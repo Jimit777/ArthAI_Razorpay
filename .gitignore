@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+
+# Generated output
+auditor.db
+report.html
+checkout.html
+*.json.bak
+
+# Real API responses. Harmless (test mode, no PII) but they are evidence of a
+# specific account's data, not source, so they are captured on demand.
+razorpay_samples/
+merchant.db
+demo_run.json
+
+# Encryption keys never live in the repo.
+.env
+*.key

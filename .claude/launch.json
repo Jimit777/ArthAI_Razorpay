@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "merchant",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": ["merchant.app:app", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}

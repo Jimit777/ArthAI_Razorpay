@@ -1,0 +1,178 @@
+[
+ {
+  "invoice_id": "inv_0009",
+  "exception_code": "AMOUNT_MISMATCH",
+  "action": "chase_supplier",
+  "confidence": 0.78,
+  "reasoning": "Kaveri Silk Mills reported invoice KAV/5429 dated 2026-06-07 under its own GSTIN 29LKSVS4501T2ZH in period 2026-07, with the same taxable value of Rs 1,06,894.00 and the same inter-state (IGST) split you booked - so this is neither a GSTIN error nor a wrong tax split. What differs is only the tax: your books claim Rs 5,344.70 while GSTR-2B supports Rs 4,844.70, a gap of Rs 500.00 against a tolerance of Rs 26.72. Because the taxable value agrees exactly on both sides, a partial supply or a rate difference fits poorly; the likeliest reading is that the supplier keyed the IGST figure short (or netted an unrecorded credit note against tax only), so claim only the supported Rs 4,844.70 until they amend. You have until 2027-11-30 (463 days), so there is room for an amendment in a later return.",
+  "rule_cited": "CGST Act s.16(2)(aa) read with Rule 36(4) - credit is available only to the extent the invoice is reported by the supplier in GSTR-1 and appears in your GSTR-2B; s.50 interest applies to any excess claimed.",
+  "evidence_used": [
+   "tax_short_in_2b",
+   "invoice_detail",
+   "find_invoice_number",
+   "supplier_filing_history",
+   "claim_window"
+  ],
+  "supplier_message": "Dear Kaveri Silk Mills team, we have reconciled your invoice KAV/5429 dated 2026-06-07 against our GSTR-2B for period 2026-07. The invoice is reported under your GSTIN 29LKSVS4501T2ZH with taxable value Rs 1,06,894.00, which matches our books, but the IGST reported is Rs 4,844.70 whereas the invoice we hold and have booked shows IGST of Rs 5,344.70 - a shortfall of Rs 500.00. Please confirm whether this was a keying error in your GSTR-1 or whether a credit note was issued against this invoice that we have not received. If it is an error, kindly file an amendment in your next GSTR-1; if a credit note exists, please send us a copy so we can record it. Until this is resolved we will restrict our claim to the Rs 4,844.70 reflected in GSTR-2B. The statutory deadline for this invoice is 30 November 2027, so an amendment in an upcoming return will be in time.",
+  "corrections": [],
+  "invented_figures": [],
+  "model": "claude-opus-5",
+  "tool_calls": [
+   "invoice_detail",
+   "find_invoice_number",
+   "supplier_filing_history"
+  ],
+  "input_tokens": 4,
+  "output_tokens": 1136,
+  "cache_read_tokens": 8862,
+  "latency_ms": 18401,
+  "error": null,
+  "decided_at": 1787561627
+ },
+ {
+  "invoice_id": "inv_0040",
+  "exception_code": "AMOUNT_MISMATCH",
+  "action": "chase_supplier",
+  "confidence": 0.88,
+  "reasoning": "Anand Textiles reported invoice ANA/3768 with the same taxable value you booked, Rs 2,31,766.00, and the same split (intra-state, CGST+SGST) \u2014 so this is not a wrong-split or inter-state problem. The SGST agrees exactly at Rs 20,858.94, but their CGST is Rs 20,233.20 against your Rs 20,858.94, which is the whole of the Rs 625.74 gap against a tolerance of Rs 208.58. A credit note, a partial supply or a rate error would have moved the taxable value or both tax heads together; only one head moved, so the likeliest reading is a keying error in the CGST field of their GSTR-1. Under s.16(2)(aa) you can only claim the Rs 41,092.14 that appears in 2B until they amend; the deadline is 2027-11-30, 463 days away, so there is ample time.",
+  "rule_cited": "CGST Act s.16(2)(aa) read with Rule 36(4) \u2014 input tax credit is available only to the extent the supplier has reported the invoice in GSTR-1/2B",
+  "evidence_used": [
+   "tax_short_in_2b",
+   "invoice_detail",
+   "find_invoice_number",
+   "supplier_filing_history",
+   "claim_window"
+  ],
+  "supplier_message": "Dear Anand Textiles team, regarding your tax invoice ANA/3768 dated 16 June 2026: our books record taxable value Rs 2,31,766.00 with CGST Rs 20,858.94 and SGST Rs 20,858.94, total tax Rs 41,717.88. Your GSTR-1 filing for period 2026-07 shows the same taxable value of Rs 2,31,766.00 and the same SGST of Rs 20,858.94, but CGST of only Rs 20,233.20, giving a reported total tax of Rs 41,092.14 \u2014 a shortfall of Rs 625.74 confined entirely to the CGST head. This appears to be a keying error in the CGST field. Please file an amendment (Table 9A) in your next GSTR-1 so the CGST reads Rs 20,858.94, or let us know if you consider the invoice value to be different. If you have issued a credit note against this invoice, please send us a copy so we can record it. Until the correction reaches our GSTR-2B we are restricted under CGST s.16(2)(aa) to claiming Rs 41,092.14.",
+  "corrections": [],
+  "invented_figures": [],
+  "model": "claude-opus-5",
+  "tool_calls": [
+   "invoice_detail",
+   "find_invoice_number",
+   "supplier_filing_history"
+  ],
+  "input_tokens": 4,
+  "output_tokens": 1142,
+  "cache_read_tokens": 8854,
+  "latency_ms": 16683,
+  "error": null,
+  "decided_at": 1787561644
+ },
+ {
+  "invoice_id": "inv_0041",
+  "exception_code": "AMOUNT_MISMATCH",
+  "action": "chase_supplier",
+  "confidence": 0.86,
+  "reasoning": "Anand Textiles reported invoice ANA/7597 dated 2026-08-15 with the correct taxable value of Rs 1,01,872.00 and the correct SGST of Rs 6,112.32, but CGST of only Rs 5,612.32 against the Rs 6,112.32 in your books - the whole Rs 500.00 gap sits in one half of an intra-state split that is otherwise exact. That rules out a rate error, a partial supply or an unrecorded credit note, all of which would move the taxable value or both halves; this is a keying slip in the supplier's GSTR-1 CGST field. Only Rs 11,724.64 is supported in GSTR-2B, so claim that much for now and hold back the Rs 500.00 until an amendment lands; you have until 2027-11-30 (463 days), so there is time.",
+  "rule_cited": "CGST Act s.16(2)(aa) read with Rule 36(4) - credit is limited to the tax actually reported by the supplier in GSTR-2B; the shortfall is claimable only once the supplier amends its GSTR-1",
+  "evidence_used": [
+   "tax_short_in_2b",
+   "invoice_detail",
+   "find_invoice_number",
+   "supplier_filing_history",
+   "claim_window"
+  ],
+  "supplier_message": "Dear Anand Textiles, we have reconciled your invoice ANA/7597 dated 2026-08-15 (GSTIN 27XJGQI1052H7ZR) against our GSTR-2B for period 2026-07. The taxable value of Rs 1,01,872.00 and SGST of Rs 6,112.32 agree with our books, but the CGST has been reported as Rs 5,612.32 instead of Rs 6,112.32 as shown on your tax invoice, leaving a shortfall of Rs 500.00 in the credit available to us (Rs 11,724.64 reported against Rs 12,224.64 invoiced). Please file an amendment to this invoice in your next GSTR-1 correcting the CGST to Rs 6,112.32 and confirm the return period in which the amendment will appear. Until it does, we are constrained by CGST Act s.16(2)(aa) to restrict our claim to the reported amount.",
+  "corrections": [],
+  "invented_figures": [],
+  "model": "claude-opus-5",
+  "tool_calls": [
+   "invoice_detail",
+   "find_invoice_number",
+   "supplier_filing_history"
+  ],
+  "input_tokens": 4,
+  "output_tokens": 1124,
+  "cache_read_tokens": 8854,
+  "latency_ms": 15898,
+  "error": null,
+  "decided_at": 1787561659
+ },
+ {
+  "invoice_id": "inv_0050",
+  "exception_code": "GSTIN_MISMATCH",
+  "action": "chase_supplier",
+  "confidence": 0.93,
+  "reasoning": "Nothing was filed against Gurgaon Warehousing's GSTIN 06FLKOE3024E4ZC for invoice GUR/7128 - they reported 0 of the 1 invoice you booked with them. But the identical invoice number, dated 2026-08-18, with taxable value Rs 1,38,849.00 and IGST Rs 6,942.45, appears in GSTR-2B under 07FQSYG2595K6ZR, a different-state registration, filed in period 2026-07. The tax split matches your books exactly (inter-state IGST), so this is a wrong-registration filing rather than under-reporting or non-filing; the credit exists but sits under the wrong GSTIN and cannot be claimed by you until amended. You have until 2027-11-30 (463 days), so there is time, but the amendment should be requested now.",
+  "rule_cited": "CGST Act s.16(2)(aa) read with Rule 36(4) - credit is available only where the supplier has reported the invoice against the recipient's correct GSTIN in GSTR-1/2B",
+  "evidence_used": [
+   "absent_but_similar_elsewhere",
+   "find_invoice_number",
+   "supplier_filing_history",
+   "invoice_detail",
+   "claim_window"
+  ],
+  "supplier_message": "Dear Gurgaon Warehousing, our invoice GUR/7128 dated 2026-08-18 (taxable value Rs 1,38,849.00, IGST Rs 6,942.45) does not appear in our GSTR-2B under your GSTIN 06FLKOE3024E4ZC. We can see the same invoice number, date and IGST amount of Rs 6,942.45 reported in the 2026-07 period under a different registration, 07FQSYG2595K6ZR. Please amend your GSTR-1 to report this supply under the correct GSTIN 06FLKOE3024E4ZC so the credit flows to us. Our claim deadline for this invoice is 30 November 2027, but we would appreciate the amendment in your next return. Please confirm the period in which the correction will be filed.",
+  "corrections": [],
+  "invented_figures": [],
+  "model": "claude-opus-5",
+  "tool_calls": [
+   "find_invoice_number",
+   "supplier_filing_history",
+   "invoice_detail"
+  ],
+  "input_tokens": 4,
+  "output_tokens": 899,
+  "cache_read_tokens": 9854,
+  "latency_ms": 14386,
+  "error": null,
+  "decided_at": 1787561674
+ },
+ {
+  "invoice_id": "inv_0056",
+  "exception_code": "SUPPLIER_LATE_FILED",
+  "action": "fix_books",
+  "confidence": 0.91,
+  "reasoning": "Bright Print House reported BRI/4313 dated 2026-06-30 in the 2026-08 period rather than the period your books expect, but the credit itself is intact: Rs 8,730.54 claimed against Rs 8,730.54 supported by 2B, a difference of Rs 0.00. The claim deadline is 2027-11-30, 463 days away, so the one-period slip is nowhere near the s.16(4) cut-off and costs you nothing. Their filing record is clean (1 invoice booked, 1 reported, 0 missing), so this is a timing shift, not a reporting failure - move the claim into 2026-08 in your books so the periods line up.",
+  "rule_cited": "CGST Act s.16(2)(aa) - credit is available only in the period the invoice appears in GSTR-2B; s.16(4) - claim by 30 November following the financial year (2027-11-30 here)",
+  "evidence_used": [
+   "filed_in_later_period",
+   "claim_window",
+   "supplier_filing_history"
+  ],
+  "supplier_message": "Hello Bright Print House, our records show invoice BRI/4313 dated 30 June 2026 for tax of Rs 8,730.54 was reported in your GSTR-1 for the 2026-08 period rather than the period of the invoice date. The amount reported matches our books exactly and we are shifting our input credit claim to the 2026-08 period accordingly, so no correction is needed at your end for this invoice. We would appreciate it if future invoices were reported in the return period matching the invoice date, so that our GSTR-2B reconciliation stays aligned month to month. Please let us know if you have any questions.",
+  "corrections": [],
+  "invented_figures": [],
+  "model": "claude-opus-5",
+  "tool_calls": [
+   "claim_window",
+   "supplier_filing_history"
+  ],
+  "input_tokens": 4,
+  "output_tokens": 802,
+  "cache_read_tokens": 8804,
+  "latency_ms": 12489,
+  "error": null,
+  "decided_at": 1787561686
+ },
+ {
+  "invoice_id": "inv_0057",
+  "exception_code": "GSTIN_MISMATCH",
+  "action": "chase_supplier",
+  "confidence": 0.91,
+  "reasoning": "Surat Trims & Buttons filed nothing at all against 24OFGEF5346X3ZS, but invoice SUR/9132 dated 2026-06-19 appears in GSTR-2B under 07GHLOW9995B3ZB for taxable value Rs 1,09,229.00 and IGST Rs 5,461.45 - identical to your books, filed in period 2026-07. So the credit exists; it is simply sitting under the wrong registration, which is a correction rather than a non-filing. Your books record the supply as inter-state (IGST Rs 5,461.45), matching the 2B line, so the only defect is the reporting GSTIN; you have until 2027-11-30 (463 days), so there is time, but do not claim until the amendment appears under 24OFGEF5346X3ZS.",
+  "rule_cited": "CGST Act s.16(2)(aa) read with rule 8 - the invoice must be furnished by the supplier against the recipient's correct GSTIN and appear in GSTR-2B; s.16(4) sets the 2027-11-30 outer limit.",
+  "evidence_used": [
+   "absent_but_similar_elsewhere",
+   "find_invoice_number",
+   "supplier_filing_history",
+   "invoice_detail"
+  ],
+  "supplier_message": "Dear Surat Trims & Buttons, our invoice SUR/9132 dated 19 June 2026 (taxable value Rs 1,09,229.00, IGST Rs 5,461.45) does not appear in our GSTR-2B under your GSTIN 24OFGEF5346X3ZS. On checking, the same invoice number, date and amount have been reported in your GSTR-1 for period 2026-07 against a different registration, 07GHLOW9995B3ZB. Please amend the B2B entry so the invoice is reported against 24OFGEF5346X3ZS and reaches our 2B, and confirm the period in which the amendment is filed. Until this is corrected we are unable to avail input tax credit of Rs 5,461.45 under s.16(2)(aa), and the credit lapses if it is not reflected by 30 November 2027.",
+  "corrections": [],
+  "invented_figures": [],
+  "model": "claude-opus-5",
+  "tool_calls": [
+   "find_invoice_number",
+   "supplier_filing_history",
+   "invoice_detail"
+  ],
+  "input_tokens": 4,
+  "output_tokens": 917,
+  "cache_read_tokens": 9854,
+  "latency_ms": 15504,
+  "error": null,
+  "decided_at": 1787561702
+ }
+]

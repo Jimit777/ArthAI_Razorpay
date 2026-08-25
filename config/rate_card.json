@@ -1,0 +1,94 @@
+{
+  "_comment": "All rates in basis points (bps). 100 bps = 1%. Money in paise.",
+  "merchant_id": "acc_DEMO_MEERA_BOUTIQUE",
+  "effective_from": "2026-04-01",
+  "currency": "INR",
+  "gst_rate_bps": 1800,
+  "gst_source": "GST law - 18% on payment aggregator service fees",
+  "tolerance": {
+    "floor_paise": 100,
+    "pct_bps": 50,
+    "_comment": "Exception if delta exceeds max(Rs 1, 0.5% of expected fee)"
+  },
+  "guardrails": {
+    "_comment": "Nothing here is a fee rule - these are the limits on what the agent is allowed to close by itself. CLAUDE.md section 10.",
+    "min_confidence": 0.75,
+    "review_above_paise": 25000,
+    "_min_confidence_note": "Below this the agent goes to a human, whatever it said.",
+    "_review_above_note": "Rs 250. Money at stake above this always gets a human, however confident."
+  },
+  "instruments": {
+    "upi": {
+      "label": "UPI (bank account)",
+      "network_mdr_bps": 0,
+      "network_mdr_cap_bps": 0,
+      "network_mdr_source": "PSS Act s.10A (as amended, assent 17 Aug 2026): zero MDR for Centre-notified modes; UPI/RuPay unchanged since 2020-01-01",
+      "platform_fee_bps": 40,
+      "platform_fee_source": "merchant contract - negotiated UPI slab"
+    },
+    "rupay_debit": {
+      "label": "RuPay debit card",
+      "network_mdr_bps": 0,
+      "network_mdr_cap_bps": 0,
+      "network_mdr_source": "PSS Act s.10A (as amended, assent 17 Aug 2026): zero MDR for Centre-notified modes; UPI/RuPay unchanged since 2020-01-01",
+      "platform_fee_bps": 40,
+      "platform_fee_source": "merchant contract"
+    },
+    "debit_card_low": {
+      "label": "Visa/Mastercard debit, ticket <= Rs 2000",
+      "network_mdr_bps": 40,
+      "network_mdr_cap_bps": 40,
+      "network_mdr_source": "RBI circular RBI/2017-18/105 - 0.40% cap below Rs 2000",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    },
+    "debit_card_high": {
+      "label": "Visa/Mastercard debit, ticket > Rs 2000",
+      "network_mdr_bps": 90,
+      "network_mdr_cap_bps": 90,
+      "network_mdr_source": "RBI circular RBI/2017-18/105 - 0.90% cap above Rs 2000",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    },
+    "credit_card": {
+      "label": "Visa/Mastercard credit, domestic",
+      "network_mdr_bps": 200,
+      "network_mdr_cap_bps": null,
+      "network_mdr_source": "uncapped by RBI; contracted slab applies",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    },
+    "premium_card": {
+      "label": "Amex / Diners / corporate card",
+      "network_mdr_bps": 300,
+      "network_mdr_cap_bps": null,
+      "network_mdr_source": "premium slab, uncapped",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    },
+    "international": {
+      "label": "International card",
+      "network_mdr_bps": 300,
+      "network_mdr_cap_bps": null,
+      "network_mdr_source": "international slab, uncapped",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    },
+    "netbanking": {
+      "label": "Net banking",
+      "network_mdr_bps": 200,
+      "network_mdr_cap_bps": null,
+      "network_mdr_source": "bank-set, uncapped",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    },
+    "wallet": {
+      "label": "Wallet",
+      "network_mdr_bps": 200,
+      "network_mdr_cap_bps": null,
+      "network_mdr_source": "wallet-issuer set, uncapped",
+      "platform_fee_bps": 0,
+      "platform_fee_source": "bundled into MDR under contract"
+    }
+  }
+}
