@@ -713,3 +713,88 @@ def test_the_axis_labels_do_not_sit_on_the_line(shop):
     assert "margin-left:46px" in CSS
     label = CSS.split(".curve-grid span {")[1].split("}")[0]
     assert "right:100%" in label, "the labels are back inside the plot"
+
+
+# --- what is earned, and what is assumed ----------------------------------
+#
+# Every one of the thirty days is a projection, so shading "the forecast part"
+# would mean inventing a boundary. This one is real: up to it the incoming
+# money is settlements from payments already taken and invoices already
+# raised; past it the receipts assume trade carries on.
+
+def test_the_earned_horizon_comes_from_the_receipts_not_a_guess():
+    """
+    A merchant with B2B invoices out has earned receivables weeks ahead; one
+    taking only card payments has about two days of them. So it is computed
+    from what is actually on the books.
+    """
+    from engine.treasury.records import ExpectedReceipt
+
+    cards_only = _inputs(receipts=[
+        ExpectedReceipt("s1", "gateway settlement", 10_000_00,
+                        TODAY + timedelta(days=2), certain=True),
+        ExpectedReceipt("s2", "gateway settlement", 10_000_00,
+                        TODAY + timedelta(days=20), certain=False)])
+    assert project_cash_flow(cards_only).earned_through_day == 2
+
+    with_invoices = _inputs(receipts=[
+        ExpectedReceipt("s1", "gateway settlement", 10_000_00,
+                        TODAY + timedelta(days=2), certain=True),
+        ExpectedReceipt("INV-1", "customer invoice", 5_00_000_00,
+                        TODAY + timedelta(days=21), certain=True)])
+    assert project_cash_flow(with_invoices).earned_through_day == 21
+
+
+def test_assumed_receipts_are_counted_separately():
+    forecast = project_cash_flow(generate(as_of=TODAY)[0])
+    payload = forecast.as_dict()
+
+    assert payload["earned_through_day"] == 16
+    assert payload["assumed_receipts"] > 0
+    # And it is only what lands past the horizon.
+    beyond = sum(p.receipts for p in forecast.positions
+                 if p.day > forecast.earned_through_day)
+    assert payload["assumed_receipts"] == beyond
+
+
+def test_the_demo_relief_is_earned_not_assumed():
+    """
+    The two receipts that cover the crunch are invoices already raised. If
+    they were assumed, the scenario would be a hope rather than a scheduling
+    problem, and the recommendation would be dishonest.
+    """
+    inputs, planted = generate(as_of=TODAY)
+    relief = [r for r in inputs.receipts
+              if r.expected_on == TODAY + timedelta(
+                  days=planted["relief_lands_on_day"])]
+
+    assert relief
+    assert all(r.certain for r in relief)
+    assert sum(r.amount for r in relief) >= 3_00_000_00
+
+
+def test_the_chart_marks_where_earned_money_stops(shop):
+    key, state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    earned = state["payload"]["forecast"]["earned_through_day"]
+
+    assert "curve-assumed" in page
+    assert "earned to here" in page
+    assert f"past day {earned}" in page
+    assert "assumes trade carries on" in page
+
+
+def test_nothing_is_shaded_when_everything_is_earned():
+    """
+    A merchant whose whole month is invoiced has no assumed stretch, and a
+    band covering nothing would be furniture.
+    """
+    from engine.treasury.records import ExpectedReceipt
+
+    from merchant.views import cash_curve
+
+    all_earned = _inputs(receipts=[
+        ExpectedReceipt("INV-1", "customer invoice", 10_000_00,
+                        TODAY + timedelta(days=30), certain=True)])
+    html = cash_curve(project_cash_flow(all_earned).as_dict())
+    assert "curve-assumed" not in html

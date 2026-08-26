@@ -47,6 +47,10 @@ from engine.treasury.records import (KIND_PAYROLL, KIND_RECURRING,
 # act on it - a forecast that only warns you the day before is a diary.
 CRUNCH_DAY = 14
 
+# Razorpay's standard cycle. Gateway money beyond it is not yet earned,
+# because the payment it would come from has not been taken.
+SETTLEMENT_CYCLE_DAYS = 2
+
 VENDORS = [
     "Sundaram Packaging", "Ravi Transport", "Meenakshi Printers",
     "Coastal Freight", "Anand Paper Mills", "Bharat Couriers",
@@ -76,6 +80,9 @@ def generate(days: int = 30, seed: int = 20260905, *,
     # Gateway settlements, T+2 from capture. Steady, unremarkable, and
     # deliberately NOT enough on their own to cover day 14 - the two large
     # ones land on day 16, which is the entire point of the scenario.
+    # Settlement is T+2, so only the first couple of days of gateway money is
+    # from payments already taken. Everything after that is an assumption that
+    # trade carries on - normal in a forecast, and not the same kind of number.
     for offset in range(1, days + 1):
         if offset % 2 == 0:
             continue
@@ -83,14 +90,20 @@ def generate(days: int = 30, seed: int = 20260905, *,
             reference=f"setl_{rng.randrange(16 ** 8):08x}",
             source="gateway settlement",
             amount=rng.randint(35_000, 95_000) * 100,
-            expected_on=today + timedelta(days=offset)))
+            expected_on=today + timedelta(days=offset),
+            certain=offset <= SETTLEMENT_CYCLE_DAYS))
 
+    # The two that relieve the crunch are B2B invoices already raised, due on
+    # the 16th. Earned rather than assumed - which is what makes this a
+    # scheduling problem rather than a hope.
     inputs.receipts.append(ExpectedReceipt(
-        reference="setl_bigticket01", source="gateway settlement",
-        amount=2_00_000_00, expected_on=today + timedelta(days=CRUNCH_DAY + 2)))
+        reference="INV-4471 Sunrise Retail", source="customer invoice",
+        amount=2_00_000_00, expected_on=today + timedelta(days=CRUNCH_DAY + 2),
+        certain=True))
     inputs.receipts.append(ExpectedReceipt(
-        reference="setl_bigticket02", source="gateway settlement",
-        amount=1_40_000_00, expected_on=today + timedelta(days=CRUNCH_DAY + 2)))
+        reference="INV-4482 Vertex Components", source="customer invoice",
+        amount=1_40_000_00, expected_on=today + timedelta(days=CRUNCH_DAY + 2),
+        certain=True))
 
     # --- money going out ---------------------------------------------------
     #
@@ -144,4 +157,5 @@ def generate(days: int = 30, seed: int = 20260905, *,
         "coverable_by_delay": True,
         "unmovable_on_crunch_day": ["PAY-PAYROLL-08", "PAY-TDS-Q2"],
         "relief_lands_on_day": CRUNCH_DAY + 2,
+        "earned_through_day": CRUNCH_DAY + 2,
     }

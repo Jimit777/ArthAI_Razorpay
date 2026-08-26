@@ -1753,6 +1753,24 @@ def cash_curve(forecast: dict, height: int = 250) -> str:
                 f'<span>{esc(_short_rupees(int(value)))}</span></div>')
         value += step_paise
 
+    # Where the receipts stop being money already earned.
+    #
+    # Every one of these thirty days is a projection, so shading "the forecast
+    # part" would mean inventing a boundary. This one is real: up to it the
+    # incoming money is settlements from payments already taken and invoices
+    # already raised; past it the receipts assume trade carries on. A forecast
+    # needs that assumption and is useless without it - what it must not do is
+    # draw both halves identically and let somebody believe the fourth week
+    # rests on the same evidence as the first.
+    assumed = ""
+    earned_day = forecast.get("earned_through_day") or 0
+    if 0 < earned_day < len(positions):
+        left = (pad + (earned_day - 1) * step) / width * 100
+        assumed = (
+            f'<div class="curve-assumed" style="left:{left:.3f}%"></div>'
+            f'<div class="curve-earned-mark" style="left:{left:.3f}%">'
+            f'<span>earned to here</span></div>')
+
     # A day label every five days, so the axis is readable without crowding.
     ticks = []
     for i, position in enumerate(positions):
@@ -1791,6 +1809,7 @@ def cash_curve(forecast: dict, height: int = 250) -> str:
           clip-path="url(#{uid}-under)"></path>
       </svg>
       {"".join(lines)}
+      {assumed}
       <div class="curve-floor-line" style="top:{pct(floor):.1f}%">
         <span>safe floor {esc(forecast.get("floor_display", ""))}</span></div>
       <div class="curve-cross"></div>
@@ -1955,6 +1974,11 @@ def cash_results(payload: dict, key: str = "") -> str:
     <span><b>{esc(forecast.get("receipts_after_trough_display", ""))}</b>
       arriving after the low point</span>
     <span><b>{esc(forecast["closing_display"])}</b> after {meta["days"]} days</span>
+    {f'<span class="hatched">past day '
+     f'{forecast["earned_through_day"]}, '
+     f'<b>{esc(forecast.get("assumed_receipts_display", ""))}</b> of the '
+     f'incoming money assumes trade carries on</span>'
+     if forecast.get("earned_through_day") else ''}
   </div>
   {measured}
   {spend}
@@ -2167,6 +2191,19 @@ COMPONENTS += """
 .curve-hit { position:absolute; top:0; bottom:0; display:block;
   cursor:crosshair }
 
+/* Past here the receipts assume trade carries on, rather than being money
+   already taken or already invoiced. Deliberately faint: it is a caveat on
+   the far half of the chart, not a warning about it. */
+.curve-assumed { position:absolute; top:0; bottom:0; right:0;
+  background:repeating-linear-gradient(-45deg,
+    var(--ink) 0 1px, transparent 1px 7px);
+  opacity:.05; pointer-events:none }
+.curve-earned-mark { position:absolute; top:0; bottom:0; width:0;
+  border-left:1px dashed var(--line); pointer-events:none }
+.curve-earned-mark span { position:absolute; top:2px; left:6px;
+  font-size:9.8px; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--faint); white-space:nowrap }
+
 /* The card that follows the pointer. */
 .curve-tip { position:absolute; z-index:3; min-width:168px;
   margin:-14px 0 0 16px; padding:11px 13px; border-radius:10px;
@@ -2228,6 +2265,11 @@ COMPONENTS += """
   font-size:11.8px; color:var(--muted) }
 .curve-legend b { color:var(--ink); font-weight:600;
   font-variant-numeric:tabular-nums }
+.curve-legend .hatched { position:relative; padding-left:16px }
+.curve-legend .hatched::before { content:""; position:absolute; left:0; top:2px;
+  width:11px; height:11px; border:1px solid var(--line);
+  background:repeating-linear-gradient(-45deg,
+    var(--ink) 0 1px, transparent 1px 4px); opacity:.55 }
 
 /* --- what a cash forecast needs before it can run ----------------------- */
 .needs { display:grid; grid-template-columns:repeat(3,1fr); gap:11px;

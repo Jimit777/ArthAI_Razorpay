@@ -72,6 +72,15 @@ class Trough:
 @dataclass
 class Forecast:
     positions: list = field(default_factory=list)
+    # The last day for which incoming money is already EARNED - a settlement
+    # from a payment taken, or an invoice raised and falling due. Past it the
+    # receipts are an assumption that trade carries on as usual.
+    #
+    # That assumption is normal and a forecast would be useless without it.
+    # What is not normal is drawing both halves the same and letting a
+    # controller believe the fourth week rests on the same evidence as the
+    # first.
+    earned_through_day: int = 0
     trough: Optional[Trough] = None
     finding: str = CASH_HEALTHY
     action: str = ACT_NONE
@@ -94,6 +103,12 @@ class Forecast:
     @property
     def closing_balance(self) -> int:
         return self.positions[-1].closing if self.positions else 0
+
+    @property
+    def assumed_receipts(self) -> int:
+        """Incoming money past the earned horizon."""
+        return sum(p.receipts for p in self.positions
+                   if p.day > self.earned_through_day)
 
     def as_dict(self) -> dict:
         from engine.gst import rules
@@ -132,6 +147,12 @@ class Forecast:
             "receipts_after_trough_display": rules.rupees(
                 self.receipts_after_trough),
             "coverable_by_delay": self.coverable_by_delay,
+            "earned_through_day": self.earned_through_day,
+            "earned_through_date": (
+                str(self.positions[self.earned_through_day - 1].on)
+                if 0 < self.earned_through_day <= len(self.positions) else ""),
+            "assumed_receipts": self.assumed_receipts,
+            "assumed_receipts_display": rules.rupees(self.assumed_receipts),
             "detail": self.detail,
         }
 
@@ -192,6 +213,14 @@ def project_cash_flow(inputs: TreasuryInputs, *, days: int = DEFAULT_DAYS,
 
         balance = position.closing
         out.positions.append(position)
+
+    # How far the receipts are backed by money already earned. Computed from
+    # the inputs rather than assumed from the horizon: a merchant with B2B
+    # invoices out has earned receivables weeks ahead, and one taking only
+    # card payments has about two days of them.
+    earned = [r.expected_on for r in inputs.receipts if r.certain]
+    out.earned_through_day = (
+        max((d - today).days for d in earned) if earned else 0)
 
     _find_trough(out, floor)
     _explain(out, inputs)
