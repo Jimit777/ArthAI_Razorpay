@@ -28,7 +28,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
 from engine.gst import rules
-from engine.gst.filing_history import history_for
+from engine.gst.filing_history import (SOURCE_LABEL, SOURCE_NOTE,
+                                       SupplierHistoryService)
 from engine.gst.risk import (PATTERN_LABEL, RiskProfile, exposure_at_risk,
                              monthly_compliance,
                              profile as profile_history, recommended_action,
@@ -62,6 +63,12 @@ class SupplierRisk:
     agent_action: str = ""
     goes_further: bool = False
     registration_status: str = "active"
+    # Where this row's filing history came from, and whether the active source
+    # had anything at all to say about this supplier. Per-row rather than only
+    # per-run: a supplier missing from an uploaded file is scored as unknown,
+    # and the row has to be able to say so on its own.
+    history_source: str = ""
+    history_known: bool = True
     profile: dict = field(default_factory=dict)
     invoices: list[dict] = field(default_factory=list)
     # Thirty-six cells for the drawer's grid, and the two statutory deadlines
@@ -94,6 +101,11 @@ class PortfolioRisk:
     rows_skipped: list[str] = field(default_factory=list)
     used_agent: bool = False
     failed_calls: int = 0
+    # One source per run, never a blend. See SupplierHistoryService for why
+    # mixing two sources inside a single table is the failure this prevents.
+    history_source: str = ""
+    suppliers_without_history: int = 0
+    history_failures: list[str] = field(default_factory=list)
     # What the run cost. The verdicts carried this and the pipeline threw it
     # away, so the page could not say what a click had spent - which is the
     # one number a person paying for the API actually wants.
@@ -135,6 +147,18 @@ class PortfolioRisk:
                 "judged_by_agent": self.used_agent,
                 "failed_calls": self.failed_calls,
                 "usage": self.usage.as_dict(),
+                # Provenance travels in the payload, not just on the screen.
+                # The JSON export is what somebody would hand an auditor, and a
+                # trust score without its source on the same page is a figure
+                # nobody can calibrate.
+                "history_source": self.history_source,
+                "history_source_label": SOURCE_LABEL.get(
+                    self.history_source, self.history_source),
+                "history_source_note": SOURCE_NOTE.get(
+                    self.history_source, ""),
+                "history_is_demo": self.history_source == "simulated",
+                "suppliers_without_history": self.suppliers_without_history,
+                "history_failures": list(self.history_failures),
             },
             "suppliers": [s.as_dict() for s in self.suppliers],
         }
@@ -165,6 +189,8 @@ def _from_group(group: SupplierGroup, prof: RiskProfile,
             "cgst": r.cgst, "sgst": r.sgst, "igst": r.igst,
             "total_tax": r.total_tax,
         } for r in group.invoices],
+        history_source=getattr(history, "source", ""),
+        history_known=bool(getattr(history, "known", False)),
         compliance_grid=monthly_compliance(history) if history else [],
         clocks=statutory_clocks([{
             "invoice_number": r.invoice_number,
@@ -175,32 +201,54 @@ def _from_group(group: SupplierGroup, prof: RiskProfile,
 
 def run(imported: ImportResult, *, use_agent: bool = True,
         agent=None, months: int = 36,
+        history: Optional[SupplierHistoryService] = None,
         on_progress: Optional[Callable[..., None]] = None) -> PortfolioRisk:
-    """Phases B and C. Phase A already happened in purchase_import.parse."""
+    """
+    Phases B and C. Phase A already happened in purchase_import.parse.
+
+    `history` decides where the filing records come from - a live API, an
+    uploaded file, or the simulator. It changes nothing below this line, which
+    is the reason the abstraction exists: one pipeline, one set of arithmetic,
+    one output contract, whatever the merchant happened to have access to.
+    """
     def say(**kw):
         if on_progress is not None:
             on_progress(**kw)
 
+    history = history or SupplierHistoryService(months=months)
+
     out = PortfolioRisk(rows_read=imported.rows_read,
                         rows_skipped=list(imported.rows_skipped),
-                        used_agent=use_agent)
+                        used_agent=use_agent,
+                        history_source=history.source)
 
-    say(phase=f"Reading {len(imported.groups)} suppliers' filing history")
+    say(phase=f"Reading {len(imported.groups)} suppliers' filing history "
+              f"({history.label})")
 
     jobs, rows = [], []
     for group in imported.groups:
-        history = history_for(group.supplier_gstin, months=months)
-        prof = profile_history(history)
+        record = history.history_for(group.supplier_gstin)
+        if not record.known:
+            out.suppliers_without_history += 1
+        prof = profile_history(record)
         at_risk = exposure_at_risk(
             group.current_month_total_tax_exposure, prof)
-        row = _from_group(group, prof, at_risk, history)
+        row = _from_group(group, prof, at_risk, record)
         rows.append(row)
         jobs.append((prof, group.supplier_name,
                      group.current_month_total_tax_exposure, at_risk,
-                     history.as_rows()[-RECENT_ROWS:]))
+                     record.as_rows()[-RECENT_ROWS:]))
+
+    # A provider that could not be reached collects its failures rather than
+    # raising, so one unreachable supplier does not kill a run of fifty. They
+    # are surfaced here so the page can say how many, instead of a table of
+    # quiet "unknown" rows that look like a verdict.
+    out.history_failures = [
+        f"{gstin}: {why}"
+        for gstin, why in getattr(history.provider, "failures", [])]
 
     if not use_agent or not jobs:
-        out.suppliers = rows
+        out.suppliers = sorted(rows, key=lambda s: (-s.at_risk, s.trust_score))
         return out
 
     say(phase=f"Asking the agent about {len(jobs)} suppliers")
@@ -239,3 +287,40 @@ def run(imported: ImportResult, *, use_agent: bool = True,
 
     out.suppliers = sorted(rows, key=lambda s: (-s.at_risk, s.trust_score))
     return out
+
+
+def history_service_for(led, business_id: str, *, months: int = 36,
+                        http=None) -> SupplierHistoryService:
+    """
+    Which of the three sources this business actually has, resolved once.
+
+    Evidence first: a configured API beats an uploaded file beats the
+    simulator, because that is the order of how current the data is. The
+    fallback is silent in the code and extremely loud in the UI - a merchant
+    must never have to wonder whether the numbers in front of them came from
+    their suppliers or from a persona generator.
+
+    A configured API whose key cannot be decrypted is skipped rather than
+    called without one. Sending unauthenticated requests at a paid endpoint on
+    a merchant's behalf is not a graceful degradation.
+    """
+    from engine.gst.filing_history import (SimulatedHistoryProvider,
+                                           UploadedHistoryProvider)
+    from merchant.gstin_lookup import FilingStatusApi
+    from merchant.sources import Sources
+
+    config = Sources(led.conn).filing_api_config(business_id)
+    if config and config["key_available"]:
+        return SupplierHistoryService(
+            FilingStatusApi(url_template=config["url_template"],
+                            api_key=config["api_key"],
+                            key_header=config["key_header"],
+                            key_param=config["key_param"], http=http),
+            months=months)
+
+    held = led.filing_history()
+    if held:
+        return SupplierHistoryService(
+            UploadedHistoryProvider(held), months=months)
+
+    return SupplierHistoryService(SimulatedHistoryProvider(), months=months)

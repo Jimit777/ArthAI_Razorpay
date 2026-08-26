@@ -112,11 +112,12 @@ def _normalise(header: str) -> str:
     return re.sub(r"[^a-z0-9 /]", " ", (header or "").lower()).strip()
 
 
-def map_columns(headers: Iterable[str]) -> dict[str, int]:
+def map_columns(headers: Iterable[str],
+                columns: Optional[dict] = None) -> dict[str, int]:
     """Which column holds which field. Unmatched fields simply do not appear."""
     seen = [_normalise(h) for h in headers]
     out: dict[str, int] = {}
-    for field_name, candidates in COLUMNS.items():
+    for field_name, candidates in (columns or COLUMNS).items():
         for candidate in candidates:
             for index, header in enumerate(seen):
                 if header == candidate:
@@ -273,3 +274,170 @@ Bright Print House,24IARVY9763E8ZD,BRI/318,2026-08-11,60000,0,0,10800
 Coimbatore Yarns,27XJGQI1052H7ZR,COI/905,2026-08-14,180000,16200,16200,0
 Nashik Logistics,27VLBAN4982B2ZX,NAS/66,2026-08-17,45000,4050,4050,0
 """
+
+
+# --- mode B: a filing history somebody assembled ---------------------------
+#
+# The purchase register (above) says what a merchant BOUGHT. This says what
+# their suppliers FILED, which is the other half of the same question and the
+# half that decides whether the credit exists.
+#
+# A merchant without a GSP contract can still get this: their own accountant
+# keeps it, or a supplier sends filing acknowledgements, or somebody works
+# through the portal's public search once a quarter. Tedious, but real - and
+# real beats simulated every time, which is why this path exists at all.
+
+HISTORY_COLUMNS = {
+    "supplier_gstin": ("supplier gstin", "gstin", "gstin of supplier",
+                       "gst no", "gst number", "gstin/uin", "supplier gst number"),
+    "period": ("period", "tax period", "return period", "period yyyy mm",
+               "month", "ret prd", "filing period"),
+    "gstr1_filed": ("gstr 1 filed date", "gstr1 filed date", "gstr 1 filed",
+                    "gstr1 filed", "gstr 1 date", "gstr1 date", "gstr 1",
+                    "gstr1", "r1 filed", "gstr 1 filing date"),
+    "gstr3b_filed": ("gstr 3b filed date", "gstr3b filed date", "gstr 3b filed",
+                     "gstr3b filed", "gstr 3b date", "gstr3b date", "gstr 3b",
+                     "gstr3b", "3b filed", "gstr 3b filing date"),
+    "registration_status": ("registration status", "gstin status", "status",
+                            "taxpayer status"),
+}
+
+
+@dataclass
+class FilingHistoryImport:
+    """What a filing-history upload yielded, and what it could not read."""
+    histories: dict = field(default_factory=dict)   # gstin -> FilingHistory
+    rows_read: int = 0
+    rows_skipped: list[str] = field(default_factory=list)
+    missing_columns: list[str] = field(default_factory=list)
+    filename: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.histories)
+
+    @property
+    def suppliers(self) -> int:
+        return len(self.histories)
+
+    @property
+    def periods(self) -> int:
+        """Total period rows understood, across every supplier."""
+        return sum(len(h.months) for h in self.histories.values())
+
+
+def parse_filing_history(data: bytes, filename: str = "") -> FilingHistoryImport:
+    """
+    A filing-history export, normalised into the standard contract.
+
+    Wants a GSTIN, a period, and the two filing dates. A blank filing-date cell
+    is meaningful and is kept: the row asserts that the period was looked at
+    and the return was not filed, which is what makes a default countable. A
+    period with no row at all is never counted - see the module docstring in
+    engine/gst/filing_history.py, where that distinction is the load-bearing
+    one.
+
+    An optional registration-status column is honoured because a cancelled
+    registration outranks every other signal, and a merchant who knows one is
+    dead should not have to enter it a second time somewhere else.
+    """
+    from engine.gst.filing_history import (SOURCE_FILE, from_filing_rows,
+                                           normalise_period)
+
+    result = FilingHistoryImport(filename=filename)
+    body, headers = read_rows(data, filename)
+    if not headers:
+        result.missing_columns = ["the file appears to be empty"]
+        return result
+
+    columns = map_columns(headers, HISTORY_COLUMNS)
+    required = ("supplier_gstin", "period", "gstr1_filed", "gstr3b_filed")
+    result.missing_columns = [f for f in required if f not in columns]
+    # Both filing columns are required rather than merely wanted. A file with
+    # GSTR-1 dates and no GSTR-3B column would score every supplier as having
+    # never paid a rupee of tax - the most serious finding this product makes -
+    # about a merchant's entire supplier book. Refusing is the only safe read.
+    if [f for f in required if f not in columns]:
+        return result
+
+    def cell(row, name, default=""):
+        index = columns.get(name)
+        if index is None or index >= len(row):
+            return default
+        value = row[index]
+        return default if value is None else value
+
+    grouped: dict[str, list[dict]] = {}
+    statuses: dict[str, str] = {}
+
+    for number, row in enumerate(body, start=2):
+        result.rows_read += 1
+        gstin = str(cell(row, "supplier_gstin")).strip().upper()
+        if not GSTIN.match(gstin):
+            result.rows_skipped.append(
+                f"row {number}: {gstin or '(blank)'} is not a GSTIN")
+            continue
+
+        raw_period = cell(row, "period")
+        period = normalise_period(raw_period)
+        if period is None:
+            result.rows_skipped.append(
+                f"row {number}: {str(raw_period).strip() or '(blank)'} is not "
+                f"a tax period")
+            continue
+
+        grouped.setdefault(gstin, []).append({
+            "period": period,
+            "gstr1_filed": cell(row, "gstr1_filed", None),
+            "gstr3b_filed": cell(row, "gstr3b_filed", None)})
+
+        status = str(cell(row, "registration_status")).strip().lower()
+        if status in {"active", "suspended", "cancelled", "canceled"}:
+            statuses[gstin] = "cancelled" if status == "canceled" else status
+
+    result.histories = {
+        gstin: from_filing_rows(
+            gstin, rows, source=SOURCE_FILE,
+            registration_status=statuses.get(gstin, "active"))
+        for gstin, rows in grouped.items()}
+    return result
+
+
+def filing_history_csv(histories) -> str:
+    """
+    A set of histories written back out in the upload format.
+
+    Exists so the two modes can be shown to agree: export the simulator's
+    history for the sample register, upload it as a file, and every score,
+    pattern and recommendation lands identically because the same arithmetic
+    ran over the same contract. That is the claim this refactor makes, and this
+    is how a person checks it rather than taking it on trust.
+    """
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["Supplier GSTIN", "Period", "GSTR-1 Filed Date",
+                     "GSTR-3B Filed Date", "Registration Status"])
+    for history in histories:
+        for month in history.months:
+            writer.writerow([
+                history.gstin, month.period,
+                month.gstr1_filed.isoformat() if month.gstr1_filed else "",
+                month.gstr3b_filed.isoformat() if month.gstr3b_filed else "",
+                history.registration_status])
+    return out.getvalue()
+
+
+def sample_filing_history(months: int = 36) -> str:
+    """
+    A filing-history file for the sample register's eight suppliers.
+
+    Generated from the simulator on purpose. It means the "download a sample"
+    path produces a file whose upload reproduces the simulated run exactly -
+    a one-click demonstration that the mode genuinely does not change the
+    answer, rather than an assertion in a README.
+    """
+    from engine.gst.filing_history import history_for
+
+    parsed = parse(SAMPLE_REGISTER.encode(), "sample.csv")
+    return filing_history_csv(
+        history_for(g.supplier_gstin, months=months) for g in parsed.groups)

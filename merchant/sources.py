@@ -63,7 +63,19 @@ CREATE TABLE IF NOT EXISTS data_sources (
   connected_at    INTEGER,
   last_sync_at    INTEGER,
   last_status     TEXT,
-  last_message    TEXT
+  last_message    TEXT,
+  -- Mode A of the supplier history service: a GSP or GST verification API the
+  -- merchant holds their own key for. Only the URL template is stored in the
+  -- clear; the key follows the same rule as the Razorpay secret, encrypted
+  -- with a key held outside this file or not stored at all. There is
+  -- deliberately no plaintext column for it.
+  filing_api_url        TEXT,
+  filing_api_key_header TEXT,
+  filing_api_key_param  TEXT,
+  filing_api_key_encrypted TEXT,
+  filing_api_status     TEXT,
+  filing_api_message    TEXT,
+  filing_api_checked_at INTEGER
 );
 """
 
@@ -172,6 +184,19 @@ class Sources:
     def __init__(self, conn):
         self.conn = conn
         self.conn.executescript(SOURCE_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS does nothing to a table that already
+        # exists, so the filing-API columns never reach a database that
+        # predates them without this.
+        from merchant.businesses import _add_column
+
+        for column, ddl in (("filing_api_url", "TEXT"),
+                            ("filing_api_key_header", "TEXT"),
+                            ("filing_api_key_param", "TEXT"),
+                            ("filing_api_key_encrypted", "TEXT"),
+                            ("filing_api_status", "TEXT"),
+                            ("filing_api_message", "TEXT"),
+                            ("filing_api_checked_at", "INTEGER")):
+            _add_column(conn, "data_sources", column, ddl)
         self.conn.commit()
 
     def get(self, business_id: str):
@@ -266,6 +291,134 @@ class Sources:
     def disconnect(self, business_id: str) -> None:
         self.conn.execute("DELETE FROM data_sources WHERE business_id = ?",
                           (business_id,))
+        self.conn.commit()
+
+
+    # --- mode A configuration --------------------------------------------------
+    #
+    # The filing-status API is configured per business and lives on the same row as
+    # the settlement connector, because both answer "where does this merchant's
+    # real data come from" and a merchant who has one usually has the other.
+    #
+    # It is a separate method rather than a flag on connect_razorpay because they
+    # fail independently: a Razorpay connection saying nothing about GST filings is
+    # the normal case, not an error.
+
+    def configure_filing_api(self, business_id: str, *, url_template: str,
+                             api_key: str = "", key_header: str = "",
+                             key_param: str = "", remember: bool = True,
+                             probe_gstin: str = "", http=None) -> SyncResult:
+        """
+        Store a filing-status API for this business, after checking it answers.
+
+        The key follows exactly the rule the Razorpay secret follows: encrypted
+        with a key held outside the database, or not stored at all. What never
+        happens is the middle option - storing it in the clear because storing it
+        was convenient.
+
+        `probe_gstin` is optional. When given, the URL is actually called once
+        before anything is saved, so a merchant finds out the configuration is
+        wrong now rather than in the middle of a fifty-supplier run.
+        """
+        from merchant.gstin_lookup import FilingStatusApi
+        from merchant.vault import Vault
+
+        url_template = (url_template or "").strip()
+        if "{gstin}" not in url_template:
+            return SyncResult(
+                False, "The URL needs a {gstin} placeholder - that is where each "
+                       "supplier's number is substituted in.")
+        if not url_template.lower().startswith("https://"):
+            # A GST API key in a query string over plain HTTP is a credential
+            # broadcast to every hop in between.
+            return SyncResult(False, "The URL must be https.")
+        if api_key and not (key_header or key_param):
+            return SyncResult(
+                False, "Say where the key goes - a header name or a query "
+                       "parameter name.")
+
+        message = "Saved."
+        if probe_gstin:
+            client = FilingStatusApi(url_template=url_template, api_key=api_key,
+                                     key_header=key_header, key_param=key_param,
+                                     http=http)
+            history = client.history_for(probe_gstin)
+            if client.failures:
+                return SyncResult(
+                    False, f"That did not work: {client.failures[0][1]}. Nothing "
+                           f"was saved.")
+            message = (f"Connected. Read {len(history.months)} tax periods for "
+                       f"{probe_gstin}.")
+
+        vault = Vault.from_env()
+        encrypted = None
+        if api_key and remember and vault is not None:
+            encrypted = vault.encrypt(api_key)
+            message += " The key is stored encrypted."
+        elif api_key and remember:
+            message += (" No encryption key is configured, so the API key was not "
+                        "stored - set LEDGERLINE_SECRET_KEY to keep it.")
+
+        self.conn.execute(
+            "INSERT INTO data_sources (business_id, kind, connected_at,"
+            " filing_api_url, filing_api_key_header, filing_api_key_param,"
+            " filing_api_key_encrypted, filing_api_status, filing_api_message,"
+            " filing_api_checked_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(business_id) DO UPDATE SET"
+            " filing_api_url = excluded.filing_api_url,"
+            " filing_api_key_header = excluded.filing_api_key_header,"
+            " filing_api_key_param = excluded.filing_api_key_param,"
+            " filing_api_key_encrypted ="
+            "   COALESCE(excluded.filing_api_key_encrypted,"
+            "            data_sources.filing_api_key_encrypted),"
+            " filing_api_status = excluded.filing_api_status,"
+            " filing_api_message = excluded.filing_api_message,"
+            " filing_api_checked_at = excluded.filing_api_checked_at",
+            (business_id, str(SourceKind.SIMULATOR), int(time.time()),
+             url_template, key_header.strip(), key_param.strip(), encrypted,
+             "ok", message, int(time.time())))
+        self.conn.commit()
+        return SyncResult(True, message)
+
+
+    def filing_api_config(self, business_id: str) -> Optional[dict]:
+        """
+        The stored configuration, with the key decrypted if it can be.
+
+        A configuration whose key cannot be decrypted still comes back - the URL is
+        real and the merchant needs to see it is there. `key_available` says
+        whether a run can actually use it, which is the question the caller has.
+        """
+        from merchant.vault import Vault
+
+        row = self.get(business_id)
+        if row is None or not row["filing_api_url"]:
+            return None
+
+        key = ""
+        if row["filing_api_key_encrypted"]:
+            vault = Vault.from_env()
+            key = (vault.decrypt(row["filing_api_key_encrypted"]) or "") if vault else ""
+
+        needs_key = bool(row["filing_api_key_header"] or row["filing_api_key_param"])
+        return {
+            "url_template": row["filing_api_url"],
+            "key_header": row["filing_api_key_header"] or "",
+            "key_param": row["filing_api_key_param"] or "",
+            "api_key": key,
+            "key_available": bool(key) or not needs_key,
+            "status": row["filing_api_status"] or "",
+            "message": row["filing_api_message"] or "",
+            "checked_at": row["filing_api_checked_at"] or 0,
+        }
+
+
+    def disconnect_filing_api(self, business_id: str) -> None:
+        self.conn.execute(
+            "UPDATE data_sources SET filing_api_url = NULL,"
+            " filing_api_key_header = NULL, filing_api_key_param = NULL,"
+            " filing_api_key_encrypted = NULL, filing_api_status = NULL,"
+            " filing_api_message = NULL WHERE business_id = ?", (business_id,))
         self.conn.commit()
 
     def _set(self, business_id: str, kind: SourceKind, key_id: Optional[str],

@@ -25,7 +25,8 @@ from engine.gst.filing_history import Persona, history_for  # noqa: E402
 from engine.gst.risk import (STATUS_LATE, STATUS_MISSED,  # noqa: E402
                              STATUS_ON_TIME, STATUS_SILENT,
                              monthly_compliance, statutory_clocks)
-from merchant.purchase_import import SAMPLE_REGISTER  # noqa: E402
+from merchant.purchase_import import (SAMPLE_REGISTER,  # noqa: E402
+                                      sample_filing_history)
 
 PASSWORD = "a-good-password"
 
@@ -317,3 +318,107 @@ def test_the_document_page_says_nothing_was_sent(shop):
                      data={"key": key, "gstin": gstin}).text
     assert "Nothing has been sent" in page
     assert CIRCULAR_183.split(" dated")[0] in page
+
+
+# --- the drawer's buttons have to carry the run they belong to ------------
+
+def test_the_drawer_forms_carry_the_run_key(shop):
+    """
+    Regression. The results view rendered the drawers without the run key, so
+    every 'Draft vendor notice' button posted an empty key and came back
+    'That analysis is no longer in memory.'
+
+    The existing binding tests all posted the key directly, which is exactly
+    why nobody noticed: the handler was fine and the FORM was empty. So this
+    reads the key out of the rendered HTML rather than supplying one.
+    """
+    key, state = _analyse(shop)
+    page = shop.get(f"/agents/input-credit?key={key}").text
+
+    assert f'name="key" value="{key}"' in page
+    assert 'name="key" value=""' not in page
+    # One pair of buttons - notice and defence - for every supplier.
+    assert page.count(f'value="{key}"') == 2 * len(state["payload"]["suppliers"])
+
+
+def test_a_button_in_the_page_actually_works(shop):
+    """End to end through the markup, not around it."""
+    import re
+
+    key, state = _analyse(shop)
+    page = shop.get(f"/agents/input-credit?key={key}").text
+
+    form = re.search(
+        r'action="/agents/input-credit/notice".*?'
+        r'name="gstin" value="([^"]+)".*?name="key" value="([^"]*)"',
+        page, re.S)
+    assert form, "no notice form in the page"
+    gstin, found_key = form.groups()
+
+    response = shop.post("/agents/input-credit/notice",
+                         data={"key": found_key, "gstin": gstin})
+    assert response.status_code == 200
+    assert "no longer in memory" not in response.text
+
+
+# --- the drawer is not a simulator privilege ------------------------------
+
+def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
+    """
+    Every interactive piece has to work whatever produced the data.
+
+    The grid, the clocks and both documents are built from the standard
+    contract, so a mode that fills that contract gets all of them - this is
+    the assertion that keeps it that way.
+    """
+    upload = shop.post(
+        "/agents/input-credit/history",
+        files={"history": ("history.csv", sample_filing_history().encode(),
+                           "text/csv")}, follow_redirects=False)
+    assert upload.status_code == 303
+    assert "error=" not in upload.headers["location"]
+
+    key, state = _analyse(shop)
+    page = shop.get(f"/agents/input-credit?key={key}").text
+
+    assert state["payload"]["portfolio"]["history_source"] == "file"
+    assert state["payload"]["portfolio"]["history_is_demo"] is False
+    # The demo warning must be gone now that the data is the merchant's own.
+    assert "Do not act on these against a real supplier" not in page
+
+    for supplier in state["payload"]["suppliers"]:
+        assert len(supplier["compliance_grid"]) == 36
+        assert supplier["clocks"]["invoices"]
+
+    gstin = state["payload"]["suppliers"][0]["gstin"]
+    notice = shop.post("/agents/input-credit/notice",
+                       data={"key": key, "gstin": gstin})
+    assert notice.status_code == 200
+    assert "no longer in memory" not in notice.text
+
+
+def test_an_upload_switches_the_source_badge(shop):
+    """The badge is how a merchant knows which world they are looking at."""
+    before = shop.get("/agents/input-credit").text
+    assert "Simulated 36-month history" in before
+
+    shop.post("/agents/input-credit/history",
+              files={"history": ("history.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    after = shop.get("/agents/input-credit").text
+    assert "Uploaded filing history" in after
+    assert "Simulated 36-month history" not in after
+
+    shop.post("/agents/input-credit/history/forget")
+    assert "Simulated 36-month history" in shop.get("/agents/input-credit").text
+
+
+def test_a_history_upload_survives_a_page_load(shop):
+    """Stored, not held for one run. A merchant who assembled three years of
+    filing dates is not asked for them again."""
+    shop.post("/agents/input-credit/history",
+              files={"history": ("history.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    page = shop.get("/agents/input-credit").text
+    assert "periods" in page
+    assert "2023-" in page or "2024-" in page

@@ -8,6 +8,7 @@ as a float; both are arithmetic, and a model that is occasionally, silently
 wrong about a figure destroys the only thing this product sells.
 """
 
+import json
 import sys
 import time
 from datetime import date
@@ -21,11 +22,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from agent.risk_agent import (RiskJudgment, _readable, review,  # noqa: E402
                               strict_schema, unverified_figures)
 from engine.gst.filing_history import (DEFAULT_MONTHS, GSTR1_DUE_DAY,  # noqa: E402
-                                       GSTR3B_DUE_DAY, Persona, history_for)
-from engine.gst.risk import (MIN_PERIODS, PATTERN_CLEAN,  # noqa: E402
+                                       GSTR3B_DUE_DAY, Persona,
+                                       SimulatedHistoryProvider,
+                                       SupplierHistoryService,
+                                       UploadedHistoryProvider, due_dates,
+                                       history_for, normalise_period)
+from engine.gst.risk import (ACT_WATCH, MIN_PERIODS, PATTERN_CLEAN,  # noqa: E402
                              PATTERN_DEFAULTER, PATTERN_LATE, PATTERN_THIN,
-                             exposure_at_risk, profile)
-from merchant.purchase_import import SAMPLE_REGISTER, parse  # noqa: E402
+                             exposure_at_risk, profile, recommended_action)
+from merchant.gstin_lookup import FilingStatusApi  # noqa: E402
+from merchant.purchase_import import (SAMPLE_REGISTER,  # noqa: E402
+                                      filing_history_csv, parse,
+                                      parse_filing_history,
+                                      sample_filing_history)
 from merchant.risk_pipeline import run  # noqa: E402
 
 PASSWORD = "a-good-password"
@@ -395,9 +404,25 @@ def test_a_sample_register_can_be_downloaded(shop):
 
 
 def test_the_page_says_the_history_is_simulated(shop):
+    """
+    With no API and no upload, the page must say the filing dates are made up.
+
+    Not a cosmetic assertion. Everything below that badge - a trust score, a
+    recommendation to stop buying from a named company - reads as fact, and on
+    a fresh install none of it is. The warning is the feature.
+    """
     page = shop.get("/agents/input-credit").text
-    assert "simulated" in page
-    assert "GSP" in page
+    assert "Simulated 36-month history" in page
+    assert "demo mode" in page
+    assert "Do not act on these against a real supplier" in page
+
+
+def test_the_demo_warning_survives_onto_the_results(shop):
+    """A warning only on the upload screen is a warning nobody reads."""
+    key, _state = _analyse(shop)
+    page = shop.get(f"/agents/input-credit?key={key}").text
+    assert "simulated filing history" in page
+    assert "Do not act on these against a real supplier" in page
 
 
 def test_the_disclaimer_is_a_banner(shop):
@@ -672,3 +697,433 @@ def test_every_rung_of_the_ladder_has_a_label():
     for action in (ACT_SAFE, ACT_WATCH, ACT_HOLD, ACT_STOP):
         assert action in ACTION_LABEL, action
         assert action in ACTION_SEVERITY, action
+
+
+# --- one contract, three sources -----------------------------------------
+#
+# The claim this refactor makes is that where filing history came from changes
+# nothing except a provenance label. These tests are what makes that a claim
+# rather than an aspiration - and they are written to fail loudly if anyone
+# later adds a shortcut for one mode that the others do not get.
+
+def _api_serving(histories):
+    """
+    A fake filing-status API that serves given histories in the GSTN's shape.
+
+    Deliberately the government's own field names and its MMYYYY period
+    ordering, so the parser is exercised against the format it will actually
+    meet rather than a convenient one.
+    """
+    class Response:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def http(_method, url, **_kw):
+        gstin = url.rsplit("/", 1)[-1]
+        entries = []
+        for month in histories[gstin].months:
+            year, mm = month.period.split("-")
+            gstn_period = f"{mm}{year}"
+            entries.append(
+                {"rtntype": "GSTR1", "ret_prd": gstn_period,
+                 "dof": month.gstr1_filed.strftime("%d-%m-%Y")}
+                if month.gstr1_filed else
+                {"rtntype": "GSTR1", "ret_prd": gstn_period,
+                 "status": "Not Filed"})
+            entries.append(
+                {"rtntype": "GSTR3B", "ret_prd": gstn_period,
+                 "dof": month.gstr3b_filed.strftime("%d-%m-%Y")}
+                if month.gstr3b_filed else
+                {"rtntype": "GSTR3B", "ret_prd": gstn_period,
+                 "status": "Not Filed"})
+        return Response({"EFiledlist": entries})
+
+    return FilingStatusApi(url_template="https://example.test/returns/{gstin}",
+                           http=http)
+
+
+def _three_services():
+    """The same eight suppliers' history, reached three different ways."""
+    imported = parse(SAMPLE_REGISTER.encode(), "register.csv")
+    gstins = [g.supplier_gstin for g in imported.groups]
+    simulated = {g: history_for(g) for g in gstins}
+
+    uploaded = parse_filing_history(
+        filing_history_csv(simulated.values()).encode(), "history.csv")
+
+    return imported, {
+        "api": SupplierHistoryService(_api_serving(simulated)),
+        "file": SupplierHistoryService(
+            UploadedHistoryProvider(uploaded.histories)),
+        "simulated": SupplierHistoryService(SimulatedHistoryProvider()),
+    }
+
+
+def _without_provenance(payload):
+    """Everything except the fields that are SUPPOSED to differ by mode."""
+    payload = json.loads(json.dumps(payload))
+    for field in ("history_source", "history_source_label",
+                  "history_source_note", "history_is_demo",
+                  "history_failures"):
+        payload["portfolio"].pop(field, None)
+    for supplier in payload["suppliers"]:
+        supplier.pop("history_source", None)
+    return payload
+
+
+def test_all_three_sources_produce_the_same_payload():
+    """
+    The whole point of the abstraction, asserted on the whole payload.
+
+    Not a spot check on a couple of fields: the entire nested structure is
+    compared, so a figure that starts varying by source fails here even if
+    nobody thought to write a test for that particular figure.
+    """
+    imported, services = _three_services()
+    payloads = {name: run(imported, use_agent=False, history=service).as_dict()
+                for name, service in services.items()}
+
+    stripped = {name: _without_provenance(p) for name, p in payloads.items()}
+    assert stripped["api"] == stripped["file"]
+    assert stripped["file"] == stripped["simulated"]
+
+
+def test_every_source_reports_the_same_schema():
+    """Same keys, whatever produced the run - including the provenance keys."""
+    imported, services = _three_services()
+    shapes = []
+    for service in services.values():
+        payload = run(imported, use_agent=False, history=service).as_dict()
+        shapes.append((sorted(payload["portfolio"]),
+                       sorted(payload["suppliers"][0])))
+    assert shapes[0] == shapes[1] == shapes[2]
+
+
+def test_each_source_names_itself_in_the_payload():
+    """A figure a merchant cannot trace to its source is a figure they cannot
+    calibrate their trust against."""
+    imported, services = _three_services()
+    for name, service in services.items():
+        portfolio = run(imported, use_agent=False, history=service).as_dict()
+        assert portfolio["portfolio"]["history_source"] == name
+        assert all(s["history_source"] == name
+                   for s in portfolio["suppliers"])
+
+    demo = run(imported, use_agent=False,
+               history=services["simulated"]).as_dict()
+    assert demo["portfolio"]["history_is_demo"] is True
+    for real in ("api", "file"):
+        payload = run(imported, use_agent=False,
+                      history=services[real]).as_dict()
+        assert payload["portfolio"]["history_is_demo"] is False
+
+
+def test_the_grid_and_the_clocks_are_built_the_same_way_in_every_mode():
+    """The drawer's two interactive pieces must not be a simulator privilege."""
+    imported, services = _three_services()
+    for service in services.values():
+        payload = run(imported, use_agent=False, history=service).as_dict()
+        for supplier in payload["suppliers"]:
+            assert len(supplier["compliance_grid"]) == DEFAULT_MONTHS
+            assert supplier["clocks"]["invoices"]
+            assert supplier["clocks"]["window_days"] == 180
+
+
+# --- absence is not innocence --------------------------------------------
+
+def test_a_supplier_missing_from_an_upload_is_unknown_not_clean():
+    """
+    The single most important rule in the ingestion layer.
+
+    Silently simulating a supplier the file does not mention would put a
+    confident, invented number under a real company's name. Empty scores as
+    TOO_LITTLE_HISTORY, which is the truthful reading of "we have no idea".
+    """
+    provider = UploadedHistoryProvider({})
+    history = provider.history_for("27AAAAA0000A1Z5")
+
+    assert history.months == []
+    assert history.known is False
+    assert profile(history).pattern == PATTERN_THIN
+    assert recommended_action(profile(history)) == ACT_WATCH
+
+
+def test_a_missing_supplier_is_counted_and_reported():
+    """A table of quiet 'unknown' rows that look like a verdict is worse than
+    a banner saying how many could not be found."""
+    imported = parse(SAMPLE_REGISTER.encode(), "register.csv")
+    only_one = imported.groups[0].supplier_gstin
+    provider = UploadedHistoryProvider(
+        {only_one: history_for(only_one)})
+
+    payload = run(imported, use_agent=False,
+                  history=SupplierHistoryService(provider)).as_dict()
+
+    assert payload["portfolio"]["suppliers_without_history"] == \
+        len(imported.groups) - 1
+    known = [s for s in payload["suppliers"] if s["history_known"]]
+    assert [s["gstin"] for s in known] == [only_one]
+
+
+def test_a_blank_filing_date_is_an_assertion_not_a_gap():
+    """
+    The distinction the whole file format turns on.
+
+    A row with an empty GSTR-3B cell says someone checked and it was not filed;
+    that is a countable default. A period with no row at all says nothing and
+    must not be counted against anyone.
+    """
+    asserted = parse_filing_history(
+        b"GSTIN,Period,GSTR-1 Filed Date,GSTR-3B Filed Date\n"
+        b"27AAAAA0000A1Z5,2026-07,2026-08-10,\n"
+        b"27AAAAA0000A1Z5,2026-08,2026-09-10,\n",
+        "history.csv")
+    history = asserted.histories["27AAAAA0000A1Z5"]
+
+    assert len(history.months) == 2
+    assert all(m.sold_but_did_not_pay for m in history.months)
+    assert profile(history).sold_but_did_not_pay == 2
+
+    # The periods nobody supplied a row for simply are not there.
+    assert profile(history).periods == 2
+
+
+def test_a_file_without_a_gstr3b_column_is_refused():
+    """
+    Refusing beats guessing, and here the guess is catastrophic.
+
+    Reading a GSTR-1-only file would set every supplier's GSTR-3B count to
+    zero - 'reported sales, never paid the tax', the most serious finding this
+    product makes - about a merchant's entire supplier book.
+    """
+    result = parse_filing_history(
+        b"GSTIN,Period,GSTR-1 Filed Date\n"
+        b"27AAAAA0000A1Z5,2026-07,2026-08-10\n", "history.csv")
+
+    assert not result.ok
+    assert "gstr3b_filed" in result.missing_columns
+
+
+# --- reading what providers actually send --------------------------------
+
+def test_the_gstn_period_ordering_is_read_correctly():
+    """MMYYYY from the portal, YYYYMM from a spreadsheet. Getting this wrong
+    moves a filing into another month and changes whether it was late."""
+    assert normalise_period("072026") == "2026-07"
+    assert normalise_period("2026-07") == "2026-07"
+    assert normalise_period("07-2026") == "2026-07"
+    assert normalise_period("2026-07-15") == "2026-07"
+    assert normalise_period("garbage") is None
+    assert normalise_period("2026-13") is None
+
+
+def test_due_dates_land_in_the_following_month():
+    """Both returns are due the month AFTER the period, which is what a naive
+    implementation gets wrong every December."""
+    assert due_dates("2026-07") == (date(2026, 8, GSTR1_DUE_DAY),
+                                    date(2026, 8, GSTR3B_DUE_DAY))
+    assert due_dates("2026-12") == (date(2027, 1, GSTR1_DUE_DAY),
+                                    date(2027, 1, GSTR3B_DUE_DAY))
+
+
+def test_an_unrecognised_status_word_is_read_as_not_filed():
+    """The cautious direction. Rounding an unknown status to 'filed' turns a
+    defaulter into a clean supplier, which is the error that costs money."""
+    history = FilingStatusApi.to_history("27AAAAA0000A1Z5", {"EFiledlist": [
+        {"rtntype": "GSTR1", "ret_prd": "072026", "dof": "10-08-2026"},
+        {"rtntype": "GSTR3B", "ret_prd": "072026", "status": "Under Process"},
+    ]})
+    assert history.months[0].sold_but_did_not_pay is True
+
+
+def test_the_earliest_filing_date_wins_over_a_revision():
+    """A period can be filed then revised. The original date is what decides
+    whether it was late, so an amendment must not make a punctual filer look
+    late."""
+    history = FilingStatusApi.to_history("27AAAAA0000A1Z5", {"EFiledlist": [
+        {"rtntype": "GSTR3B", "ret_prd": "072026", "dof": "19-08-2026"},
+        {"rtntype": "GSTR3B", "ret_prd": "072026", "dof": "28-11-2026"},
+    ]})
+    assert history.months[0].gstr3b_filed == date(2026, 8, 19)
+    assert history.months[0].gstr3b_late_days == 0
+
+
+def test_an_unreachable_api_does_not_fall_back_to_the_simulator():
+    """
+    The failure mode this whole abstraction exists to prevent.
+
+    Half a table of genuine records and half of generated ones, with no column
+    saying which, is worse than either alone - it is a screen nobody can
+    calibrate. An unreachable lookup returns unknown and is reported.
+    """
+    def broken(*_a, **_kw):
+        raise ConnectionError("provider is down")
+
+    api = FilingStatusApi(url_template="https://example.test/{gstin}",
+                          http=broken)
+    history = api.history_for("27AAAAA0000A1Z5")
+
+    assert history.months == []
+    assert history.known is False
+    assert api.failures and "provider is down" in api.failures[0][1]
+
+
+def test_api_failures_reach_the_payload():
+    """So the page can say how many could not be read."""
+    def broken(*_a, **_kw):
+        raise ConnectionError("timed out")
+
+    imported = parse(SAMPLE_REGISTER.encode(), "register.csv")
+    payload = run(imported, use_agent=False,
+                  history=SupplierHistoryService(
+                      FilingStatusApi(url_template="https://x.test/{gstin}",
+                                      http=broken))).as_dict()
+
+    assert len(payload["portfolio"]["history_failures"]) == len(imported.groups)
+    assert payload["portfolio"]["suppliers_without_history"] == \
+        len(imported.groups)
+
+
+# --- the round trip a person can check by hand ---------------------------
+
+def test_the_sample_history_reproduces_the_simulated_run():
+    """
+    Download the sample history, upload it, get the same answers.
+
+    This is the demonstration that the mode does not change the answer, and it
+    is a test rather than a README sentence so it cannot quietly stop being
+    true.
+    """
+    imported = parse(SAMPLE_REGISTER.encode(), "register.csv")
+    uploaded = parse_filing_history(sample_filing_history().encode(), "h.csv")
+
+    simulated = run(imported, use_agent=False,
+                    history=SupplierHistoryService(
+                        SimulatedHistoryProvider())).as_dict()
+    from_file = run(imported, use_agent=False,
+                    history=SupplierHistoryService(
+                        UploadedHistoryProvider(uploaded.histories))).as_dict()
+
+    for a, b in zip(simulated["suppliers"], from_file["suppliers"]):
+        assert a["gstin"] == b["gstin"]
+        assert a["trust_score"] == b["trust_score"]
+        assert a["pattern"] == b["pattern"]
+        assert a["action"] == b["action"]
+        assert a["at_risk"] == b["at_risk"]
+        assert a["compliance_grid"] == b["compliance_grid"]
+
+
+# --- mode A configuration -------------------------------------------------
+
+@pytest.fixture
+def biz(tmp_path, monkeypatch):
+    """A signed-in owner with one business, for the configuration routes."""
+    import merchant.app as appmod
+
+    monkeypatch.setattr(appmod, "DB", str(tmp_path / "app.db"))
+    client = TestClient(appmod.app)
+    client.post("/signup", data={"email": "meera@x.in", "password": PASSWORD})
+    client.post("/businesses", data={"name": "Meera's Boutique"})
+    client.post("/sources/simulator")
+    return client
+
+
+@pytest.mark.parametrize("url,why", [
+    ("http://provider.test/returns/{gstin}", "must be https"),
+    ("https://provider.test/returns/", "{gstin} placeholder"),
+])
+def test_a_bad_endpoint_is_refused_before_anything_is_stored(biz, url, why):
+    """
+    Both refusals matter. A URL with no placeholder would query the same
+    supplier every time and quietly score a whole book against one company's
+    record; an http URL puts a GST API key in cleartext on every hop.
+    """
+    response = biz.post("/agents/input-credit/setup/filing-api",
+                        data={"url_template": url, "api_key": "k",
+                              "key_header": "x-api-key"},
+                        follow_redirects=False)
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+
+    page = biz.get("/agents/input-credit").text
+    assert "Simulated 36-month history" in page
+
+
+def test_a_key_with_nowhere_to_go_is_refused(biz):
+    """A key with neither a header nor a parameter name would be silently
+    dropped, and the merchant would think they were authenticated."""
+    response = biz.post("/agents/input-credit/setup/filing-api",
+                        data={"url_template": "https://p.test/{gstin}",
+                              "api_key": "secret"},
+                        follow_redirects=False)
+    assert "error=" in response.headers["location"]
+
+
+def test_a_configured_api_becomes_the_active_source(biz):
+    """Evidence first: a configured API outranks an upload, which outranks the
+    simulator."""
+    biz.post("/agents/input-credit/setup/filing-api",
+             data={"url_template": "https://p.test/{gstin}"})
+
+    page = biz.get("/agents/input-credit").text
+    assert "Connected GST API" in page
+    assert "Simulated 36-month history" not in page
+
+    biz.post("/agents/input-credit/setup/filing-api/forget")
+    assert "Simulated 36-month history" in biz.get("/agents/input-credit").text
+
+
+def test_staff_cannot_change_where_filing_history_comes_from(tmp_path,
+                                                             monkeypatch):
+    """
+    Same reasoning as the rate card.
+
+    Whoever decides where filing history comes from decides what every
+    supplier score is computed against - point it at an endpoint that reports
+    everyone as compliant and the findings quietly stop appearing.
+    """
+    import merchant.app as appmod
+
+    monkeypatch.setattr(appmod, "DB", str(tmp_path / "app.db"))
+    owner = TestClient(appmod.app)
+    owner.post("/signup", data={"email": "owner@x.in", "password": PASSWORD})
+    owner.post("/businesses", data={"name": "Meera's Boutique"})
+
+    staff = TestClient(appmod.app)
+    staff.post("/signup", data={"email": "staff@x.in", "password": PASSWORD})
+
+    with appmod.ledger(None) as led:
+        from merchant.auth import Auth, Role
+
+        auth = Auth(led.conn)
+        user = auth.by_email("staff@x.in")
+        business = led.conn.execute(
+            "SELECT business_id FROM businesses LIMIT 1").fetchone()
+        auth.add_member(business["business_id"], user["user_id"], Role.STAFF)
+
+    # Switching is a GET. Assert it worked rather than assuming - a staff
+    # member who never entered the business would be refused for the wrong
+    # reason and this test would pass without testing anything.
+    staff.get(f"/switch?business_id={business['business_id']}")
+    assert staff.get("/agents/input-credit").status_code == 200
+
+    response = staff.post("/agents/input-credit/setup/filing-api",
+                          data={"url_template": "https://evil.test/{gstin}"},
+                          follow_redirects=False)
+    assert response.status_code == 403
+
+    with appmod.ledger(None) as led:
+        from merchant.sources import Sources
+
+        assert Sources(led.conn).filing_api_config(
+            business["business_id"]) is None
+
+    # And the owner, in the same business, can.
+    assert owner.post("/agents/input-credit/setup/filing-api",
+                      data={"url_template": "https://good.test/{gstin}"},
+                      follow_redirects=False).status_code == 303

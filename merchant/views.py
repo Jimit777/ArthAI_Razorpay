@@ -447,6 +447,34 @@ tr.clickable:hover td { background:var(--raised) }
   letter-spacing:-.02em; font-variant-numeric:tabular-nums }
 .clock .what { font-size:11.6px; color:var(--ink-2); line-height:1.45 }
 @media (max-width:560px) { .clocks { grid-template-columns:1fr } }
+
+/* --- which filing-history source is live ------------------------------- */
+/* Stated on both the upload screen and the results, because a trust score
+   reads as fact and one computed from generated dates has to carry that on
+   the same screen rather than one click away. */
+.src { display:flex; align-items:flex-start; gap:11px; padding:13px 16px;
+  border:1px solid var(--line); border-radius:10px; margin-bottom:16px;
+  background:var(--card) }
+.src b { font-size:13px }
+.src .src-what { font-size:11.8px; color:var(--ink-2); line-height:1.5;
+  margin-top:3px }
+.src > div { flex:1 }
+.src-dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto;
+  margin-top:5px; background:var(--muted) }
+.src.ok { border-color:var(--good); background:var(--good-wash) }
+.src.ok .src-dot { background:var(--good) }
+.src.demo { border-color:var(--warn); background:var(--warn-wash) }
+.src.demo .src-dot { background:var(--warn) }
+.src form, .src a.btn { flex:0 0 auto }
+
+/* --- the three modes, side by side ------------------------------------- */
+.modes { display:grid; grid-template-columns:repeat(3,1fr); gap:11px;
+  margin-top:11px }
+.modes > div { border:1px solid var(--line-2); border-radius:9px;
+  padding:11px 13px }
+.modes b { display:block; font-size:12.2px; margin-bottom:3px }
+.modes span { font-size:11.4px; color:var(--ink-2); line-height:1.45 }
+@media (max-width:720px) { .modes { grid-template-columns:1fr } }
 """
 
 CSS = TOKENS + SHELL + COMPONENTS

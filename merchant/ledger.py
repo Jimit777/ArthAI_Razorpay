@@ -132,6 +132,27 @@ CREATE TABLE IF NOT EXISTS live_gstr2b (
   recorded_at     INTEGER
 );
 
+-- Mode B: filing history a merchant assembled and uploaded, one row per
+-- supplier per tax period.
+--
+-- A NULL filing date here is an ASSERTION, not a gap: the row exists because
+-- somebody looked at that period and the return was not filed. A period with
+-- no row at all makes no claim either way and is never counted. That
+-- distinction is the whole reason this is stored per period rather than as a
+-- blob - see engine/gst/filing_history.py, where the same rule is enforced on
+-- the way in.
+CREATE TABLE IF NOT EXISTS supplier_filing_history (
+  business_id     TEXT NOT NULL,
+  supplier_gstin  TEXT NOT NULL,
+  period          TEXT NOT NULL,     -- 'YYYY-MM'
+  gstr1_filed     TEXT,              -- ISO date, or NULL for 'did not file'
+  gstr3b_filed    TEXT,
+  registration_status TEXT DEFAULT 'active',
+  source_file     TEXT,
+  uploaded_at     INTEGER,
+  PRIMARY KEY (business_id, supplier_gstin, period)
+);
+
 CREATE TABLE IF NOT EXISTS business_itc_runs (
   run_id      TEXT PRIMARY KEY,
   business_id TEXT NOT NULL,
@@ -585,6 +606,88 @@ class Ledger:
             " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         self.conn.commit()
         return {"added": len(rows), "removed": removed}
+
+    # --- mode B storage ---------------------------------------------------
+
+    def replace_filing_history(self, imported) -> dict:
+        """
+        Store an uploaded filing history, replacing what was held before.
+
+        Replacing wholesale rather than merging per period. A merchant who
+        re-uploads is correcting the file, and a merge would leave rows from
+        the old one alive underneath - which for this table means a period
+        someone deliberately removed silently keeps counting as a default.
+        """
+        import time
+
+        business_id = self._scoped()
+        self.conn.execute(
+            "DELETE FROM supplier_filing_history WHERE business_id = ?",
+            (business_id,))
+
+        now = int(time.time())
+        rows = []
+        for gstin, history in imported.histories.items():
+            for month in history.months:
+                rows.append((
+                    business_id, gstin, month.period,
+                    month.gstr1_filed.isoformat() if month.gstr1_filed else None,
+                    month.gstr3b_filed.isoformat() if month.gstr3b_filed else None,
+                    history.registration_status, imported.filename, now))
+
+        self.conn.executemany(
+            "INSERT INTO supplier_filing_history (business_id, supplier_gstin,"
+            " period, gstr1_filed, gstr3b_filed, registration_status,"
+            " source_file, uploaded_at) VALUES (?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return {"suppliers": len(imported.histories), "periods": len(rows)}
+
+    def filing_history(self) -> dict:
+        """
+        Everything held for this business, in the standard contract.
+
+        Returns GSTIN -> FilingHistory, ready to hand to
+        UploadedHistoryProvider. Empty means mode B is not available and the
+        caller should fall back - which it decides, not this.
+        """
+        from engine.gst.filing_history import SOURCE_FILE, from_filing_rows
+
+        grouped: dict[str, list[dict]] = {}
+        statuses: dict[str, str] = {}
+        for row in self.conn.execute(
+                "SELECT * FROM supplier_filing_history WHERE business_id = ?"
+                " ORDER BY supplier_gstin, period", (self._scoped(),)):
+            grouped.setdefault(row["supplier_gstin"], []).append({
+                "period": row["period"],
+                "gstr1_filed": row["gstr1_filed"],
+                "gstr3b_filed": row["gstr3b_filed"]})
+            statuses[row["supplier_gstin"]] = (
+                row["registration_status"] or "active")
+
+        return {gstin: from_filing_rows(
+                    gstin, rows, source=SOURCE_FILE,
+                    registration_status=statuses.get(gstin, "active"))
+                for gstin, rows in grouped.items()}
+
+    def filing_history_summary(self) -> dict:
+        """What the page needs to describe the upload without loading it all."""
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT supplier_gstin) AS suppliers,"
+            " COUNT(*) AS periods, MIN(period) AS first_period,"
+            " MAX(period) AS last_period, MAX(uploaded_at) AS uploaded_at,"
+            " MAX(source_file) AS source_file"
+            " FROM supplier_filing_history WHERE business_id = ?",
+            (self._scoped(),)).fetchone()
+        if row is None or not row["suppliers"]:
+            return {}
+        return dict(row)
+
+    def forget_filing_history(self) -> int:
+        removed = self.conn.execute(
+            "DELETE FROM supplier_filing_history WHERE business_id = ?",
+            (self._scoped(),)).rowcount
+        self.conn.commit()
+        return removed
 
     def import_gstr2b(self, lines, period: str = "") -> dict:
         """
