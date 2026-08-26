@@ -1915,6 +1915,17 @@ async def start_cash_forecast(request: Request,
     form = await request.form()
     source = str(form.get("source") or "demo")
 
+    # An agent that is switched off must not produce findings. The header
+    # said "Switched off" while the page ran anyway, which is a screen
+    # disagreeing with itself about whether the work happened.
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "cash_forecaster"):
+            return RedirectResponse(
+                "/agents/cash-forecaster?error="
+                + quote("This agent is switched off for this business. Turn it on from Agents."), status_code=303)
+
     key = f"cash_{int(time.time() * 1000)}"
     with _cash_lock:
         CASH_RUNS[key] = {"state": "running", "business_id": ws.business_id,
@@ -2307,6 +2318,15 @@ def forget_recon_sources(ws: Workspace = Depends(required_workspace)):
 async def start_three_way(request: Request,
                           ws: Workspace = Depends(required_workspace)):
     """Generate the three sources, join them, and explain the leftovers."""
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "three_way_recon"):
+            return RedirectResponse(
+                "/agents/three-way?error="
+                + quote("This agent is switched off for this business. "
+                        "Turn it on from Agents."), status_code=303)
+
     form = await request.form()
     try:
         n = max(50, min(300, int(form.get("records") or 55)))

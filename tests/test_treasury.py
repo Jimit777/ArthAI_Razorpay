@@ -409,9 +409,58 @@ def test_a_demo_run_reaches_the_dashboard(shop):
     assert state["state"] == "done", state
 
     page = shop.get(f"/agents/cash-forecaster?key={key}").text
-    assert "lowest point" in page
-    assert "below the safe floor" in page
+    # The verdict leads: what is wrong, when, and what to do - in that order.
+    assert "You run short on" in page
+    assert "What to do" in page
+    assert "safe floor" in page
     assert "The days that move" in page
+
+
+def test_the_page_leads_with_the_decision_not_the_balance(shop):
+    """
+    Regression on a design defect. The first version led with "in the account
+    today", which is the least actionable number here - a controller opening
+    this wants to know whether they are fine, when they are not, and what to
+    do, in that order.
+    """
+    key, state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+
+    verdict_at = page.index('class="verdict')
+    today_at = page.index(state["payload"]["forecast"]["opening_display"])
+    assert verdict_at < today_at, "today's balance is leading again"
+
+    # And the date is written for a person, not parsed from an ISO string.
+    assert "10 September" in page
+
+
+def test_the_chart_carries_its_own_scale(shop):
+    """
+    A dramatic-looking cliff with no vertical axis could be a rupee or a lakh.
+    The first version drew the shape and left the reader to infer the numbers.
+    """
+    key, _state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+
+    assert page.count('class="curve-grid"') >= 3, "no vertical scale"
+    assert "curve-floor-line" in page
+    # And the low point is labelled ON the chart, not only in a card above it.
+    assert 'class="curve-tag' in page
+
+
+def test_the_danger_band_has_height(shop):
+    """
+    The floor used to sit on the bottom edge because the axis was forced to
+    zero, which made the danger band - the entire point of the chart - a line
+    one pixel tall.
+    """
+    import re
+
+    key, _state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    band = re.search(r'<rect[^>]*fill="var\(--danger\)"[^>]*>', page).group(0)
+    height = float(re.search(r'height="([\d.]+)"', band).group(1))
+    assert height > 10, f"the danger band is {height}px tall"
 
 
 def test_the_curve_is_drawn_and_the_danger_zone_marked(shop):
@@ -551,3 +600,31 @@ def test_only_the_line_turns_red_not_the_whole_month(shop):
 
     assert "var(--brand)" in area, "the area under the curve should stay calm"
     assert "var(--danger)" in line, "the line itself marks the breach"
+
+
+def test_the_axis_does_not_invent_negative_territory(shop):
+    """
+    Padding the bottom by a share of the whole span put the axis at minus one
+    and a third lakh on a month that never goes negative - a chunk of empty
+    chart labelled with a number that cannot happen.
+    """
+    key, state = _forecast(shop)
+    assert state["payload"]["forecast"]["trough"]["below_zero"] is False
+
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    labels = page.split('class="curve-grid"')[1:]
+    assert labels
+    assert not any("Rs -" in label.split("</div>")[0] for label in labels)
+
+
+def test_the_card_does_not_restate_the_verdict(shop):
+    """
+    Without the agent the card repeated the headline sentence word for word,
+    so the same figures were read twice and neither said anything new.
+    """
+    key, state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    detail = state["payload"]["forecast"]["detail"]
+
+    card = page.split('class="finding-card"')[1]
+    assert detail not in card

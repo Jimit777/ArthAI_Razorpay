@@ -186,6 +186,18 @@ CREATE TABLE IF NOT EXISTS resolution_memory (
 """
 
 
+# Bytes of randomness after the millisecond prefix.
+#
+# Three was not enough, and the test that says so was intermittently red
+# rather than wrong. Within a single millisecond every id shares its prefix,
+# so uniqueness rests entirely on the suffix - and 24 bits gives roughly a
+# one-in-a-hundred chance of a collision across 500 ids, which is exactly what
+# a loop over seeds generates. A primary key whose docstring promises "unique
+# regardless" should not fail once in a hundred runs. Four bytes takes that to
+# about three in a hundred thousand and costs two characters.
+RUN_ID_BYTES = 4
+
+
 def new_run_id() -> str:
     """
     Sortable by time, unique regardless.
@@ -194,7 +206,7 @@ def new_run_id() -> str:
     millisecond is not exotic, it is what a loop over seeds does. The random
     suffix costs nothing and the timestamp prefix keeps ids sorting in run order.
     """
-    return f"run_{int(time.time() * 1000):x}_{secrets.token_hex(3)}"
+    return f"run_{int(time.time() * 1000):x}_{secrets.token_hex(RUN_ID_BYTES)}"
 
 
 class Store:

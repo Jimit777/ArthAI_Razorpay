@@ -282,8 +282,15 @@ def test_run_ids_are_unique_even_in_the_same_millisecond():
     A bare millisecond timestamp collided the first time two runs were saved in
     a loop. My original version of this test asserted `>= 1`, which is true of
     any non-empty set and proves nothing - it passed while the bug was live.
+
+    It then went intermittently red, roughly once in a hundred runs, and that
+    was the test being right rather than flaky: a three-byte suffix carries
+    about a one percent chance of a collision across 500 ids generated inside
+    one millisecond. Widened to four. Ten thousand here rather than five
+    hundred, so a suffix that is too short fails every time instead of
+    occasionally.
     """
-    assert len({new_run_id() for _ in range(500)}) == 500
+    assert len({new_run_id() for _ in range(10_000)}) == 10_000
 
 
 def test_run_ids_sort_in_time_order():

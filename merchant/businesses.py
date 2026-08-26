@@ -435,17 +435,38 @@ class Businesses:
 
     # --- agents -----------------------------------------------------------
 
+    # No row is not the same as a row saying "off".
+    #
+    # A business gets a row per agent when it is created, so an absent row can
+    # only mean one thing: the agent did not exist yet when this business was
+    # made. Reading that as "switched off" meant every business created before
+    # an agent shipped found it silently disabled - and the header said
+    # "Switched off" over a decision nobody had made.
+    #
+    # So absence means "not yet decided", which resolves to on. Only an
+    # explicit 0 - somebody went to Agents and turned it off - is off.
+
     def enabled_agents(self, business_id: str) -> set[str]:
-        return {r["agent_id"] for r in self.conn.execute(
-            "SELECT agent_id FROM business_agents"
-            " WHERE business_id = ? AND enabled = 1", (business_id,))}
+        from merchant.catalog import live_agents
+
+        decided = {r["agent_id"]: bool(r["enabled"]) for r in self.conn.execute(
+            "SELECT agent_id, enabled FROM business_agents"
+            " WHERE business_id = ?", (business_id,))}
+        out = {a for a, on in decided.items() if on}
+        out |= {spec.id for spec in live_agents() if spec.id not in decided}
+        return out
 
     def agent_enabled(self, business_id: str, agent_id: str) -> bool:
         row = self.conn.execute(
             "SELECT enabled FROM business_agents"
             " WHERE business_id = ? AND agent_id = ?",
             (business_id, agent_id)).fetchone()
-        return bool(row["enabled"]) if row else False
+        if row is not None:
+            return bool(row["enabled"])
+        from merchant.catalog import get
+
+        spec = get(agent_id)
+        return bool(spec and spec.is_live)
 
     def set_agent(self, business_id: str, agent_id: str, enabled: bool) -> None:
         self.conn.execute(

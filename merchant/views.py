@@ -1573,14 +1573,70 @@ CASH_TONE = {
 }
 
 
-def cash_curve(forecast: dict, height: int = 190) -> str:
-    """
-    Thirty days as an inline SVG, with the danger zone shaded.
+# Round figures to put an axis on, in PAISE. Written out rather than computed
+# because the obvious computation - divide by a power of ten - is what
+# produced an axis reading 2.7L, and because a constant named 1_00_000 in a
+# paise codebase reads as a lakh and is a thousand rupees.
+GRID_STEPS_PAISE = (
+    1_000_00,        # Rs 1,000
+    5_000_00,        # Rs 5,000
+    10_000_00,       # Rs 10,000
+    25_000_00,       # Rs 25,000
+    50_000_00,       # Rs 50,000
+    1_00_000_00,     # Rs 1 lakh
+    2_00_000_00,     # Rs 2 lakh
+    5_00_000_00,     # Rs 5 lakh
+    10_00_000_00,    # Rs 10 lakh
+    25_00_000_00,    # Rs 25 lakh
+    1_00_00_000_00,  # Rs 1 crore
+)
 
-    Hand-built rather than charted: it is one polyline, one shaded band and a
-    marker, and pulling in a charting library for that would add a dependency
-    and a build step to draw thirty points. Everything is computed server-side
-    - the browser is handed coordinates, never figures to work out.
+
+def _short_rupees(paise: int) -> str:
+    """
+    A rupee figure short enough for an axis label.
+
+    Lakhs, because that is how the reader thinks about their own balance -
+    "Rs 7.1L" is read at a glance and "Rs 7,05,000.00" has to be counted.
+    Only ever used on the chart furniture; every figure a decision rests on
+    is written out in full.
+    """
+    rupees = paise / 100
+    if abs(rupees) >= 1_00_000:
+        lakhs = rupees / 1_00_000
+        # No decimal on a whole number of lakhs. "Rs 10.0L" reads as a
+        # measurement; "Rs 10L" reads as the round figure it is.
+        return (f"Rs {lakhs:.0f}L" if abs(lakhs - round(lakhs)) < 0.05
+                else f"Rs {lakhs:.1f}L")
+    if abs(rupees) >= 1_000:
+        return f"Rs {rupees / 1_000:.0f}k"
+    return f"Rs {rupees:,.0f}"
+
+
+def cash_curve(forecast: dict, height: int = 210) -> str:
+    """
+    Thirty days as a chart somebody can read without being told what it says.
+
+    Three things the first version got wrong, all of them the same mistake -
+    drawing a shape and leaving the reader to infer the numbers:
+
+      no vertical scale at all, so a dramatic-looking cliff could have been
+      a rupee or a lakh and there was no way to tell
+
+      the axis forced to zero, which pushed the safe floor onto the bottom
+      edge and made the danger band - the entire point of the chart - a line
+      one pixel tall
+
+      the low point marked with a dot and no value on it, so the one figure
+      the reader came for was in a stat card somewhere above
+
+    The scale now starts below the floor rather than at zero. That is a real
+    trade - a non-zero baseline exaggerates the drop - and it is made honest
+    by labelling the axis, which is the thing that was missing before.
+
+    Labels are HTML positioned by percentage rather than SVG text: the plot
+    uses preserveAspectRatio="none" so it can stretch to any width, and text
+    inside it would stretch with it.
     """
     positions = forecast.get("positions") or []
     if not positions:
@@ -1588,68 +1644,112 @@ def cash_curve(forecast: dict, height: int = 190) -> str:
 
     floor = forecast.get("floor", 0)
     balances = [p["closing"] for p in positions]
-    top = max(max(balances), floor) * 1.08 or 1
-    bottom = min(min(balances), 0)
+
+    # Room above the peak, and below the floor - but only as much below as the
+    # floor itself needs to be legible.
+    #
+    # Padding the bottom by a share of the whole span put the axis at minus one
+    # and a third lakh on a month that never goes negative, which is a chunk of
+    # empty chart labelled with a number that cannot happen. Padding by a share
+    # of the FLOOR keeps the danger band a readable height without inventing
+    # territory below zero.
+    high = max(max(balances), floor)
+    low = min(min(balances), floor)
+    top = high + (high - low) * 0.10
+    bottom = min(low, 0) - max(floor * 0.5, 1)
     span = (top - bottom) or 1
 
-    width, pad = 720, 8
+    width, pad = 720, 6
     step = (width - pad * 2) / max(1, len(positions) - 1)
 
+    def pct(value: int) -> float:
+        """Where a rupee figure sits, top-down, as a percentage."""
+        return (top - value) / span * 100
+
     def y(value: int) -> float:
-        return pad + (top - value) / span * (height - pad * 2)
+        return pct(value) / 100 * height
 
     points = " ".join(f"{pad + i * step:.1f},{y(b):.1f}"
                       for i, b in enumerate(balances))
-    area = (f"{pad:.1f},{y(bottom):.1f} " + points
-            + f" {pad + (len(balances) - 1) * step:.1f},{y(bottom):.1f}")
+    area = (f"{pad:.1f},{height:.1f} " + points
+            + f" {pad + (len(balances) - 1) * step:.1f},{height:.1f}")
 
-    # The danger zone: everything below the safe floor, shaded across the
-    # whole width so the curve entering it is visible rather than inferred.
     floor_y = y(floor)
-    danger = (f'<rect x="{pad}" y="{floor_y:.1f}" width="{width - pad * 2}" '
-              f'height="{max(0, y(bottom) - floor_y):.1f}" '
-              f'fill="var(--danger)" opacity="0.09"></rect>'
-              f'<line x1="{pad}" y1="{floor_y:.1f}" x2="{width - pad}" '
-              f'y2="{floor_y:.1f}" stroke="var(--danger)" '
-              f'stroke-dasharray="4 4" stroke-width="1"></line>')
+    danger = (f'<rect x="0" y="{floor_y:.1f}" width="{width}" '
+              f'height="{max(0, height - floor_y):.1f}" '
+              f'fill="var(--danger)" opacity="0.10"></rect>')
 
     trough = forecast.get("trough") or {}
-    marker = ""
+    marker = tag = ""
     if trough:
         index = max(0, min(len(balances) - 1, trough["day"] - 1))
-        cx, cy = pad + index * step, y(trough["balance"])
+        cx = pad + index * step
         breached = trough.get("shortfall", 0) > 0
         colour = "var(--danger)" if breached else "var(--warn)"
         marker = (
-            f'<line x1="{cx:.1f}" y1="{pad}" x2="{cx:.1f}" '
-            f'y2="{y(bottom):.1f}" stroke="{colour}" stroke-width="1" '
-            f'opacity=".45"></line>'
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4.5" fill="{colour}">'
-            f'</circle>')
+            f'<line x1="{cx:.1f}" y1="0" x2="{cx:.1f}" y2="{height}" '
+            f'stroke="{colour}" stroke-width="1" opacity=".4"></line>'
+            f'<circle cx="{cx:.1f}" cy="{y(trough["balance"]):.1f}" r="4.5" '
+            f'fill="{colour}"></circle>')
+        # The one figure the reader came for, on the chart rather than in a
+        # card above it.
+        side = "left" if index < len(balances) * 0.7 else "right"
+        offset = (f'left:{cx / width * 100:.1f}%' if side == "left"
+                  else f'right:{(1 - cx / width) * 100:.1f}%')
+        tag = (f'<div class="curve-tag {side}" '
+               f'style="{offset};top:{pct(trough["balance"]):.1f}%">'
+               f'<b>{esc(trough.get("balance_display", ""))}</b>'
+               f'<span>day {trough["day"]} &middot; '
+               f'{esc(trough.get("date", ""))}</span></div>')
 
-    # The LINE turns red when the month breaks; the area under it does not.
-    # Filling thirty days in danger colour because one of them is bad reads as
-    # "this whole month is a crisis", which is both untrue and the fastest way
-    # to teach somebody to ignore the colour.
-    breached = bool(trough.get("shortfall") or 0)
-    stroke = "var(--danger)" if breached else "var(--brand)"
+    # Gridlines on genuinely round numbers, not on evenly divided data - an
+    # axis reading 2.7L / 5.7L / 8.7L is arithmetic nobody asked for, and that
+    # is exactly what dividing the span into fifths produced.
+    #
+    # The first attempt rounded with `value / 1_00_000`, which looks like a
+    # lakh and is a THOUSAND rupees here, because everything in this codebase
+    # is paise. Hence the ladder below, written in paise and spelled out.
+    lines = []
+    # Six intervals rather than five: the tighter bound skipped a whole rung
+    # of the ladder and left a three-line axis on a twelve-lakh span.
+    for step in GRID_STEPS_PAISE:
+        if (top - bottom) / step <= 6.5:
+            break
+    start = int(bottom // step) * step
+    value = start
+    while value <= top:
+        if bottom <= value <= top:
+            lines.append(
+                f'<div class="curve-grid" style="top:{pct(value):.1f}%">'
+                f'<span>{esc(_short_rupees(int(value)))}</span></div>')
+        value += step
+
+    breached_line = (trough.get("shortfall") or 0) > 0
+    stroke = "var(--danger)" if breached_line else "var(--brand)"
+
     first, last = positions[0], positions[-1]
+    day_marks = f'<span>{esc(first["date"])}</span>'
+    if trough:
+        day_marks += (f'<span class="curve-day">day {trough["day"]}</span>')
+    day_marks += f'<span>{esc(last["date"])}</span>'
+
     return f"""
 <div class="curve">
-  <svg viewBox="0 0 {width} {height}" preserveAspectRatio="none"
-       role="img" aria-label="Thirty day cash projection">
-    {danger}
-    <polygon points="{area}" fill="var(--brand)" opacity="0.06"></polygon>
-    <polyline points="{points}" fill="none" stroke="{stroke}"
-      stroke-width="2" stroke-linejoin="round"></polyline>
-    {marker}
-  </svg>
-  <div class="curve-axis">
-    <span>{esc(first["date"])} &middot; day 1</span>
-    <span class="curve-floor">safe floor
-      {esc(forecast.get("floor_display", ""))}</span>
-    <span>{esc(last["date"])} &middot; day {last["day"]}</span>
+  <div class="curve-plot" style="height:{height}px">
+    <svg viewBox="0 0 {width} {height}" preserveAspectRatio="none"
+         role="img" aria-label="Thirty day cash projection">
+      {danger}
+      <polygon points="{area}" fill="var(--brand)" opacity="0.06"></polygon>
+      <polyline points="{points}" fill="none" stroke="{stroke}"
+        stroke-width="2" stroke-linejoin="round"></polyline>
+      {marker}
+    </svg>
+    {"".join(lines)}
+    <div class="curve-floor-line" style="top:{pct(floor):.1f}%">
+      <span>safe floor {esc(forecast.get("floor_display", ""))}</span></div>
+    {tag}
   </div>
+  <div class="curve-axis">{day_marks}</div>
 </div>"""
 
 
@@ -1671,7 +1771,7 @@ def cash_results(payload: dict, key: str = "") -> str:
             f'{"yes" if c["ok"] else "no"}</b></div>'
             for c in accuracy["checks"])
         measured = (
-            f'<details class="working" style="margin-top:13px">'
+            f'<details class="working" style="margin:0 16px 14px">'
             f'<summary>Checked against the planted scenario &mdash; '
             f'{accuracy["passed"]} of {accuracy["total"]}</summary>'
             f'<div class="working-body">{checks}'
@@ -1692,6 +1792,40 @@ def cash_results(payload: dict, key: str = "") -> str:
                  f'decision in a cash forecast and it is what to do about the '
                  f'low point.</div>')
 
+    # The verdict, before anything else. The first version led with "in the
+    # account today", which is the least actionable number on the page - a
+    # controller opening this wants to know whether they are fine, when they
+    # are not, and what to do, in that order.
+    breached = bool(trough.get("shortfall"))
+    if breached:
+        verdict = f"""
+  <div class="verdict bad">
+    <div>
+      <div class="verdict-what">You run short on
+        {esc(_day_words(trough.get("date", "")))}</div>
+      <div class="verdict-why">
+        {esc(trough.get("shortfall_display", ""))} short of the
+        {esc(forecast.get("floor_display", ""))} floor, on day
+        {trough.get("day", "")} of {meta["days"]}.
+        {"Moving one payment covers it." if forecast.get("coverable_by_delay")
+         else "Rescheduling will not cover it &mdash; this needs funding."}
+      </div>
+    </div>
+    <div class="verdict-do">
+      <span>What to do</span><b>{esc(forecast["action_label"])}</b></div>
+  </div>"""
+    else:
+        verdict = f"""
+  <div class="verdict ok">
+    <div>
+      <div class="verdict-what">The next {meta["days"]} days hold</div>
+      <div class="verdict-why">The balance never falls below
+        {esc(trough.get("balance_display", ""))}, and the floor is
+        {esc(forecast.get("floor_display", ""))}.</div>
+    </div>
+    <div class="verdict-do"><span>What to do</span><b>Nothing</b></div>
+  </div>"""
+
     return f"""
 <div class="banner brand" style="margin-bottom:16px">
   <span><b>Nothing here is paid, moved or scheduled.</b> This projects a
@@ -1699,34 +1833,31 @@ def cash_results(payload: dict, key: str = "") -> str:
 </div>
 
 <div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
-  <div class="stats">
-    <div class="stat"><b>{esc(forecast["opening_display"])}</b>
-      <span>in the account today</span></div>
-    <div class="stat"><b style="color:{"var(--danger)" if trough.get("shortfall")
-                                       else "var(--ink)"}">
-      {esc(trough.get("balance_display", "&mdash;"))}</b>
-      <span>lowest point, day {trough.get("day", "&mdash;")}</span></div>
-    <div class="stat"><b style="color:{"var(--danger)" if trough.get("shortfall")
-                                       else "var(--muted)"}">
-      {esc(trough.get("shortfall_display", "Rs 0.00"))}</b>
-      <span>below the safe floor</span></div>
-    <div class="stat"><b>{esc(forecast["closing_display"])}</b>
-      <span>after {meta["days"]} days</span></div>
-  </div>
+  {verdict}
   {cash_curve(forecast)}
-  <div style="padding:11px 16px;border-top:1px solid var(--line-2);
-    color:var(--muted);font-size:11.5px">
-    {esc(forecast["detail"])} Every figure here was computed before the agent
-    was asked &mdash; the model is not permitted to do arithmetic on a running
-    balance, where being right ninety-nine times out of a hundred still means
-    being wrong about the month.
-    {measured}
+  <div class="curve-legend">
+    <span><b>{esc(forecast["opening_display"])}</b> today</span>
+    <span><b>{esc(forecast.get("receipts_after_trough_display", ""))}</b>
+      arriving after the low point</span>
+    <span><b>{esc(forecast["closing_display"])}</b> after {meta["days"]} days</span>
   </div>
+  {measured}
   {spend}
 </div>
 
 {_cash_alert(payload, tone, badge)}
 {_cash_days(forecast)}"""
+
+
+def _day_words(iso: str) -> str:
+    """A date a person reads rather than parses. "10 September", not 2026-09-10."""
+    from datetime import date as _date
+
+    try:
+        when = _date.fromisoformat(str(iso)[:10])
+    except (TypeError, ValueError):
+        return str(iso)
+    return f"{when.day} {when.strftime('%B')}"
 
 
 def _cash_alert(payload: dict, tone: str, badge) -> str:
@@ -1793,7 +1924,11 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
     {badge(forecast["finding_label"], tone or "bad")}
   </div>
   <p class="finding-card-why">
-    {esc(verdict.get("reasoning") or forecast["detail"])}</p>
+    {esc(verdict["reasoning"]) if verdict.get("reasoning") else
+     "The figures are below. What the agent adds is which of the movable "
+     "payments to actually move &mdash; it weighs a supplier relationship "
+     "against an interest charge, which no comparison of totals produces. "
+     "Run this again with the agent on to get that."}</p>
 
   <div class="facts">
     <div class="fact"><span>Short by</span>
@@ -1872,14 +2007,70 @@ def _cash_days(forecast: dict) -> str:
 
 COMPONENTS += """
 /* --- the thirty-day cash curve ----------------------------------------- */
-/* One polyline, one shaded danger band, one marker on the low point. Drawn
-   server-side from computed coordinates - the browser is never handed a
-   figure to work out. */
-.curve { padding:14px 16px 10px; border-top:1px solid var(--line-2) }
-.curve svg { width:100%; height:190px; display:block }
-.curve-axis { display:flex; justify-content:space-between; margin-top:6px;
+/* Drawn server-side from computed coordinates - the browser is never handed
+   a figure to work out. Axis labels are HTML rather than SVG text because
+   the plot stretches to any width and text inside it would stretch too. */
+.curve { padding:16px 18px 12px; border-top:1px solid var(--line-2) }
+.curve-plot { position:relative }
+.curve-plot svg { width:100%; height:100%; display:block; position:absolute;
+  inset:0 }
+
+.curve-grid { position:absolute; left:0; right:0; height:0;
+  border-top:1px dashed var(--line-2); pointer-events:none }
+.curve-grid span { position:absolute; left:0; top:-8px; padding:0 5px 0 0;
+  background:var(--surface); font-size:10.2px; color:var(--faint);
+  font-variant-numeric:tabular-nums }
+
+.curve-floor-line { position:absolute; left:0; right:0; height:0;
+  border-top:1px dashed var(--danger); opacity:.85; pointer-events:none }
+.curve-floor-line span { position:absolute; right:0; top:-8px; padding:0 0 0 6px;
+  background:var(--surface); font-size:10.2px; color:var(--danger);
+  font-variant-numeric:tabular-nums }
+
+/* The low point, labelled on the chart rather than only in a card above it. */
+.curve-tag { position:absolute; transform:translateY(-50%); padding:3px 8px;
+  background:var(--surface); border:1px solid var(--danger);
+  border-radius:6px; box-shadow:var(--shadow); white-space:nowrap;
+  pointer-events:none }
+.curve-tag.left { margin-left:12px }
+.curve-tag.right { margin-right:12px }
+.curve-tag b { display:block; font-size:12.6px; letter-spacing:-.01em;
+  color:var(--danger); font-variant-numeric:tabular-nums }
+.curve-tag span { font-size:10.2px; color:var(--muted) }
+
+.curve-axis { display:flex; justify-content:space-between; margin-top:9px;
   font-size:10.6px; color:var(--faint) }
-.curve-floor { color:var(--danger); opacity:.75 }
+.curve-axis .curve-day { color:var(--danger); opacity:.85 }
+
+/* --- the verdict, before anything else --------------------------------- */
+/* A controller opening this wants three things in order: am I fine, when am
+   I not, and what do I do. The first version led with today's balance, which
+   is the least actionable number on the page. */
+.verdict { display:flex; align-items:center; gap:18px; padding:18px 20px;
+  border-bottom:1px solid var(--line-2) }
+.verdict > div:first-child { flex:1 }
+.verdict-what { font-size:19px; font-weight:600; letter-spacing:-.02em }
+.verdict-why { margin-top:4px; font-size:12.8px; color:var(--ink-2);
+  max-width:60ch; line-height:1.5 }
+.verdict.bad { background:var(--danger-wash) }
+.verdict.bad .verdict-what { color:var(--danger) }
+.verdict.ok { background:var(--good-wash) }
+.verdict.ok .verdict-what { color:var(--good) }
+.verdict-do { text-align:right; white-space:nowrap; flex:0 0 auto }
+.verdict-do span { display:block; font-size:10.2px; letter-spacing:.06em;
+  text-transform:uppercase; color:var(--muted); margin-bottom:2px }
+.verdict-do b { font-size:14.5px; font-weight:600 }
+@media (max-width:640px) {
+  .verdict { flex-direction:column; align-items:flex-start; gap:11px }
+  .verdict-do { text-align:left }
+}
+
+/* The supporting figures, under the chart where they belong - context, not
+   headline. */
+.curve-legend { display:flex; flex-wrap:wrap; gap:20px; padding:0 18px 14px;
+  font-size:11.8px; color:var(--muted) }
+.curve-legend b { color:var(--ink); font-weight:600;
+  font-variant-numeric:tabular-nums }
 
 /* --- what a cash forecast needs before it can run ----------------------- */
 .needs { display:grid; grid-template-columns:repeat(3,1fr); gap:11px;
