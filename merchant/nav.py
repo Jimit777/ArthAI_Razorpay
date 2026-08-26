@@ -143,6 +143,14 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             AgentTab("With API", "with-api",
                      "your register; history fetched per supplier over a GSP"),
         )),
+    "three_way_recon": AgentRoute(
+        agent_id="three_way_recon", slug="three-way",
+        tabs=(
+            AgentTab("Reconciliation", "",
+                     "invoices, settlements and bank credits, joined"),
+            AgentTab("Matched", "matched",
+                     "every line the three sources closed between them"),
+        )),
 }
 
 SLUG_TO_AGENT = {r.slug: r for r in AGENT_ROUTES.values()}

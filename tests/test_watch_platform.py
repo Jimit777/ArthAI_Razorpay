@@ -211,13 +211,20 @@ def test_one_business_cannot_see_another_businesses_suppliers(shop):
 
 def test_the_watch_is_not_registered_as_a_separate_agent():
     """
-    It is the reconciler doing another job on the same data. A third catalogue
-    entry would inflate the agent count without adding a capability.
+    It is the reconciler doing another job on the same data. A catalogue entry
+    would inflate the agent count without adding a capability.
+
+    Asserts the watch is absent rather than enumerating every live agent -
+    that spelling meant adding a genuinely new agent broke a test about the
+    watch, which is a test failing for a reason it is not about.
     """
     import merchant.app  # noqa: F401
     from merchant.catalog import live_agents
 
-    assert {a.id for a in live_agents()} == {"settlement_audit", "gst_itc"}
+    ids = {a.id for a in live_agents()}
+    for invented in ("supplier_watch", "watch", "gst_watch"):
+        assert invented not in ids
+    assert "gst_itc" in ids, "the watch belongs to the reconciler"
 
 
 def test_the_most_urgent_finding_is_shown_first(shop):

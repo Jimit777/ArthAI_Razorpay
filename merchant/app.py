@@ -40,6 +40,7 @@ from fastapi import Cookie, Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 import merchant.agents.gst  # noqa: F401  - registers the live agent
+import merchant.agents.recon  # noqa: F401  - registers the live agent
 import merchant.agents.settlement  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
 from merchant import catalog, views
@@ -1662,6 +1663,198 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
                               "phase": f"{type(exc).__name__}: {exc}"}
 
 
+# --- three-way reconciliation ---------------------------------------------
+#
+# Runs held in memory, exactly like the supplier risk runs above and for the
+# same reason: this produces a report to read and act on, not a ledger entry.
+# Nothing here writes to the books, so nothing here needs to survive a
+# restart.
+
+RECON_RUNS: dict = {}
+_recon_lock = threading.Lock()
+
+# What a person decided about a line, so the page can show it was dealt with.
+# Deliberately NOT written to any ledger - the whole platform's guardrail is
+# that an agent proposes and a human disposes, and "disposes" here means
+# telling their bank or their gateway, not this recording a fact.
+RECON_DECISIONS: dict = {}
+
+
+def _run_recon(key: str, business_id: str, use_agent: bool, n: int) -> None:
+    from engine.recon.generator import generate
+    from merchant.recon_pipeline import run as run_recon
+
+    def progress(**kw):
+        with _recon_lock:
+            state = RECON_RUNS.get(key)
+            if state is not None:
+                state.update(kw)
+
+    try:
+        batch, truth = generate(n)
+        result = run_recon(batch, truth=truth, use_agent=use_agent,
+                           on_progress=progress)
+        with _recon_lock:
+            RECON_RUNS[key] = {"state": "done", "business_id": business_id,
+                               "phase": "done", "payload": result.as_dict()}
+    except Exception as exc:                                # noqa: BLE001
+        with _recon_lock:
+            RECON_RUNS[key] = {"state": "failed", "business_id": business_id,
+                               "phase": f"{type(exc).__name__}: {exc}"}
+
+
+def _recon_state(key: str, business_id: str = "") -> tuple[str, dict]:
+    """
+    The run being looked at, falling back to this business's latest.
+
+    The tab links are generic and carry no run key, so switching to Matched
+    and back used to lose the run and show "run a reconciliation first" over
+    results that were sitting in memory. A merchant who navigates away and
+    returns should find their work, not a fresh button.
+
+    Scoped by business, because these runs are held in one process-wide dict
+    and one merchant must never fall back into another's numbers.
+    """
+    with _recon_lock:
+        if key:
+            return key, dict(RECON_RUNS.get(key) or {})
+        if not business_id:
+            return "", {}
+        for found, state in reversed(list(RECON_RUNS.items())):
+            if (state.get("business_id") == business_id
+                    and state.get("state") == "done"):
+                return found, dict(state)
+    return "", {}
+
+
+@app.get("/agents/three-way", response_class=HTMLResponse)
+def three_way_page(ws: Workspace = Depends(required_workspace),
+                   key: str = "", error: str = "", ok: str = ""):
+    """The exception list. What needs a decision, and nothing else."""
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "three_way_recon", "")
+
+    key, state = _recon_state(key, ws.business_id)
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    if state.get("state") == "running":
+        return HTMLResponse(_risk_running(
+            state, head, shell, title="Three-way reconciliation",
+            active="agent:three_way_recon",
+            doing="Joining your invoices, settlements and bank credits"))
+    if state.get("state") == "failed":
+        banner = (f'<div class="banner warn"><span>'
+                  f'{views.esc(state.get("phase", "It failed."))}</span></div>')
+
+    payload = state.get("payload")
+    body = (views.recon_results(payload, key).replace("{key}", key)
+            if payload else views.recon_start_screen())
+    return HTMLResponse(views.page("Three-way reconciliation",
+                                   head + banner + body,
+                                   "agent:three_way_recon", **shell))
+
+
+@app.get("/agents/three-way/matched", response_class=HTMLResponse)
+def three_way_matched(ws: Workspace = Depends(required_workspace),
+                      key: str = ""):
+    """Every line the three sources closed. A tab away, on purpose."""
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "three_way_recon", "matched")
+
+    key, state = _recon_state(key, ws.business_id)
+    payload = state.get("payload")
+    if not payload:
+        body = ('<div class="banner warn"><span>Run a reconciliation first.'
+                '</span></div>' + views.recon_start_screen())
+    else:
+        body = views.recon_matched(payload, key)
+    return HTMLResponse(views.page("Matched lines", head + body,
+                                   "agent:three_way_recon", **shell))
+
+
+@app.post("/agents/three-way/run")
+async def start_three_way(request: Request,
+                          ws: Workspace = Depends(required_workspace)):
+    """Generate the three sources, join them, and explain the leftovers."""
+    form = await request.form()
+    try:
+        n = max(50, min(300, int(form.get("records") or 55)))
+    except (TypeError, ValueError):
+        n = 55
+
+    key = f"recon_{int(time.time() * 1000)}"
+    with _recon_lock:
+        RECON_RUNS[key] = {"state": "running", "business_id": ws.business_id,
+                           "phase": "Building three sources",
+                           "done": 0, "total": 0}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail=f"ran a three-way reconciliation over {n} records")
+
+    threading.Thread(
+        target=_run_recon,
+        args=(key, ws.business_id, form.get("use_agent") == "yes", n),
+        daemon=True).start()
+    return RedirectResponse(f"/agents/three-way?key={key}", status_code=303)
+
+
+@app.post("/agents/three-way/decide")
+async def decide_three_way(request: Request,
+                           ws: Workspace = Depends(required_workspace)):
+    """
+    Record what a person decided about one exception.
+
+    Records the DECISION and does nothing else. It does not write off a
+    balance, post an entry, or tell anybody - because none of those are this
+    platform's to do, and a button that quietly did one of them would break
+    the guardrail the whole product rests on.
+    """
+    from urllib.parse import quote
+
+    form = await request.form()
+    key = str(form.get("key") or "")
+    line = str(form.get("line") or "")
+    decision = str(form.get("decision") or "")
+    if decision not in {"write_off", "dispute", "investigate"}:
+        return RedirectResponse(
+            f"/agents/three-way?key={key}&error="
+            + quote("That is not one of the choices."), status_code=303)
+
+    with _recon_lock:
+        RECON_DECISIONS.setdefault(key, {})[line] = decision
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=line, detail=f"marked {line} as {decision}")
+
+    return RedirectResponse(
+        f"/agents/three-way?key={key}&ok="
+        + quote(f"Noted: {line} marked as {decision.replace('_', ' ')}. "
+                f"Nothing was posted anywhere - this is a note to you."),
+        status_code=303)
+
+
+@app.get("/agents/three-way/{key}.json")
+def three_way_json(key: str, ws: Workspace = Depends(required_workspace)):
+    """The payload, for anything that wants it without the HTML."""
+    _found, state = _recon_state(key)
+    if not state:
+        return JSONResponse({"error": "no such run"}, status_code=404)
+    if state.get("state") != "done":
+        return JSONResponse({"state": state.get("state"),
+                             "phase": state.get("phase", "")})
+    return JSONResponse(state["payload"])
+
+
 # --- the three tabs -------------------------------------------------------
 #
 # One question decides which tab a merchant is on: where does supplier filing
@@ -1755,7 +1948,17 @@ def supplier_risk_with_api(ws: Workspace = Depends(required_workspace),
     return _risk_page(ws, TAB_WITH_API, key, error, ok)
 
 
-def _risk_running(state: dict, head: str, shell: dict) -> str:
+def _risk_running(state: dict, head: str, shell: dict, *,
+                  title: str = "Supplier risk", active: str = "agent:gst_itc",
+                  doing: str = "Working through your suppliers") -> str:
+    """
+    The progress screen, shared by every agent that runs in a thread.
+
+    Parameterised rather than copied. It was reused verbatim for the three-way
+    reconciler first, which told a merchant it was "working through your
+    suppliers" and highlighted the wrong agent in the rail - a page that lies
+    about which agent is running is worse than no progress screen at all.
+    """
     done, total = state.get("done", 0), state.get("total", 0)
     bar = ""
     if total:
@@ -1770,7 +1973,7 @@ def _risk_running(state: dict, head: str, shell: dict) -> str:
   <div style="display:flex;align-items:center;gap:11px">
     <span class="spinner"></span>
     <div>
-      <div style="font-weight:580">Working through your suppliers</div>
+      <div style="font-weight:580">{views.esc(doing)}</div>
       <div class="sub" style="margin-top:2px">
         {views.esc(state.get("phase", "Starting"))}</div>
     </div>
@@ -1778,7 +1981,7 @@ def _risk_running(state: dict, head: str, shell: dict) -> str:
   {bar}
 </div>
 <meta http-equiv="refresh" content="1">"""
-    return views.page("Supplier risk", body, "agent:gst_itc", **shell)
+    return views.page(title, body, active, **shell)
 
 
 # --- the supplier drawer ----------------------------------------------------

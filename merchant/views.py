@@ -1104,3 +1104,271 @@ def gstr2b_import_card(held=()) -> str:
   </p>
   {periods_held}
 </div>"""
+
+
+# --- three-way reconciliation ---------------------------------------------
+#
+# Two screens, and the split is the whole design: what needs a decision, and
+# what does not. A reconciliation that shows fifty green rows and six red ones
+# in the same table buries the six, and the six are the entire product.
+#
+# So the landing screen is the exception list, and the fifty matched lines are
+# a tab away - present, exportable, and not competing for attention.
+
+RECON_ACTION_TONE = {
+    "chase": "danger", "dispute": "danger",
+    "investigate": "warn", "write_off": "", "none": "good",
+}
+
+
+def recon_start_screen() -> str:
+    """Before a run: what it is about to do, and one button."""
+    return """
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is filed, claimed or paid.</b> This reads three
+  sources, joins them, and reports what it could not close.</span>
+</div>
+
+<div class="card" style="text-align:center;padding:34px 24px">
+  <h2 style="margin:0">Reconcile three sources</h2>
+  <p class="sub" style="margin:7px auto 6px;max-width:60ch">What you billed,
+     what your gateway says it settled after its fee, and what your bank
+     actually credited. The join is arithmetic; the agent explains only the
+     lines the arithmetic could not close.</p>
+  <div class="three-src">
+    <div><b>ERP invoices</b><span>what was billed</span></div>
+    <div class="arrow">&rarr;</div>
+    <div><b>Gateway settlements</b><span>what was processed, net of fee</span></div>
+    <div class="arrow">&rarr;</div>
+    <div><b>Bank credits</b><span>what actually arrived</span></div>
+  </div>
+  <form method="post" action="/agents/three-way/run" style="margin-top:20px">
+    <button style="font-size:14px;padding:12px 26px">
+      Run reconciliation (simulate 55 records)</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent to explain each exception
+    </label>
+  </form>
+</div>
+
+<div class="card tint">
+  <h2>Where the numbers come from</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Fifty-five linked
+     records across the three sources, generated with known faults planted in
+     them &mdash; money that never arrived, credits short by an amount nobody
+     accounted for, gateway lines with no invoice reference, and one credit
+     that belongs to nobody. The generator returns the answer key, so the
+     match rate on the next screen is <b>measured against it</b> rather than
+     asserted.</p>
+</div>"""
+
+
+def recon_results(payload: dict, key: str = "") -> str:
+    """The summary, then the lines that need a person."""
+    meta = payload["metadata"]
+    metrics = payload["match_metrics"]
+    findings = payload["vocabulary"]["findings"]
+    notes = payload["vocabulary"]["notes"]
+    actions = payload["vocabulary"]["actions"]
+
+    accuracy = metrics.get("accuracy") or {}
+    measured = ""
+    if accuracy.get("records_with_a_known_answer"):
+        wrong = accuracy["wrong"]
+        measured = (
+            f'<div style="padding:11px 16px;border-top:1px solid var(--line-2);'
+            f'color:var(--muted);font-size:11.5px">'
+            f'<b>Checked against the answer key.</b> '
+            f'{accuracy["correct"]} of '
+            f'{accuracy["records_with_a_known_answer"]} lines were classified '
+            f'as the generator built them '
+            f'({accuracy["accuracy_percentage"]}%)'
+            + (f', and {wrong} were not.' if wrong else
+               ' &mdash; none were misclassified.')
+            + ' The match rate above is a measurement, not a claim.</div>')
+
+    passes = metrics["passes"]
+    spend = ""
+    usage = meta.get("usage") or {}
+    if usage.get("calls"):
+        spend = (
+            f'<div style="padding:11px 16px;border-top:1px solid var(--line-2);'
+            f'color:var(--muted);font-size:11.5px">'
+            f'{usage["calls"]} agent call'
+            f'{"" if usage["calls"] == 1 else "s"} &mdash; one per exception, '
+            f'not one per record. <b>${usage["usd"]:.3f}</b> '
+            f'(about Rs {usage["rupees"]:.0f}). The {metrics["successful_matches_count"]} '
+            f'matched lines cost nothing, because arithmetic settled them.'
+            f'</div>')
+
+    failed = ""
+    if meta.get("failed_calls"):
+        failed = (f'<div class="banner warn"><span><b>{meta["failed_calls"]} '
+                  f'exception{"" if meta["failed_calls"] == 1 else "s"} could '
+                  f'not be explained by the agent.</b> Those rows show the '
+                  f'finding and the recommended action, computed without '
+                  f'it.</span></div>')
+
+    rows = "".join(_recon_exception(e, findings, notes, actions)
+                   for e in payload["exception_list"])
+    if not rows:
+        rows = ('<tr><td colspan="5" style="color:var(--muted);padding:22px">'
+                'Every line closed. Nothing needs a decision.</td></tr>')
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is filed, claimed or paid.</b> Every action below is a
+  proposal waiting for you.</span>
+</div>
+{failed}
+
+<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
+  <div class="stats">
+    <div class="stat"><b>{metrics["match_rate_percentage"]}%</b>
+      <span>auto-reconciled</span></div>
+    <div class="stat"><b>{meta["total_records_processed"]}</b>
+      <span>records audited</span></div>
+    <div class="stat"><b style="color:var(--danger)">
+      {metrics["exception_count"]}</b>
+      <span>need your decision</span></div>
+    <div class="stat"><b style="color:var(--danger)">
+      {metrics["at_stake_display"]}</b>
+      <span>at stake</span></div>
+  </div>
+  <div style="padding:11px 16px;border-top:1px solid var(--line-2);
+    color:var(--muted);font-size:11.5px">
+    {metrics["successful_matches_count"]} of
+    {metrics["successful_matches_count"] + metrics["exception_count"]} lines
+    closed in {meta["processing_time_ms"]} ms &mdash;
+    <b>{passes["pass_1_exact"]}</b> on an exact reference,
+    <b>{passes["pass_2_windowed"]}</b> on amount and date where no reference
+    existed, and <b>{passes["pass_3_narration"]}</b> by reading the bank&rsquo;s
+    narration. <a href="/agents/three-way/matched?key={esc(key)}">See the
+    matched lines</a>.
+  </div>
+  {measured}
+  {spend}
+</div>
+
+<div class="card flush">
+  <div class="card-head"><h2>Needs your decision</h2>
+    <span class="sub">worst first</span></div>
+  <div style="overflow-x:auto">
+  <table>
+    <tr><th>Issue</th><th>Finding</th><th class="r">At stake</th>
+        <th>Suggested action</th><th class="r"></th></tr>
+    {rows}
+  </table>
+  </div>
+  <div style="padding:11px 16px;border-top:1px solid var(--line-2);
+    color:var(--muted);font-size:11.5px">
+    The action comes from the figures, not from the agent, so it does not
+    change between runs. The agent reads each line and explains what it is
+    likely to be. Nothing here is actioned for you &mdash; every button is a
+    proposal.
+  </div>
+</div>"""
+
+
+def _recon_exception(row: dict, findings: dict, notes: dict,
+                     actions: dict) -> str:
+    """One line that needs a person, and the three buttons they might press."""
+    from merchant.ui import badge
+
+    tone = RECON_ACTION_TONE.get(row["action"], "")
+    suggested = row["action"]
+    return f"""
+      <tr>
+        <td style="max-width:44ch">
+          <div style="font-weight:560">{esc(row["detail"])}</div>
+          <div style="color:var(--muted);font-size:11.3px;margin-top:3px">
+            {esc(row["reasoning"] or notes.get(row["finding_type"], ""))}</div>
+          <div class="mono" style="color:var(--faint);font-size:10.5px;
+            margin-top:3px">
+            {esc(row["invoice_id"] or "no invoice")} &middot;
+            {esc(row["txn_id"] or "no settlement")} &middot;
+            {esc(row["utr_number"] or "no credit")}</div>
+        </td>
+        <td>{badge(findings.get(row["finding_type"], row["finding_type"]),
+                   "bad" if tone == "danger" else "warn",
+                   title=row["finding_type"])}</td>
+        <td class="r" style="font-weight:600;color:var(--danger)">
+          {rupees(row["at_stake"])}</td>
+        <td>{esc(actions.get(suggested, suggested))}</td>
+        <td class="r" style="white-space:nowrap">
+          {_recon_buttons(row, suggested)}</td>
+      </tr>"""
+
+
+def _recon_buttons(row: dict, suggested: str) -> str:
+    """
+    Write off, dispute, investigate - with the suggested one emphasised.
+
+    All three are always offered. The agent proposes; a person disposes, and a
+    screen that hides the other two options is making the decision while
+    appearing to ask for it.
+    """
+    out = []
+    for action, label in (("write_off", "Write off"), ("dispute", "Dispute"),
+                          ("investigate", "Investigate")):
+        primary = action == suggested
+        out.append(
+            f'<form method="post" action="/agents/three-way/decide" '
+            f'style="display:inline">'
+            f'<input type="hidden" name="key" value="{{key}}">'
+            f'<input type="hidden" name="line" value="{esc(row["invoice_id"] or row["txn_id"] or row["utr_number"])}">'
+            f'<input type="hidden" name="decision" value="{action}">'
+            f'<button class="{"" if primary else "ghost"} small"'
+            f' style="margin-left:4px">{label}</button></form>')
+    return "".join(out)
+
+
+def recon_matched(payload: dict, key: str = "") -> str:
+    """Every line the three sources closed between them."""
+    metrics = payload["match_metrics"]
+    rows = "".join(f"""
+      <tr>
+        <td class="mono">{esc(m["invoice_id"] or "&mdash;")}</td>
+        <td>{esc(m["customer_name"])}</td>
+        <td class="mono">{esc(m["txn_id"] or "&mdash;")}</td>
+        <td class="mono">{esc(m["utr_number"] or "&mdash;")}</td>
+        <td class="r">{esc(m["amount_display"])}</td>
+        <td><span class="pill">{esc(m["matched_by"] or "exact")}</span></td>
+      </tr>""" for m in payload["matched_records"])
+
+    return f"""
+<div class="card flush">
+  <div class="card-head"><h2>Matched lines</h2>
+    <span class="sub">{metrics["successful_matches_count"]} closed</span></div>
+  <div style="overflow-x:auto">
+  <table>
+    <tr><th>Invoice</th><th>Customer</th><th>Gateway txn</th><th>Bank UTR</th>
+        <th class="r">Net</th><th>Joined by</th></tr>
+    {rows}
+  </table>
+  </div>
+  <div style="padding:11px 16px;border-top:1px solid var(--line-2);
+    color:var(--muted);font-size:11.5px">
+    Three ids on every row, which is the artefact somebody would actually hand
+    an auditor. <a href="/agents/three-way?key={esc(key)}">Back to the
+    exceptions</a>.
+  </div>
+</div>"""
+
+
+COMPONENTS += """
+/* --- the three sources, side by side ----------------------------------- */
+.three-src { display:flex; align-items:center; justify-content:center;
+  gap:10px; flex-wrap:wrap; margin-top:16px }
+.three-src > div:not(.arrow) { border:1px solid var(--line-2);
+  border-radius:9px; padding:11px 15px; min-width:150px }
+.three-src b { display:block; font-size:12.4px }
+.three-src span { font-size:11.3px; color:var(--muted) }
+.three-src .arrow { color:var(--faint); font-size:15px; border:0; padding:0 }
+@media (max-width:720px) { .three-src .arrow { display:none } }
+"""
+
+CSS = TOKENS + SHELL + COMPONENTS
