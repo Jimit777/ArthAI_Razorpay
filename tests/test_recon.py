@@ -558,3 +558,230 @@ def test_one_merchants_run_never_falls_back_into_anothers(shop, tmp_path,
     page = other.get("/agents/three-way").text
     assert "Run reconciliation" in page
     assert "Needs your decision" not in page
+
+
+# --- a merchant's own three sources ---------------------------------------
+#
+# The agent was demo-only for exactly two lines: the ones that called
+# generate(). Everything below them - the join, the arithmetic, the agent, the
+# dashboard - never knew where the batch came from, which is what made adding
+# real data a matter of loading rather than rewriting.
+
+TALLY_INVOICES = (
+    b'Voucher No,Party Name,Date,Amount,Status\n'
+    b'INV-2026-0001,Sunrise Retail,05-07-2026,"1,20,000.00",Paid\n'
+    b'INV-2026-0002,Meridian Traders,06/07/2026,85000,Paid\n'
+    b'INV-2026-0003,Kavya Enterprises,07-07-2026,45000,Paid\n')
+
+GATEWAY_REPORT = (
+    b'Payment Id,Order Receipt,Amount,Fee,Tax,Settled At,UTR\n'
+    b'pay_1,INV-2026-0001,120000,2400,432,07-07-2026,HDFCN0001234567\n'
+    b'pay_2,,85000,1700,306,08-07-2026,HDFCN0007654321\n'
+    b'pay_3,INV-2026-0003,45000,900,162,09-07-2026,HDFCN0009999999\n')
+
+# HDFC shape: separate Withdrawal/Deposit columns, two-digit years, and one row
+# whose reference column holds the BANK's own ref rather than the gateway's.
+HDFC_STATEMENT = (
+    b'Date,Narration,Chq/Ref No,Withdrawal Amt.,Deposit Amt.,Closing Balance\n'
+    b'07/07/26,NEFT-RAZORPAY-SETTLEMENT-HDFCN0001234567,HDFCN0001234567,,117168.00,500000\n'
+    b'08/07/26,MB-NEFT-HDFCN0007654321-RZPY,REF99887766,,82994.00,583000\n'
+    b'09/07/26,RENT PAYMENT NEFT,,25000.00,,558000\n')
+
+
+def _upload(shop, kind, field, name, data):
+    return shop.post("/agents/three-way/upload",
+                     data={"kind": kind},
+                     files={field: (name, data, "text/csv")})
+
+
+def _upload_all(shop):
+    _upload(shop, "invoice", "invoices", "tally.csv", TALLY_INVOICES)
+    _upload(shop, "settlement", "settlements", "rzp.csv", GATEWAY_REPORT)
+    _upload(shop, "bank", "bank", "hdfc.csv", HDFC_STATEMENT)
+
+
+def _run_real(shop, source="upload", timeout=30):
+    import merchant.app as appmod
+
+    response = shop.post("/agents/three-way/run",
+                         data={"source": source, "use_agent": "no"},
+                         follow_redirects=False)
+    key = response.headers["location"].split("key=")[-1]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with appmod._recon_lock:
+            state = dict(appmod.RECON_RUNS.get(key) or {})
+        if state.get("state") != "running":
+            return key, state
+        time.sleep(0.05)
+    raise AssertionError("the run never finished")
+
+
+def test_real_files_reach_the_same_dashboard(shop):
+    _upload_all(shop)
+    key, state = _run_real(shop)
+    assert state["state"] == "done", state
+
+    payload = state["payload"]
+    assert payload["match_metrics"]["successful_matches_count"] == 2
+    assert payload["match_metrics"]["exception_count"] == 1
+    # The one line that was settled and never arrived.
+    assert payload["exception_list"][0]["finding_type"] == MISSING_IN_BANK
+
+    page = shop.get(f"/agents/three-way/upload?key={key}").text
+    assert "auto-reconciled" in page
+    assert "Needs your decision" in page
+
+
+def test_real_data_never_claims_a_measured_accuracy(shop):
+    """
+    The honesty requirement, and the reason it needed enforcing.
+
+    The demo can state an accuracy because the generator returns an answer
+    key. Real data has no key, so there is nothing to measure against -
+    printing a percentage there would be exactly the dishonesty this project
+    keeps refusing.
+    """
+    _upload_all(shop)
+    key, state = _run_real(shop)
+
+    assert state["payload"]["match_metrics"]["accuracy"] == {}
+    page = shop.get(f"/agents/three-way/upload?key={key}").text
+    assert "Checked against the answer key" not in page
+    # And the demo still does say it.
+    demo_key, _ = _run(shop)
+    demo_page = shop.get(f"/agents/three-way?key={demo_key}").text
+    assert "Checked against the answer key" in demo_page
+
+
+def test_all_three_sources_are_required(shop):
+    """
+    A two-way join between books and bank tells a merchant money is missing
+    and nothing about where it went, which is the whole reason the gateway is
+    in the middle of this. Running one and calling it a three-way
+    reconciliation would be the dishonest option.
+    """
+    _upload(shop, "invoice", "invoices", "tally.csv", TALLY_INVOICES)
+    _upload(shop, "bank", "bank", "hdfc.csv", HDFC_STATEMENT)
+
+    page = shop.get("/agents/three-way/upload").text
+    assert "Not ready yet" in page
+    assert "Gateway settlements" in page
+
+    _key, state = _run_real(shop)
+    assert state["state"] == "failed"
+    assert "at least one is missing" in state["phase"]
+
+
+def test_uploads_survive_a_page_load(shop):
+    """Assembling three exports is real work. Nobody should be asked twice."""
+    _upload_all(shop)
+    page = shop.get("/agents/three-way/upload").text
+
+    assert "Ready to reconcile" in page
+    assert "3 invoice" in page or "3 records" in page
+    for name in ("tally.csv", "rzp.csv", "hdfc.csv"):
+        assert name in page
+
+
+def test_clearing_removes_all_three(shop):
+    _upload_all(shop)
+    shop.post("/agents/three-way/forget")
+    page = shop.get("/agents/three-way/upload").text
+    assert "Not ready yet" in page
+
+
+# --- the bank statement, which is the awkward source ----------------------
+
+def test_debits_are_ignored_not_reconciled(shop):
+    """
+    A current account is mostly money going OUT. Keeping those rows would
+    flood the exception list with lines that were never meant to match
+    anything, which is the fastest way to build a list nobody reads.
+    """
+    from merchant.recon_import import parse_bank
+
+    result = parse_bank(HDFC_STATEMENT, "hdfc.csv")
+    assert len(result.credits) == 2
+    assert result.debits_ignored == 1
+
+
+def test_the_other_common_statement_shape_also_reads():
+    """One Amount column with a Dr/Cr flag, and no reference column at all."""
+    from merchant.recon_import import parse_bank
+
+    icici = (b"Value Date,Transaction Remarks,Type,Amount(INR)\n"
+             b"07-07-2026,MB-NEFT-HDFCN0001234567-RZPY,CR,117168.00\n"
+             b"08-07-2026,ATM WDL,DR,2000.00\n")
+    result = parse_bank(icici, "icici.csv")
+
+    assert len(result.credits) == 1
+    assert result.debits_ignored == 1
+    # The UTR was pulled out of the narration, because there is no column.
+    assert result.credits[0].utr_number == "HDFCN0001234567"
+
+
+def test_an_unreadable_date_is_reported_not_replaced_with_today():
+    """
+    Regression, and it would have been a bad one.
+
+    Two-digit years were missing from the format list, so every HDFC statement
+    row fell back to today - which put every credit outside its three-day
+    window and had the PARSER manufacture an exception list of its own.
+    """
+    from merchant.recon_import import parse_bank, parse_invoices
+
+    result = parse_invoices(b"Invoice No,Amount,Date\nINV-1,1000,not-a-date\n",
+                            "x.csv")
+    assert result.invoices == []
+    assert "unreadable date" in result.rows_skipped[0]
+
+    # And the format that caused it now parses.
+    dated = parse_bank(HDFC_STATEMENT, "hdfc.csv")
+    assert dated.credits[0].transaction_date == date(2026, 7, 7)
+
+
+def test_a_file_with_the_wrong_columns_is_refused_by_name(shop):
+    response = _upload(shop, "invoice", "invoices", "wrong.csv",
+                       b"Colour,Size\nred,large\n")
+    assert "Missing columns" in response.text
+
+
+# --- the connected path ---------------------------------------------------
+
+def test_razorpay_recon_rows_become_settlements():
+    """
+    order_receipt is the merchant's OWN reference for the order, which is what
+    makes Pass 1 exact rather than a search.
+    """
+    from merchant.recon_import import settlements_from_razorpay
+
+    rows = [
+        {"type": "payment", "payment_id": "pay_1", "amount": 12000000,
+         "fee": 240000, "tax": 43200, "settled_at": 1783000000,
+         "settlement_utr": "HDFCN0001234567", "order_receipt": "INV-2026-0001"},
+        # Refunds and adjustments belong in a settlement audit, not a
+        # three-way match against sales invoices.
+        {"type": "refund", "payment_id": "pay_2", "amount": 500000},
+        {"type": "adjustment", "entity_id": "adj_1", "amount": 100000},
+    ]
+    out = settlements_from_razorpay(rows)
+
+    assert len(out) == 1
+    assert out[0].txn_id == "pay_1"
+    assert out[0].invoice_reference == "INV-2026-0001"
+    assert out[0].net_settled == 12000000 - 240000 - 43200
+
+
+def test_the_connected_tab_says_what_is_missing_without_an_account(shop):
+    page = shop.get("/agents/three-way/connected").text
+    assert "No Razorpay account is connected" in page
+    # And is honest that connecting only replaces one of the three.
+    assert "invoices" in page and "statement" in page
+
+
+def test_a_pull_without_an_account_is_refused(shop):
+    response = shop.post("/agents/three-way/pull",
+                         data={"year": "2026", "month": "07"},
+                         follow_redirects=False)
+    assert "error=" in response.headers["location"]

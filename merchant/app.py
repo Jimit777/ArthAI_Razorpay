@@ -1680,8 +1680,16 @@ _recon_lock = threading.Lock()
 RECON_DECISIONS: dict = {}
 
 
-def _run_recon(key: str, business_id: str, use_agent: bool, n: int) -> None:
-    from engine.recon.generator import generate
+def _run_recon(key: str, business_id: str, use_agent: bool, n: int,
+               source: str = "demo") -> None:
+    """
+    One run, over generated data or the merchant's own.
+
+    `truth` is passed ONLY for the demo. Real data has no answer key, so there
+    is no accuracy to report - and reporting one against data nobody labelled
+    would be exactly the dishonesty this project keeps refusing. The dashboard
+    shows the measured-accuracy block only when it is actually measured.
+    """
     from merchant.recon_pipeline import run as run_recon
 
     def progress(**kw):
@@ -1691,7 +1699,19 @@ def _run_recon(key: str, business_id: str, use_agent: bool, n: int) -> None:
                 state.update(kw)
 
     try:
-        batch, truth = generate(n)
+        if source == "demo":
+            from engine.recon.generator import generate
+
+            batch, truth = generate(n)
+        else:
+            truth = None
+            with ledger(business_id) as led:
+                batch = led.recon_batch()
+            if batch is None:
+                raise ValueError(
+                    "All three sources are needed and at least one is "
+                    "missing. Upload your invoices, your settlement report "
+                    "and your bank statement, then run again.")
         result = run_recon(batch, truth=truth, use_agent=use_agent,
                            on_progress=progress)
         with _recon_lock:
@@ -1778,6 +1798,225 @@ def three_way_matched(ws: Workspace = Depends(required_workspace),
                                    "agent:three_way_recon", **shell))
 
 
+def _recon_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
+    """
+    Every three-way tab renders through here.
+
+    One function rather than four, for the same reason the input credit tabs
+    share one: the results half must be identical whichever tab produced the
+    run, and the surest way to guarantee that is for there to be exactly one
+    piece of code that renders it.
+    """
+    from merchant.sources import Sources
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "three_way_recon", tab)
+        held = led.recon_sources_held()
+        row = Sources(led.conn).get(ws.business_id)
+        source_kind = row["kind"] if row else None
+        last_pull = (row["last_message"] or "") if row else ""
+
+    key, state = _recon_state(key, ws.business_id)
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    if state.get("state") == "running":
+        return HTMLResponse(_risk_running(
+            state, head, shell, title="Three-way reconciliation",
+            active="agent:three_way_recon",
+            doing="Joining your invoices, settlements and bank credits"))
+    if state.get("state") == "failed":
+        banner = (f'<div class="banner warn"><span>'
+                  f'{views.esc(state.get("phase", "It failed."))}</span></div>')
+
+    payload = state.get("payload")
+    if payload:
+        body = views.recon_results(payload, key).replace("{key}", key)
+    elif tab == "upload":
+        body = views.recon_upload_screen(held)
+    elif tab == "connected":
+        body = views.recon_connected_screen(held, source_kind, last_pull)
+    else:
+        body = views.recon_start_screen()
+
+    return HTMLResponse(views.page("Three-way reconciliation",
+                                   head + banner + body,
+                                   "agent:three_way_recon", **shell))
+
+
+@app.get("/agents/three-way/upload", response_class=HTMLResponse)
+def three_way_upload_page(ws: Workspace = Depends(required_workspace),
+                          key: str = "", error: str = "", ok: str = ""):
+    """Your own three exports. Works for any merchant with any bank."""
+    return _recon_page(ws, "upload", key, error, ok)
+
+
+@app.get("/agents/three-way/connected", response_class=HTMLResponse)
+def three_way_connected_page(ws: Workspace = Depends(required_workspace),
+                             key: str = "", error: str = "", ok: str = ""):
+    """Settlements pulled from Razorpay; the other two still uploaded."""
+    return _recon_page(ws, "connected", key, error, ok)
+
+
+RECON_FIELD = {"invoice": "invoices", "settlement": "settlements",
+               "bank": "bank"}
+
+
+@app.post("/agents/three-way/upload")
+async def upload_recon_source(request: Request,
+                              ws: Workspace = Depends(required_workspace)):
+    """
+    Take one of the three sources and store it.
+
+    One route for all three rather than three near-identical ones. They differ
+    only in which parser reads the file, and three copies of the same upload
+    handling is three places for the size limit or the error wording to drift.
+    """
+    from urllib.parse import quote
+
+    from merchant import recon_import
+
+    form = await request.form()
+    kind = str(form.get("kind") or "")
+    if kind not in RECON_FIELD:
+        return RedirectResponse(
+            "/agents/three-way/upload?error="
+            + quote("That is not one of the three sources."), status_code=303)
+
+    upload = form.get(RECON_FIELD[kind])
+    if upload is None or not getattr(upload, "filename", ""):
+        return RedirectResponse(
+            "/agents/three-way/upload?error=" + quote("Choose a file first."),
+            status_code=303)
+
+    data = await upload.read()
+    if len(data) > 12 * 1024 * 1024:
+        return RedirectResponse(
+            "/agents/three-way/upload?error="
+            + quote(f"{upload.filename} is over 12 MB."), status_code=303)
+
+    parse = {"invoice": recon_import.parse_invoices,
+             "settlement": recon_import.parse_settlements,
+             "bank": recon_import.parse_bank}[kind]
+    result = parse(data, upload.filename)
+
+    if not result.ok:
+        return RedirectResponse(
+            "/agents/three-way/upload?error="
+            + quote(f"Could not read {upload.filename}. Missing columns: "
+                    f"{', '.join(result.missing_columns)}."), status_code=303)
+
+    records = (result.invoices if kind == "invoice" else
+               result.settlements if kind == "settlement" else result.credits)
+    if not records:
+        return RedirectResponse(
+            "/agents/three-way/upload?error="
+            + quote(f"{upload.filename} had the right columns and no usable "
+                    f"rows. {'; '.join(result.rows_skipped[:2])}"),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        stored = led.replace_recon_source(kind, records, upload.filename)
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=upload.filename,
+            detail=f"uploaded {stored} {kind} records for three-way recon")
+
+    message = f"{stored} {kind} records read from {upload.filename}."
+    if getattr(result, "debits_ignored", 0):
+        message += (f" {result.debits_ignored} debit rows were ignored - this "
+                    f"reconciliation is about money coming in.")
+    if result.rows_skipped:
+        message += f" {len(result.rows_skipped)} rows were skipped."
+    return RedirectResponse(
+        "/agents/three-way/upload?ok=" + quote(message), status_code=303)
+
+
+@app.post("/agents/three-way/pull")
+async def pull_recon_settlements(request: Request,
+                                 ws: Workspace = Depends(required_workspace)):
+    """
+    Pull one month of Razorpay's settlement recon report.
+
+    The one source that does not have to be a file. Reuses the connector the
+    settlement auditor already uses, so there is one Razorpay client in this
+    codebase rather than two that drift.
+    """
+    from urllib.parse import quote
+
+    from merchant.recon_import import settlements_from_razorpay
+    from merchant.sources import Razorpay, Sources
+
+    form = await request.form()
+    try:
+        year = int(str(form.get("year") or "").strip())
+        month = int(str(form.get("month") or "").strip())
+    except ValueError:
+        return RedirectResponse(
+            "/agents/three-way/connected?error="
+            + quote("Give a year and a month."), status_code=303)
+
+    with ledger(ws.business_id) as led:
+        sources = Sources(led.conn)
+        row = sources.get(ws.business_id)
+        secret = sources.stored_secret(ws.business_id)
+        if row is None or row["kind"] != "razorpay":
+            return RedirectResponse(
+                "/agents/three-way/connected?error="
+                + quote("No Razorpay account is connected to this business."),
+                status_code=303)
+        if not secret:
+            return RedirectResponse(
+                "/agents/three-way/connected?error="
+                + quote("The stored Razorpay secret cannot be read, so the "
+                        "pull was not attempted. Reconnect the account."),
+                status_code=303)
+
+        try:
+            client = Razorpay(row["razorpay_key_id"], secret)
+        except ValueError as exc:
+            return RedirectResponse(
+                "/agents/three-way/connected?error=" + quote(str(exc)),
+                status_code=303)
+
+        result = client.settlements(year, month)
+        if not result.ok:
+            return RedirectResponse(
+                "/agents/three-way/connected?error=" + quote(result.message),
+                status_code=303)
+
+        settlements = settlements_from_razorpay(result.raw)
+        stored = led.replace_recon_source(
+            "settlement", settlements, f"Razorpay {month:02d}/{year}")
+
+    skipped = len(result.raw) - len(settlements)
+    message = (f"{stored} settlement lines pulled for {month:02d}/{year}.")
+    if skipped > 0:
+        message += (f" {skipped} refund, transfer or adjustment lines were "
+                    f"left out - those belong in a settlement audit.")
+    if not stored:
+        message = (f"Razorpay returned nothing for {month:02d}/{year}. "
+                   f"{result.message}")
+    return RedirectResponse(
+        "/agents/three-way/connected?ok=" + quote(message), status_code=303)
+
+
+@app.post("/agents/three-way/forget")
+def forget_recon_sources(ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        led.forget_recon_sources()
+    return RedirectResponse(
+        "/agents/three-way/upload?ok="
+        + quote("All three sources cleared."), status_code=303)
+
+
 @app.post("/agents/three-way/run")
 async def start_three_way(request: Request,
                           ws: Workspace = Depends(required_workspace)):
@@ -1799,11 +2038,14 @@ async def start_three_way(request: Request,
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
             target=key, detail=f"ran a three-way reconciliation over {n} records")
 
+    source = str(form.get("source") or "demo")
     threading.Thread(
         target=_run_recon,
-        args=(key, ws.business_id, form.get("use_agent") == "yes", n),
+        args=(key, ws.business_id, form.get("use_agent") == "yes", n, source),
         daemon=True).start()
-    return RedirectResponse(f"/agents/three-way?key={key}", status_code=303)
+    landing = ("/agents/three-way" if source == "demo"
+               else f"/agents/three-way/{'connected' if source == 'connected' else 'upload'}")
+    return RedirectResponse(f"{landing}?key={key}", status_code=303)
 
 
 @app.post("/agents/three-way/decide")

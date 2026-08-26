@@ -132,6 +132,25 @@ CREATE TABLE IF NOT EXISTS live_gstr2b (
   recorded_at     INTEGER
 );
 
+-- The three sources of the three-way reconciliation, as a merchant uploaded
+-- them. Stored rather than held for one run: assembling three exports is a
+-- real piece of work, and asking for all three again because somebody
+-- refreshed the page is how a tool stops being used.
+--
+-- `kind` is 'invoice' | 'settlement' | 'bank'. One table rather than three
+-- because they share a lifecycle - replaced together, scoped together,
+-- forgotten together - and three tables that are always written in the same
+-- breath is three chances for one of them to be left behind.
+CREATE TABLE IF NOT EXISTS recon_sources (
+  business_id  TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  ref          TEXT NOT NULL,      -- invoice_id | txn_id | utr_number
+  payload      TEXT NOT NULL,      -- the record as JSON
+  source_file  TEXT,
+  uploaded_at  INTEGER,
+  PRIMARY KEY (business_id, kind, ref)
+);
+
 -- Mode B: filing history a merchant assembled and uploaded, one row per
 -- supplier per tax period.
 --
@@ -737,6 +756,108 @@ class Ledger:
             " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         self.conn.commit()
         return {"added": len(rows), "removed": removed}
+
+    # --- the three-way sources --------------------------------------------
+
+    def replace_recon_source(self, kind: str, records, filename: str = ""
+                             ) -> int:
+        """
+        Store one of the three sources, replacing what was held before.
+
+        Replacing rather than merging, for the same reason the purchase
+        register does: an export is a statement of a period, and a merchant
+        who uploads a corrected one expects it to correct rather than double.
+        """
+        import json
+        import time
+
+        business_id = self._scoped()
+        self.conn.execute(
+            "DELETE FROM recon_sources WHERE business_id = ? AND kind = ?",
+            (business_id, kind))
+
+        now = int(time.time())
+        rows = []
+        for record in records:
+            payload = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                       for k, v in vars(record).items()}
+            ref = str(payload.get("invoice_id") or payload.get("txn_id")
+                      or payload.get("utr_number") or "")
+            if not ref:
+                continue
+            rows.append((business_id, kind, ref, json.dumps(payload),
+                         filename, now))
+
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO recon_sources (business_id, kind, ref,"
+            " payload, source_file, uploaded_at) VALUES (?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def recon_batch(self):
+        """
+        The three stored sources, in the shape the matcher already takes.
+
+        Returns None when any of the three is missing. A two-way join is a
+        different product with different findings, and quietly running one
+        while calling it a three-way reconciliation would be the dishonest
+        option - so the caller is told which source is absent instead.
+        """
+        import json
+        from datetime import date as _date
+
+        from engine.recon.records import (BankCredit, Invoice, ReconBatch,
+                                          Settlement)
+
+        held: dict[str, list] = {"invoice": [], "settlement": [], "bank": []}
+        for row in self.conn.execute(
+                "SELECT kind, payload FROM recon_sources WHERE business_id = ?"
+                " ORDER BY ref", (self._scoped(),)):
+            held.setdefault(row["kind"], []).append(json.loads(row["payload"]))
+
+        if not all(held.get(k) for k in ("invoice", "settlement", "bank")):
+            return None
+
+        def when(value):
+            try:
+                return _date.fromisoformat(str(value)[:10])
+            except (TypeError, ValueError):
+                return _date.today()
+
+        return ReconBatch(
+            invoices=[Invoice(
+                invoice_id=r["invoice_id"], customer_name=r["customer_name"],
+                amount=r["amount"], date_issued=when(r["date_issued"]),
+                status=r.get("status", "issued")) for r in held["invoice"]],
+            settlements=[Settlement(
+                txn_id=r["txn_id"], gross_amount=r["gross_amount"],
+                fee_deducted=r["fee_deducted"], net_settled=r["net_settled"],
+                settlement_date=when(r["settlement_date"]),
+                invoice_reference=r.get("invoice_reference"),
+                utr=r.get("utr")) for r in held["settlement"]],
+            bank=[BankCredit(
+                utr_number=r["utr_number"], description=r["description"],
+                credit_amount=r["credit_amount"],
+                transaction_date=when(r["transaction_date"]))
+                for r in held["bank"]])
+
+    def recon_sources_held(self) -> dict:
+        """What is on file for each source, for the page to describe it."""
+        out = {}
+        for row in self.conn.execute(
+                "SELECT kind, COUNT(*) n, MAX(uploaded_at) at,"
+                " MAX(source_file) f FROM recon_sources"
+                " WHERE business_id = ? GROUP BY kind", (self._scoped(),)):
+            out[row["kind"]] = {"records": row["n"], "uploaded_at": row["at"],
+                                "source_file": row["f"] or ""}
+        return out
+
+    def forget_recon_sources(self) -> int:
+        removed = self.conn.execute(
+            "DELETE FROM recon_sources WHERE business_id = ?",
+            (self._scoped(),)).rowcount
+        self.conn.commit()
+        return removed
 
     # --- mode B storage ---------------------------------------------------
 

@@ -1372,3 +1372,190 @@ COMPONENTS += """
 """
 
 CSS = TOKENS + SHELL + COMPONENTS
+
+
+# --- the three-way agent's real-data tabs ---------------------------------
+
+RECON_SOURCE_HELP = {
+    "invoice": ("ERP sales invoices", "invoices",
+                "What you billed. A CSV or Excel export from Tally, Zoho, "
+                "Busy or your own spreadsheet - it needs an invoice number "
+                "and an amount, and a date if you have one. Column names do "
+                "not have to match anything."),
+    "settlement": ("Gateway settlements", "settlements",
+                   "What your gateway says it processed. Download the "
+                   "settlement report from your gateway dashboard. It needs a "
+                   "transaction id and either the net settled or the gross "
+                   "and the fee; an invoice reference and a UTR make the "
+                   "match exact rather than a search."),
+    "bank": ("Bank statement", "bank",
+             "What actually arrived. Export the statement from net banking "
+             "as CSV or Excel - every bank offers it. Debits are ignored: "
+             "this is about money coming in."),
+}
+
+
+def _recon_source_card(kind: str, held: dict) -> str:
+    """One of the three uploads, or a note that it is already on file."""
+    title, field, blurb = RECON_SOURCE_HELP[kind]
+    on_file = held.get(kind)
+
+    if on_file:
+        return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>{esc(title)} &mdash; {on_file["records"]} records</b>
+    <div class="src-what">From
+      <span class="mono">{esc(on_file["source_file"] or "your upload")}</span>.
+      Upload again to replace it.</div></div>
+  <form method="post" action="/agents/three-way/upload" style="flex:0"
+        enctype="multipart/form-data">
+    <input type="hidden" name="kind" value="{kind}">
+    <label class="btn ghost small" style="cursor:pointer">Replace
+      <input type="file" name="{field}" accept=".csv,.xlsx,.xlsm,.txt"
+        style="display:none" onchange="this.form.submit()"></label>
+  </form>
+</div>"""
+
+    return f"""
+<div class="card">
+  <h2>{esc(title)}</h2>
+  <p class="sub" style="margin:3px 0 12px;max-width:68ch">{esc(blurb)}</p>
+  <form method="post" action="/agents/three-way/upload"
+        enctype="multipart/form-data">
+    <input type="hidden" name="kind" value="{kind}">
+    <div class="row">
+      <div><label>{esc(title)} (CSV or Excel)</label>
+        <input type="file" name="{field}" accept=".csv,.xlsx,.xlsm,.txt"
+          required></div>
+      <div style="flex:0;align-self:flex-end"><button>Upload</button></div>
+    </div>
+  </form>
+</div>"""
+
+
+def _recon_run_card(held: dict, ready: bool, connected: bool = False) -> str:
+    """The run button, and what is still missing if it cannot run yet."""
+    if not ready:
+        missing = [RECON_SOURCE_HELP[k][0] for k in
+                   ("invoice", "settlement", "bank") if not held.get(k)]
+        return f"""
+<div class="card tint">
+  <h2>Not ready yet</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:68ch">Still needed:
+     <b>{esc(", ".join(missing))}</b>. All three are required &mdash; a
+     two-way join between books and bank tells you money is missing and
+     nothing about where it went, which is the whole reason the gateway is in
+     the middle of this.</p>
+</div>"""
+
+    return f"""
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Ready to reconcile</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">
+     {held.get("invoice", {}).get("records", 0)} invoices,
+     {held.get("settlement", {}).get("records", 0)} settlements and
+     {held.get("bank", {}).get("records", 0)} bank credits are on file.</p>
+  <form method="post" action="/agents/three-way/run">
+    <input type="hidden" name="source" value="{'connected' if connected else 'upload'}">
+    <button style="font-size:14px;padding:12px 26px">Reconcile my data</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent to explain each exception
+    </label>
+  </form>
+  <form method="post" action="/agents/three-way/forget" style="margin-top:12px">
+    <button class="ghost small">Clear all three</button>
+  </form>
+</div>"""
+
+
+def recon_upload_screen(held: dict) -> str:
+    """
+    Your own three exports. Works for any merchant with any bank.
+
+    Deliberately not framed as the lesser option. For the bank leg it is
+    currently the only honest one - there is no free API that hands an Indian
+    merchant their own statement, and the regulated alternative needs a
+    commercial relationship most merchants will never have.
+    """
+    ready = all(held.get(k) for k in ("invoice", "settlement", "bank"))
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is filed, claimed or paid.</b> Your files are read,
+  joined and reported on. Nothing is sent anywhere.</span>
+</div>
+
+{_recon_run_card(held, ready)}
+{_recon_source_card("invoice", held)}
+{_recon_source_card("settlement", held)}
+{_recon_source_card("bank", held)}
+
+<div class="card tint">
+  <h2>Why the bank statement is a file and not a connection</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">There is no free API
+     that hands an Indian merchant their own bank statement. The Account
+     Aggregator framework is the regulated answer and needs an AA or TSP
+     relationship &mdash; the same wall as a GSP for GST filing history. A
+     net-banking CSV export works for every bank, today, with no commercial
+     dependency, so that is what this asks for. If you have a corporate
+     account with an API, the importer takes the same shape.</p>
+</div>"""
+
+
+def recon_connected_screen(held: dict, source_kind: Optional[str],
+                           last_pull: str = "") -> str:
+    """Settlements pulled from Razorpay; the other two still uploaded."""
+    if source_kind != "razorpay":
+        return f"""
+<div class="banner warn">
+  <span><b>No Razorpay account is connected to this business.</b> Connect one
+    in <a href="/data">Data &amp; integrations</a> and settlement reports are
+    pulled for you &mdash; you would still upload your invoices and your bank
+    statement, because neither of those is on the gateway.</span>
+</div>
+
+<div class="card tint">
+  <h2>What connecting changes, and what it does not</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">One of the three
+     sources stops being a download. Razorpay&rsquo;s settlement recon report
+     is the only endpoint in this product that states, line by line, what a
+     gateway deducted and what it sent &mdash; so that leg becomes automatic
+     and current. Your invoices live in your accounting system and your
+     statement lives at your bank, so those two stay uploads on the
+     <a href="/agents/three-way/upload">Upload</a> tab.</p>
+</div>"""
+
+    settled = held.get("settlement")
+    return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>Razorpay connected</b>
+    <div class="src-what">Settlement reports are pulled for this business.
+      {esc(last_pull)}</div></div>
+</div>
+
+<div class="card">
+  <h2>Pull settlements</h2>
+  <p class="sub" style="margin:3px 0 12px;max-width:68ch">One month of the
+     settlement recon report, straight from Razorpay. Payment lines only
+     &mdash; refunds, transfers and adjustments belong in a settlement audit
+     rather than in a three-way match against sales invoices.</p>
+  <form method="post" action="/agents/three-way/pull">
+    <div class="row">
+      <div><label>Year</label><input name="year" value="2026" required></div>
+      <div><label>Month</label><input name="month" value="07" required></div>
+      <div style="flex:0;align-self:flex-end"><button>Pull</button></div>
+    </div>
+  </form>
+  {'<p class="sub" style="margin:11px 0 0;font-size:11.5px">'
+   + str(settled["records"]) + ' settlement lines on file.</p>'
+   if settled else ''}
+</div>
+
+{_recon_source_card("invoice", held)}
+{_recon_source_card("bank", held)}
+{_recon_run_card(held, all(held.get(k) for k in
+                           ("invoice", "settlement", "bank")), connected=True)}"""

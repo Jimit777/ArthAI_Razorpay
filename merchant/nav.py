@@ -146,8 +146,16 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
     "three_way_recon": AgentRoute(
         agent_id="three_way_recon", slug="three-way",
         tabs=(
-            AgentTab("Reconciliation", "",
-                     "invoices, settlements and bank credits, joined"),
+            # Same shape as the input credit agent's tabs, and for the same
+            # reason: the only thing that differs between them is where the
+            # three sources come from. The join, the arithmetic, the agent and
+            # the dashboard are identical whichever tab produced the run.
+            AgentTab("Demo Mode", "",
+                     "generated invoices, settlements and credits, one click"),
+            AgentTab("Upload", "upload",
+                     "your own three exports - works with any bank"),
+            AgentTab("Connected", "connected",
+                     "settlements pulled from Razorpay; you upload two"),
             AgentTab("Matched", "matched",
                      "every line the three sources closed between them"),
         )),
