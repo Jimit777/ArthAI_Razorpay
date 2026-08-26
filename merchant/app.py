@@ -1677,8 +1677,19 @@ CASH_FIELD = {"account": "balances", "payout": "payouts",
               "recurring": "recurring"}
 
 
-def _cash_state(key: str, business_id: str = "") -> tuple[str, dict]:
-    """This run, or this business's latest. Scoped, for the obvious reason."""
+def _cash_state(key: str, business_id: str = "",
+                source: str = "") -> tuple[str, dict]:
+    """
+    This run, or this business's latest FROM THIS TAB.
+
+    The source match is the whole point and its absence was a bug: a demo run
+    then showed its results on the Without API and With API tabs too, so
+    clicking either of them appeared to do nothing. A tab has to be able to
+    show its own screen, and results belong to the tab that produced them.
+
+    An explicit key in the URL always wins, so a link to a specific run still
+    opens it wherever it came from.
+    """
     with _cash_lock:
         if key:
             return key, dict(CASH_RUNS.get(key) or {})
@@ -1686,7 +1697,8 @@ def _cash_state(key: str, business_id: str = "") -> tuple[str, dict]:
             return "", {}
         for found, state in reversed(list(CASH_RUNS.items())):
             if (state.get("business_id") == business_id
-                    and state.get("state") == "done"):
+                    and state.get("state") == "done"
+                    and state.get("source") == source):
                 return found, dict(state)
     return "", {}
 
@@ -1764,10 +1776,12 @@ def _run_cash(key: str, business_id: str, use_agent: bool,
                           on_progress=progress)
         with _cash_lock:
             CASH_RUNS[key] = {"state": "done", "business_id": business_id,
-                              "phase": "done", "payload": result.as_dict()}
+                              "source": source, "phase": "done",
+                              "payload": result.as_dict()}
     except Exception as exc:                                # noqa: BLE001
         with _cash_lock:
             CASH_RUNS[key] = {"state": "failed", "business_id": business_id,
+                              "source": source,
                               "phase": f"{type(exc).__name__}: {exc}"}
 
 
@@ -1783,7 +1797,9 @@ def _cash_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
         source_kind = row["kind"] if row else None
         receipts = len(_pending_receipts(led, ws.business_id))
 
-    key, state = _cash_state(key, ws.business_id)
+    key, state = _cash_state(key, ws.business_id,
+                             source={"": "demo", "upload": "upload",
+                                     "connected": "connected"}.get(tab, "demo"))
 
     banner = ""
     if error:
@@ -1929,6 +1945,7 @@ async def start_cash_forecast(request: Request,
     key = f"cash_{int(time.time() * 1000)}"
     with _cash_lock:
         CASH_RUNS[key] = {"state": "running", "business_id": ws.business_id,
+                          "source": source,
                           "phase": "Building the scenario", "done": 0,
                           "total": 1}
 
@@ -2013,14 +2030,17 @@ def _run_recon(key: str, business_id: str, use_agent: bool, n: int,
                            on_progress=progress)
         with _recon_lock:
             RECON_RUNS[key] = {"state": "done", "business_id": business_id,
-                               "phase": "done", "payload": result.as_dict()}
+                               "source": source, "phase": "done",
+                               "payload": result.as_dict()}
     except Exception as exc:                                # noqa: BLE001
         with _recon_lock:
             RECON_RUNS[key] = {"state": "failed", "business_id": business_id,
+                               "source": source,
                                "phase": f"{type(exc).__name__}: {exc}"}
 
 
-def _recon_state(key: str, business_id: str = "") -> tuple[str, dict]:
+def _recon_state(key: str, business_id: str = "",
+                 source: str = "") -> tuple[str, dict]:
     """
     The run being looked at, falling back to this business's latest.
 
@@ -2028,6 +2048,10 @@ def _recon_state(key: str, business_id: str = "") -> tuple[str, dict]:
     and back used to lose the run and show "run a reconciliation first" over
     results that were sitting in memory. A merchant who navigates away and
     returns should find their work, not a fresh button.
+
+    Matched on SOURCE as well: without that, a demo run showed its results on
+    the Upload and Connected tabs too, so clicking either appeared to do
+    nothing. Results belong to the tab that produced them.
 
     Scoped by business, because these runs are held in one process-wide dict
     and one merchant must never fall back into another's numbers.
@@ -2039,60 +2063,10 @@ def _recon_state(key: str, business_id: str = "") -> tuple[str, dict]:
             return "", {}
         for found, state in reversed(list(RECON_RUNS.items())):
             if (state.get("business_id") == business_id
-                    and state.get("state") == "done"):
+                    and state.get("state") == "done"
+                    and state.get("source") == source):
                 return found, dict(state)
     return "", {}
-
-
-@app.get("/agents/three-way", response_class=HTMLResponse)
-def three_way_page(ws: Workspace = Depends(required_workspace),
-                   key: str = "", error: str = "", ok: str = ""):
-    """The exception list. What needs a decision, and nothing else."""
-    with ledger(ws.business_id) as led:
-        shell = _shell_for(led, ws)
-        head = _workspace_head(led, ws, "three_way_recon", "")
-
-    key, state = _recon_state(key, ws.business_id)
-    banner = ""
-    if error:
-        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
-    elif ok:
-        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
-
-    if state.get("state") == "running":
-        return HTMLResponse(_risk_running(
-            state, head, shell, title="Three-way reconciliation",
-            active="agent:three_way_recon",
-            doing="Joining your invoices, settlements and bank credits"))
-    if state.get("state") == "failed":
-        banner = (f'<div class="banner warn"><span>'
-                  f'{views.esc(state.get("phase", "It failed."))}</span></div>')
-
-    payload = state.get("payload")
-    body = (views.recon_results(payload, key).replace("{key}", key)
-            if payload else views.recon_start_screen())
-    return HTMLResponse(views.page("Three-way reconciliation",
-                                   head + banner + body,
-                                   "agent:three_way_recon", **shell))
-
-
-@app.get("/agents/three-way/matched", response_class=HTMLResponse)
-def three_way_matched(ws: Workspace = Depends(required_workspace),
-                      key: str = ""):
-    """Every line the three sources closed. A tab away, on purpose."""
-    with ledger(ws.business_id) as led:
-        shell = _shell_for(led, ws)
-        head = _workspace_head(led, ws, "three_way_recon", "matched")
-
-    key, state = _recon_state(key, ws.business_id)
-    payload = state.get("payload")
-    if not payload:
-        body = ('<div class="banner warn"><span>Run a reconciliation first.'
-                '</span></div>' + views.recon_start_screen())
-    else:
-        body = views.recon_matched(payload, key)
-    return HTMLResponse(views.page("Matched lines", head + body,
-                                   "agent:three_way_recon", **shell))
 
 
 def _recon_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
@@ -2114,7 +2088,9 @@ def _recon_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
         source_kind = row["kind"] if row else None
         last_pull = (row["last_message"] or "") if row else ""
 
-    key, state = _recon_state(key, ws.business_id)
+    key, state = _recon_state(key, ws.business_id,
+                              source={"": "demo", "upload": "upload",
+                                      "connected": "connected"}.get(tab, "demo"))
 
     banner = ""
     if error:
@@ -2143,6 +2119,46 @@ def _recon_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
 
     return HTMLResponse(views.page("Three-way reconciliation",
                                    head + banner + body,
+                                   "agent:three_way_recon", **shell))
+
+
+@app.get("/agents/three-way", response_class=HTMLResponse)
+def three_way_page(ws: Workspace = Depends(required_workspace),
+                   key: str = "", error: str = "", ok: str = ""):
+    """The exception list. What needs a decision, and nothing else."""
+    return _recon_page(ws, "", key, error, ok)
+
+
+@app.get("/agents/three-way/matched", response_class=HTMLResponse)
+def three_way_matched(ws: Workspace = Depends(required_workspace),
+                      key: str = ""):
+    """
+    Every line the three sources closed. A tab away, on purpose.
+
+    Shows the latest run from ANY tab, unlike the three that produce runs -
+    this one has no screen of its own to protect, and a merchant who ran a
+    reconciliation on the Upload tab and then clicked Matched means the one
+    they just ran.
+    """
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "three_way_recon", "matched")
+
+    found = ""
+    for source in ("demo", "upload", "connected"):
+        found, state = _recon_state(key, ws.business_id, source)
+        if state.get("payload"):
+            break
+    else:
+        state = {}
+
+    payload = state.get("payload")
+    if not payload:
+        body = ('<div class="banner warn"><span>Run a reconciliation first.'
+                '</span></div>' + views.recon_start_screen())
+    else:
+        body = views.recon_matched(payload, found or key)
+    return HTMLResponse(views.page("Matched lines", head + body,
                                    "agent:three_way_recon", **shell))
 
 
@@ -2336,6 +2352,7 @@ async def start_three_way(request: Request,
     key = f"recon_{int(time.time() * 1000)}"
     with _recon_lock:
         RECON_RUNS[key] = {"state": "running", "business_id": ws.business_id,
+                           "source": str(form.get("source") or "demo"),
                            "phase": "Building three sources",
                            "done": 0, "total": 0}
 

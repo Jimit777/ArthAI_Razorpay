@@ -444,8 +444,9 @@ def test_the_chart_carries_its_own_scale(shop):
 
     assert page.count('class="curve-grid"') >= 3, "no vertical scale"
     assert "curve-floor-line" in page
-    # And the low point is labelled ON the chart, not only in a card above it.
-    assert 'class="curve-tag' in page
+    # The readout names the low point at rest, and any day on hover.
+    assert 'class="curve-read"' in page
+    assert page.count('class="curve-hit"') == 30, "one hit column per day"
 
 
 def test_the_danger_band_has_height(shop):
@@ -594,7 +595,7 @@ def test_only_the_line_turns_red_not_the_whole_month(shop):
     key, _state = _forecast(shop)
     page = shop.get(f"/agents/cash-forecaster?key={key}").text
 
-    svg = page.split('<div class="curve">')[1].split("</svg>")[0]
+    svg = page.split('<div class="curve-plot"')[1].split("</svg>")[0]
     area = svg.split("<polygon")[1].split(">")[0]
     line = svg.split("<polyline")[1].split(">")[0]
 
@@ -628,3 +629,34 @@ def test_the_card_does_not_restate_the_verdict(shop):
 
     card = page.split('class="finding-card"')[1]
     assert detail not in card
+
+
+def test_the_chart_answers_about_any_day_not_only_the_worst(shop):
+    """
+    A cash curve is thirty numbers. The still version showed one of them and
+    drew the other twenty-nine, so a controller could see the shape of the
+    month and read exactly one figure off it.
+    """
+    key, state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+
+    hits = page.count('class="curve-hit"')
+    assert hits == len(state["payload"]["forecast"]["positions"])
+
+    # Every figure is server-rendered into the DOM; the browser picks one to
+    # show and computes nothing, which is the engine's rule applied to the
+    # front end.
+    assert 'data-bal="Rs ' in page
+    assert "data-in=" in page and "data-out=" in page
+    assert "computes nothing" in page or "curve-cross" in page
+
+
+def test_the_readout_falls_back_to_the_low_point(shop):
+    """Without JavaScript the chart still draws and the low point is still
+    named - the interaction adds to a complete answer."""
+    key, state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    low = state["payload"]["forecast"]["trough"]
+
+    curve = page.split('<div class="curve"')[1]
+    assert f'data-low="{low["day"] - 1}"' in curve

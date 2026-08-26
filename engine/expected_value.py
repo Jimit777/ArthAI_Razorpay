@@ -174,10 +174,22 @@ def tolerance_paise(expected_fee_paise: int, rate_card: dict) -> int:
 
 
 def rupees(paise: int) -> str:
-    """Display helper. Only place paise become a decimal."""
-    sign = "-" if paise < 0 else ""
-    p = abs(paise)
-    return f"{sign}Rs {p // 100:,}.{p % 100:02d}"
+    """
+    Display helper. Only place paise become a decimal.
+
+    Delegates rather than formatting, because there were two of these and they
+    disagreed: this one grouped in thousands and engine/gst/rules grouped in
+    lakhs, so the settlement half of the product printed Rs 1,000,000.00 on
+    the same screen where the GST half printed Rs 10,00,000.00. Two formats
+    for the same quantity in one Indian finance product is a defect, and the
+    lakh grouping is the one a merchant here reads without counting digits.
+
+    Kept as a name rather than collapsed into an import, because two dozen
+    modules call it and the indirection costs nothing.
+    """
+    from engine.gst.rules import rupees as indian
+
+    return indian(paise)
 
 
 # --- the inverse of classify_instrument ---------------------------------

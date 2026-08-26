@@ -210,3 +210,32 @@ def test_meera_boutique_end_to_end():
     refund = 150_000                                                    # order 1005
     net = gross - total_fee - total_gst - refund
     assert rupees(net) == "Rs 7,391.44"
+
+
+# --- one money format, not two --------------------------------------------
+
+def test_there_is_only_one_rupee_format_in_the_product():
+    """
+    There were two, and they disagreed.
+
+    engine/expected_value grouped in thousands and engine/gst/rules grouped in
+    lakhs, so the settlement half of the product printed Rs 1,000,000.00 on
+    the same screen where the GST half printed Rs 10,00,000.00 - and the cash
+    forecaster's hover readout showed both, one line apart. Two formats for
+    the same quantity in one Indian finance product is a defect.
+    """
+    from engine.expected_value import rupees as settlement_side
+    from engine.gst.rules import rupees as gst_side
+
+    for paise in (0, 5, 99, 100, 668900, 94000000, 100000000, -12345678,
+                  1_00_00_000_00):
+        assert settlement_side(paise) == gst_side(paise), paise
+
+
+def test_money_is_grouped_the_way_an_indian_merchant_reads_it():
+    """Lakhs and crores, not thousands. Rs 12,34,567.89."""
+    from engine.expected_value import rupees
+
+    assert rupees(123456789) == "Rs 12,34,567.89"
+    assert rupees(100000000) == "Rs 10,00,000.00"
+    assert rupees(-100000) == "-Rs 1,000.00"
