@@ -1540,3 +1540,24 @@ def test_a_real_upload_never_gets_a_generated_gstr2b(shop):
         led.business_id = led.businesses.all()[0]["business_id"]
         assert led.conn.execute(
             "SELECT COUNT(*) n FROM live_gstr2b").fetchone()["n"] == 0
+
+
+def test_the_reconciliation_is_reachable_from_the_results(shop):
+    """
+    It is not a tab any more, by request - but a page nothing links to is a
+    page nobody finds. The dashboard says what the other half answers and
+    links to it, because "who your credit depends on" and "did this month's
+    invoices match GSTR-2B" are genuinely different questions about the same
+    suppliers.
+    """
+    key = shop.post("/agents/input-credit/demo", data={"use_agent": "no"},
+                    follow_redirects=False
+                    ).headers["location"].split("key=")[-1]
+    assert _finish(shop, key)["state"] == "done"
+
+    page = shop.get(f"/agents/input-credit?key={key}").text
+    assert 'href="/agents/input-credit/reconciliation"' in page
+    assert "The other half of this agent" in page
+
+    # And the link goes somewhere that works.
+    assert shop.get("/agents/input-credit/reconciliation").status_code == 200

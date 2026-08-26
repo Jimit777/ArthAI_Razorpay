@@ -2712,6 +2712,19 @@ def _risk_results(payload: dict, key: str = "") -> str:
   {spend}
 </div>
 
+<div class="card tint">
+  <h2>The other half of this agent</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">This screen is about
+     <b>who your credit depends on</b> &mdash; three years of each
+     supplier&rsquo;s filing record, and what it says about the money you are
+     claiming from them now. The
+     <a href="/agents/input-credit/reconciliation">reconciliation</a> answers
+     the other question: <b>this period&rsquo;s invoices, line by line,
+     against what your suppliers actually reported in GSTR-2B</b>. Same
+     suppliers, different question &mdash; a supplier with a spotless
+     three-year record can still have got one invoice wrong last month.</p>
+</div>
+
 {drawers}
 {DRAWER_SCRIPT}"""
 
