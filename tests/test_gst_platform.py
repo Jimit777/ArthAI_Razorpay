@@ -491,3 +491,129 @@ def test_an_unknown_behaviour_falls_back_rather_than_erroring(shop):
     with appmod.ledger() as led:
         biz = led.businesses.all()[0]["business_id"]
         assert led.businesses.supplier_behaviour(biz) == "correct"
+
+
+# --- several supplier behaviours at once ----------------------------------
+#
+# The switch used to be one fault for the whole book, which produces a register
+# where every supplier has the same problem. That demonstrates one finding well
+# and the case the agent actually exists for - several kinds of problem side by
+# side, needing to be told apart - not at all.
+
+def test_the_control_is_a_multi_select(shop):
+    page = shop.get("/data/simulator").text
+    assert 'type="checkbox" name="behaviour"' in page
+    # And no radio left behind, which would silently limit it to one.
+    assert 'type="radio" name="behaviour"' not in page.split(
+        "How your suppliers file")[1]
+
+
+def test_several_behaviours_can_be_stored_at_once(shop):
+    import merchant.app as appmod
+
+    shop.post("/settings/suppliers",
+              data={"behaviour": ["not_filed", "wrong_gstin", "filed_late"]})
+    with appmod.ledger() as led:
+        biz = led.businesses.all()[0]["business_id"]
+        stored = led.businesses.supplier_behaviours(biz)
+    assert {str(b) for b in stored} == {"not_filed", "wrong_gstin", "filed_late"}
+
+
+def test_a_mixed_setting_produces_a_mixed_register(shop):
+    """
+    The point of the whole feature, asserted on what the detector finds.
+
+    Ten suppliers, all five behaviours ticked: the register that comes out has
+    to contain all five kinds of discrepancy, or the mix is decorative.
+    """
+    import merchant.app as appmod
+    from engine.gst.detector import detect_batch
+
+    shop.post("/settings/suppliers",
+              data={"behaviour": ["correct", "not_filed", "wrong_gstin",
+                                  "short_reported", "filed_late"]})
+
+    names = ["Anand Textiles", "Kaveri Silk Mills", "Deepak Packaging",
+             "Bright Print House", "Coimbatore Yarns", "Nashik Logistics",
+             "Surat Fabrics", "Pune Threads", "Ludhiana Wool", "Jaipur Blocks"]
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        for name in names:
+            led.record_purchase(supplier_name=name, taxable_value=100_000)
+        variances = detect_batch(led.build_itc_batch())
+
+    found = {v.signals[0].kind for v in variances if v.signals}
+    assert found == {"matched_exactly", "absent_from_2b",
+                     "absent_but_similar_elsewhere", "tax_short_in_2b",
+                     "filed_in_later_period"}
+
+
+def test_a_supplier_keeps_its_behaviour_across_invoices(shop):
+    """
+    The stickiness the mix depends on.
+
+    Filing behaviour belongs to the supplier, not the invoice. A supplier who
+    misfiles to another state does it every time, which is exactly why a
+    cross-GSTIN search finds them - re-rolling per invoice would leave no
+    consistent wrong registration to search for and quietly break the finding.
+    """
+    import merchant.app as appmod
+
+    shop.post("/settings/suppliers",
+              data={"behaviour": ["not_filed", "wrong_gstin",
+                                  "short_reported", "filed_late"]})
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        for _ in range(4):
+            for name in ("Anand Textiles", "Kaveri Silk Mills",
+                         "Deepak Packaging"):
+                led.record_purchase(supplier_name=name, taxable_value=50_000)
+
+        for name in ("Anand Textiles", "Kaveri Silk Mills", "Deepak Packaging"):
+            behaviours = {r["behaviour"] for r in led.conn.execute(
+                "SELECT behaviour FROM live_purchases WHERE supplier_name = ?",
+                (name,))}
+            assert len(behaviours) == 1, f"{name} drifted: {behaviours}"
+
+
+def test_one_ticked_behaviour_still_applies_to_everybody(shop):
+    """The single-choice case is the one-element case, not a separate path."""
+    import merchant.app as appmod
+
+    shop.post("/settings/suppliers", data={"behaviour": ["not_filed"]})
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        for name in ("A Traders", "B Traders", "C Traders"):
+            led.record_purchase(supplier_name=name, taxable_value=50_000)
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM live_gstr2b").fetchone()["n"] == 0
+
+
+def test_ticking_nothing_means_filing_correctly(shop):
+    """A form with no faults selected reads as 'no faults', not as an error."""
+    import merchant.app as appmod
+
+    shop.post("/settings/suppliers", data={})
+    with appmod.ledger() as led:
+        biz = led.businesses.all()[0]["business_id"]
+        assert led.businesses.supplier_behaviour(biz) == "correct"
+
+
+def test_a_legacy_single_value_still_reads(shop):
+    """
+    Rows written before this feature hold a bare value.
+
+    No migration was run, so this is the compatibility that keeps an existing
+    database working - and it is one line of parsing rather than a rewrite of
+    live rows.
+    """
+    import merchant.app as appmod
+
+    with appmod.ledger() as led:
+        biz = led.businesses.all()[0]["business_id"]
+        led.conn.execute(
+            "UPDATE businesses SET supplier_behaviour = 'wrong_gstin'"
+            " WHERE business_id = ?", (biz,))
+        led.conn.commit()
+        assert [str(b) for b in led.businesses.supplier_behaviours(biz)] \
+            == ["wrong_gstin"]

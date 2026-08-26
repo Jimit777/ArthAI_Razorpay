@@ -97,6 +97,90 @@ STATES = {
 }
 
 
+# --- picking a behaviour when several are switched on ----------------------
+#
+# The switch used to be one behaviour for the whole book, which produces a
+# register where every supplier has the same fault. That demonstrates one
+# finding well and the thing the product is actually for - a mixed register
+# where several kinds of problem sit side by side and have to be told apart -
+# not at all.
+#
+# So several can be selected at once. The question is then what a mix MEANS,
+# and the answer is not "pick one at random per invoice":
+#
+# Filing behaviour is a property of the SUPPLIER, not of an invoice. A supplier
+# who misfiles to a Karnataka registration does it on every invoice, which is
+# exactly why a cross-GSTIN search finds it. Re-rolling per invoice would give
+# one supplier three different faults across three months, and the findings
+# would stop meaning anything - GSTIN_MISMATCH in particular becomes
+# unfindable, because there is no consistent wrong registration to search for.
+#
+# So each SUPPLIER is assigned one behaviour from the selected set, chosen
+# deterministically from their name. The same supplier always behaves the same
+# way, different suppliers exhibit different faults, and the register is
+# reproducible - open it twice and it says the same thing.
+
+SEPARATOR = ","
+
+
+def parse_behaviours(text) -> list["SupplierBehaviour"]:
+    """
+    The stored setting as a list.
+
+    Accepts a bare value as well as a list, because that is what every row
+    written before this feature existed contains, and a migration that
+    rewrites live rows to add a feature is a worse trade than four lines here.
+    Unknown values are dropped rather than raising: a setting a merchant
+    cannot correct from the UI must not be able to break their register.
+    """
+    if not text:
+        return [SupplierBehaviour.CORRECT]
+    if isinstance(text, SupplierBehaviour):
+        return [text]
+    if isinstance(text, str):
+        parts = [p.strip() for p in text.split(SEPARATOR)]
+    else:
+        parts = [str(p).strip() for p in text]
+
+    out = []
+    for part in parts:
+        try:
+            found = SupplierBehaviour(part)
+        except ValueError:
+            continue
+        if found not in out:
+            out.append(found)
+    return out or [SupplierBehaviour.CORRECT]
+
+
+def join_behaviours(chosen) -> str:
+    """The list as it is stored. Order follows the enum so it is stable."""
+    kept = [b for b in SupplierBehaviour if b in set(parse_behaviours(chosen))]
+    return SEPARATOR.join(str(b) for b in kept)
+
+
+def next_behaviour(chosen, already_assigned: int) -> "SupplierBehaviour":
+    """
+    Which behaviour the NEXT new supplier gets, given how many already have one.
+
+    A rotation rather than a hash of the name, and the reason is small numbers.
+    Hashing distributes well over hundreds of suppliers and badly over the six
+    in a demo register - selecting all five faults and watching four suppliers
+    land on the same one is a worse demonstration than the single choice this
+    replaces. A rotation guarantees that every selected behaviour appears as
+    soon as there are enough suppliers to go round.
+
+    Stability comes from the caller, not from here: a supplier who already has
+    a behaviour keeps it, and this is only asked about ones that do not. See
+    Ledger._supplier_behaviour, where that lookup lives, and note why it
+    matters - a supplier whose fault changed between two invoices would make
+    GSTIN_MISMATCH unfindable, because there would be no consistent wrong
+    registration to search for.
+    """
+    options = parse_behaviours(chosen)
+    return options[already_assigned % len(options)]
+
+
 def gstin_for(name: str, state: str = "27") -> str:
     """
     A GSTIN in the real 15-character shape, derived from the supplier name.

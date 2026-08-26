@@ -403,10 +403,21 @@ class Businesses:
     # gateway's fault switch for the same reason: it belongs to the simulator
     # and not to a business, and putting it on the purchase form asked a
     # merchant to declare something only the product can find out.
-    def set_supplier_behaviour(self, business_id: str, behaviour: str) -> None:
+    def set_supplier_behaviour(self, business_id: str, behaviour) -> None:
+        """
+        Store one behaviour, or several.
+
+        Several are kept comma-separated in the same column rather than in a
+        table of their own. A row written before this feature holds a bare
+        value and parses as a one-element list, so nothing had to be migrated -
+        and the single-choice case stays the one-element case rather than
+        becoming a separate code path.
+        """
+        from merchant.suppliers import join_behaviours
+
         self.conn.execute(
             "UPDATE businesses SET supplier_behaviour = ? WHERE business_id = ?",
-            (behaviour, business_id))
+            (join_behaviours(behaviour), business_id))
         self.conn.commit()
 
     def supplier_behaviour(self, business_id: str) -> str:
@@ -415,6 +426,12 @@ class Businesses:
             return row["supplier_behaviour"] or "correct"
         except (TypeError, IndexError, KeyError):
             return "correct"
+
+    def supplier_behaviours(self, business_id: str) -> list:
+        """The stored setting as a list, however many are switched on."""
+        from merchant.suppliers import parse_behaviours
+
+        return parse_behaviours(self.supplier_behaviour(business_id))
 
     # --- agents -----------------------------------------------------------
 

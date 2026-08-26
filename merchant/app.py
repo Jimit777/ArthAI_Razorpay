@@ -544,8 +544,7 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
 
     with ledger(resolved) as led:
         shell = _shell_for(led, ws)
-        supplier_behaviour = SupplierBehaviour(
-            led.businesses.supplier_behaviour(resolved))
+        supplier_behaviours = set(led.businesses.supplier_behaviours(resolved))
         behaviour = led.behaviour()
         pending = led.unsettled()
         orders = led.orders(limit=25)
@@ -600,14 +599,19 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
         </div>
       </label>""" for b in Behaviour)
 
+    # Checkboxes, not radios. One fault across the whole book demonstrates one
+    # finding well and the thing the product is actually for - a register where
+    # several kinds of problem sit side by side and have to be told apart - not
+    # at all. Each supplier is assigned one of the ticked behaviours and keeps
+    # it; see Ledger._supplier_behaviour for why that stickiness matters.
     supplier_faults = "".join(f"""
       <label style="display:block;padding:9px 12px;border:1px solid
-        {'var(--brand)' if b == supplier_behaviour else 'var(--line)'};
+        {'var(--brand)' if b in supplier_behaviours else 'var(--line)'};
         border-radius:7px;margin-bottom:5px;cursor:pointer;
-        {'background:var(--brand-wash);' if b == supplier_behaviour else ''}">
+        {'background:var(--brand-wash);' if b in supplier_behaviours else ''}">
         <div style="display:flex;align-items:center;gap:9px">
-          <input type="radio" name="behaviour" value="{b.value}"
-            {'checked' if b == supplier_behaviour else ''}
+          <input type="checkbox" name="behaviour" value="{b.value}"
+            {'checked' if b in supplier_behaviours else ''}
             style="width:auto;margin:0">
           <b style="font-size:12.5px">{views.esc(SUPPLIER_LABEL[b])}</b>
           <span class="sp"></span>
@@ -640,12 +644,19 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
      merchant has no idea whether a supplier filed &mdash; finding out is the
      whole point of the input credit agent &mdash; so this switch belongs to
      the simulator, not to a purchase form.</p>
+  <p class="sub" style="margin:0 0 12px"><b>Tick as many as you like.</b> Each
+     supplier is given one of them and keeps it, so a mixed register comes out
+     with several kinds of problem in it at once &mdash; which is the case the
+     agent exists for. One supplier cannot both file late and not file at all,
+     so the mix is across suppliers rather than within one.</p>
   <form method="post" action="/settings/suppliers">
     {supplier_faults}
     <button style="margin-top:4px">Apply to new invoices</button>
   </form>
   <p class="sub" style="margin:10px 0 0;font-size:11.3px">Invoices already
-     recorded keep whatever their supplier did at the time.</p>
+     recorded keep whatever their supplier did at the time, and a supplier who
+     already has a behaviour keeps it &mdash; only new suppliers draw from the
+     ticked set.</p>
 </div>"""
 
     settle = ""
@@ -4401,17 +4412,21 @@ def set_guardrails(min_confidence: str = Form("0.75"),
 
 
 @app.post("/settings/suppliers")
-def set_supplier_behaviour(behaviour: str = Form(...),
+def set_supplier_behaviour(behaviour: list[str] = Form(default=[]),
                            ws: Workspace = Depends(required_workspace)):
-    """A demo control, so it lives with the other demo controls."""
-    from merchant.suppliers import SupplierBehaviour
+    """
+    A demo control, so it lives with the other demo controls.
 
-    try:
-        chosen = SupplierBehaviour(behaviour)
-    except ValueError:
-        chosen = SupplierBehaviour.CORRECT
+    Takes a list now that the control is checkboxes. Unticking everything
+    means "file correctly", which is the honest reading of a form with no
+    faults selected - and is what parse_behaviours falls back to, so there is
+    no separate empty case here.
+    """
+    from merchant.suppliers import join_behaviours
+
     with ledger(ws.business_id) as led:
-        led.businesses.set_supplier_behaviour(ws.business_id, str(chosen))
+        led.businesses.set_supplier_behaviour(
+            ws.business_id, join_behaviours(behaviour))
     return RedirectResponse("/data/simulator", status_code=303)
 
 

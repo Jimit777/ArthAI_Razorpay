@@ -515,6 +515,51 @@ class Ledger:
 
     # --- purchases, and what suppliers reported about them ----------------
 
+    def _supplier_behaviour(self, business_id: str, supplier_name: str):
+        """
+        How THIS supplier files, given what the simulator is set to.
+
+        With one behaviour selected everybody gets it, which is what the
+        setting always did. With several, each supplier is assigned one - and
+        the assignment has to be sticky, because filing behaviour is a property
+        of the supplier rather than of an invoice. A supplier who misfiles to a
+        Karnataka registration does it every time, which is precisely why a
+        cross-GSTIN search finds them; re-rolling per invoice would leave no
+        consistent wrong registration to search for and quietly break the
+        finding.
+
+        So a supplier who already has one keeps it, and only genuinely new ones
+        draw from the rotation. The lookup is against what was actually stored
+        on their past invoices, so the assignment survives a restart without
+        needing a table of its own.
+        """
+        from merchant.suppliers import (SupplierBehaviour, next_behaviour,
+                                        parse_behaviours)
+
+        chosen = self.businesses.supplier_behaviour(business_id)
+        options = parse_behaviours(chosen)
+        if len(options) == 1:
+            return options[0]
+
+        allowed = {str(o) for o in options}
+        seen = self.conn.execute(
+            "SELECT behaviour FROM live_purchases WHERE business_id = ?"
+            " AND supplier_name = ? AND behaviour IS NOT NULL"
+            " ORDER BY recorded_at LIMIT 1",
+            (business_id, supplier_name)).fetchone()
+        # Reassign only if their old behaviour is no longer among the selected
+        # ones - which means the merchant deliberately turned it off, and the
+        # page already promises that new invoices follow the new setting.
+        if seen is not None and seen["behaviour"] in allowed:
+            return SupplierBehaviour(seen["behaviour"])
+
+        assigned = self.conn.execute(
+            "SELECT COUNT(DISTINCT supplier_name) n FROM live_purchases"
+            " WHERE business_id = ? AND behaviour IN"
+            f" ({','.join('?' * len(allowed))})",
+            (business_id, *sorted(allowed))).fetchone()["n"]
+        return next_behaviour(chosen, assigned)
+
     def record_purchase(self, *, supplier_name: str, taxable_value: int,
                         rate_bps: int = 1800, interstate: bool = False,
                         behaviour=None, category: Optional[str] = None,
@@ -535,8 +580,8 @@ class Ledger:
         business_id = self._scoped()
         # Whatever the simulator is set to, unless a caller names one - the
         # generator and the tests still need to plant a specific fault.
-        behaviour = SupplierBehaviour(
-            behaviour or self.businesses.supplier_behaviour(business_id))
+        behaviour = (SupplierBehaviour(behaviour) if behaviour
+                     else self._supplier_behaviour(business_id, supplier_name))
         when = invoice_date or date.today()
         state = "24" if interstate else "27"
         gstin = gstin_for(supplier_name, state)
