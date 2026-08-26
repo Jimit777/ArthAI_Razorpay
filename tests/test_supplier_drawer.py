@@ -245,9 +245,11 @@ def go_live(client):
 def _analyse(shop, timeout=30):
     import merchant.app as appmod
 
-    r = shop.post("/agents/input-credit",
-                  files={"register": ("r.csv", SAMPLE_REGISTER.encode(),
-                                      "text/csv")},
+    # The Demo Mode tab: both halves generated. Uploading a register with no
+    # history now refuses rather than falling back to generated records, so
+    # this is the flow that exercises the dashboard without inventing data
+    # about anyone.
+    r = shop.post("/agents/input-credit/demo",
                   data={"use_agent": "no"}, follow_redirects=False)
     key = r.headers["location"].split("key=")[-1]
     deadline = time.time() + timeout
@@ -271,13 +273,17 @@ def test_supplier_risk_is_the_landing_view(shop):
     assert "Step 1" not in page
 
 
-def test_the_manual_tabs_are_gone(shop):
+def test_the_tabs_are_the_three_ways_history_arrives(shop):
+    """
+    The tabs name the one question that actually differs between them: where
+    supplier filing history comes from. Everything downstream is identical.
+    """
     from merchant.nav import AGENT_ROUTES
 
     labels = [t.label for t in AGENT_ROUTES["gst_itc"].tabs]
-    assert "Purchases" not in labels
-    assert "Suppliers" not in labels
-    assert labels[0] == "Supplier risk"
+    assert labels == ["Demo Mode", "Without API", "With API"]
+    for gone in ("Purchases", "Suppliers", "Setup", "Supplier risk"):
+        assert gone not in labels
 
 
 def test_every_row_opens_a_drawer(shop):
@@ -390,7 +396,6 @@ def test_a_button_in_the_page_actually_works(shop):
 # --- the drawer is not a simulator privilege ------------------------------
 
 def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
-    go_live(shop)
     """
     Every interactive piece has to work whatever produced the data.
 
@@ -405,7 +410,23 @@ def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
     assert upload.status_code == 303
     assert "error=" not in upload.headers["location"]
 
-    key, state = _analyse(shop)
+    # The register flow, not the demo one: with history uploaded, a register
+    # upload resolves to that history.
+    import merchant.app as appmod
+
+    r = shop.post("/agents/input-credit",
+                  files={"register": ("r.csv", SAMPLE_REGISTER.encode(),
+                                      "text/csv")},
+                  data={"use_agent": "no"}, follow_redirects=False)
+    key = r.headers["location"].split("key=")[-1]
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        with appmod._risk_lock:
+            state = dict(appmod.RISK_RUNS.get(key) or {})
+        if state.get("state") != "running":
+            break
+        time.sleep(0.05)
+    assert state["state"] == "done", state
     page = shop.get(f"/agents/input-credit?key={key}").text
 
     assert state["payload"]["portfolio"]["history_source"] == "file"
@@ -426,35 +447,33 @@ def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
 
 def test_an_upload_completes_the_one_time_step(shop):
     """
-    State 3 stops asking once the one-time effort is done.
+    The Without API tab stops asking once the one-time effort is done.
 
     A page that keeps demanding three years of filing history after it has been
     given three years of filing history is a page nobody finishes.
     """
-    go_live(shop)
-    before = shop.get("/agents/input-credit").text
+    before = shop.get("/agents/input-credit/without-api").text
     assert "Step 1" in before
     assert "No GST API is configured" in before
 
     shop.post("/agents/input-credit/history",
               files={"history": ("history.csv", sample_filing_history().encode(),
                                  "text/csv")})
-    after = shop.get("/agents/input-credit").text
-    assert "Supplier filing history on file" in after
+    after = shop.get("/agents/input-credit/without-api").text
+    assert "Supplier history on file" in after
     assert "Step 1" not in after
     assert "Upload your purchase register" in after
 
     shop.post("/agents/input-credit/history/forget")
-    assert "Step 1" in shop.get("/agents/input-credit").text
+    assert "Step 1" in shop.get("/agents/input-credit/without-api").text
 
 
 def test_a_history_upload_survives_a_page_load(shop):
     """Stored, not held for one run. A merchant who assembled three years of
     filing dates is not asked for them again."""
-    go_live(shop)
     shop.post("/agents/input-credit/history",
               files={"history": ("history.csv", sample_filing_history().encode(),
                                  "text/csv")})
-    page = shop.get("/agents/input-credit").text
+    page = shop.get("/agents/input-credit/without-api").text
     assert "tax periods" in page
     assert "2023-" in page or "2024-" in page

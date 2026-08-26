@@ -1208,12 +1208,19 @@ def test_a_workspace_says_whether_it_is_on_live_or_demo_data(client):
     assert "Demo data" in page
 
 
-def test_the_setup_tab_lists_what_the_agent_needs(client):
+def test_the_setup_tab_folded_into_the_tab_it_configures(client):
+    """
+    Setup is gone. The only thing on it this agent needed was the GSP
+    connection, and that belongs beside the flow it enables rather than one
+    tab away from it - so the old URL lands there.
+    """
     _start(client)
-    page = client.get("/agents/input-credit/setup").text
-    assert "What this agent needs" in page
-    assert "Purchase register" in page
-    assert "GSTR-2B" in page
+    moved = client.get("/agents/input-credit/setup", follow_redirects=False)
+    assert moved.status_code == 307
+    assert moved.headers["location"] == "/agents/input-credit/with-api"
+
+    page = client.get("/agents/input-credit/with-api").text
+    assert "Connect a GST filing-status API" in page
 
 
 def test_the_hub_shows_planned_agents_without_pretending(client):

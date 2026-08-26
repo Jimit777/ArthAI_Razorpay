@@ -163,6 +163,24 @@ class MonthlyFiling:
     gstr1_filed: Optional[date]
     gstr3b_due: date
     gstr3b_filed: Optional[date]
+    # Whether anybody actually KNOWS what happened to the GSTR-3B.
+    #
+    # This is a third state, and it exists because GSTR-2B was added as a
+    # history source. A GSP return-status feed reports every period either way,
+    # so `gstr3b_filed = None` genuinely means "did not file". GSTR-2B does not
+    # work like that: it is a statement of what suppliers REPORTED, and it is
+    # silent about payment except where the portal itself flags a Rule 37A
+    # reversal.
+    #
+    # Reading that silence as non-payment would accuse every supplier in a
+    # merchant's book of the most serious thing this product can find. So
+    # silence is recorded as ignorance, and the arithmetic in risk.py counts
+    # only the periods where somebody actually knows.
+    gstr3b_known: bool = True
+
+    @property
+    def payment_unknown(self) -> bool:
+        return not self.gstr3b_known and self.gstr3b_filed is None
 
     @property
     def gstr1_late_days(self) -> int:
@@ -183,8 +201,13 @@ class MonthlyFiling:
 
         The single most important field here. A reconciliation cannot see this
         - the invoice is in GSTR-2B either way.
+
+        Requires the payment status to be KNOWN. "We have no idea whether they
+        paid" and "they did not pay" are different claims, and only one of them
+        justifies telling a merchant to stop buying from a named company.
         """
-        return self.gstr1_filed is not None and self.gstr3b_filed is None
+        return (self.gstr3b_known and self.gstr1_filed is not None
+                and self.gstr3b_filed is None)
 
 
 @dataclass
@@ -219,6 +242,7 @@ class FilingHistory:
             "gstr3b_due": str(m.gstr3b_due),
             "gstr3b_filed": str(m.gstr3b_filed) if m.gstr3b_filed else None,
             "gstr3b_late_days": m.gstr3b_late_days,
+            "gstr3b_known": m.gstr3b_known,
             "sold_but_did_not_pay": m.sold_but_did_not_pay,
         } for m in self.months]
 
@@ -419,7 +443,8 @@ def from_filing_rows(gstin: str, rows: Iterable[dict], *,
             gstr1_due=gstr1_due,
             gstr1_filed=normalise_date(row.get("gstr1_filed")),
             gstr3b_due=gstr3b_due,
-            gstr3b_filed=normalise_date(row.get("gstr3b_filed")))
+            gstr3b_filed=normalise_date(row.get("gstr3b_filed")),
+            gstr3b_known=bool(row.get("gstr3b_known", True)))
 
     return FilingHistory(
         gstin=gstin.strip().upper(),

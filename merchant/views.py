@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime, timezone
+from typing import Optional
 
 from engine.expected_value import rupees
 from merchant.auth import ROLE_LABEL
@@ -828,22 +829,21 @@ def _history_on_file(summary: dict) -> str:
 
 def risk_demo_screen() -> str:
     """
-    State 1. Connected to the simulator, so there is nothing to upload.
+    Tab 1. Both halves generated, one button, no upload boxes.
 
-    Deliberately one button and no file inputs. Asking a person to download a
-    sample file and upload it back is theatre - the platform already has both
-    halves, and pretending otherwise just adds two clicks and a chance to pick
-    the wrong file.
+    Asking a person to download a sample file and upload it back is theatre -
+    the platform holds both halves already, and the round trip only adds two
+    clicks and a chance to pick the wrong file.
     """
     return """
 <div class="src demo">
   <span class="src-dot"></span>
-  <div><b>Demo mode &mdash; this business is on the built-in simulator</b>
-    <div class="src-what">Both halves are generated: a purchase register of
-      eight suppliers, and 36 months of GSTR-1 and GSTR-3B filing history for
-      each of them, produced in the same JSON the GST portal returns and read
-      back through the same parser a live connection uses. The arithmetic and
-      the law are real; the companies and their filing dates are not.
+  <div><b>Demo mode &mdash; nothing here is your data</b>
+    <div class="src-what">A purchase register of eight suppliers, and 36 months
+      of GSTR-1 and GSTR-3B history for each of them, generated in the same
+      JSON the GST portal returns and read back through the same parser a live
+      connection uses. The arithmetic and the law are real; the companies and
+      their filing dates are not.
       <b>Do not act on any of it against a real supplier.</b></div></div>
 </div>
 
@@ -865,62 +865,53 @@ def risk_demo_screen() -> str:
 </div>
 
 <div class="card tint">
-  <h2>Working with your own data instead</h2>
-  <p class="sub" style="margin:4px 0 0;max-width:70ch">Switch this business to
-     a live data source in <a href="/data">Data &amp; integrations</a>. You will
-     then be asked for your purchase register &mdash; and, if you have no GSP
-     API configured, for your suppliers&rsquo; filing history once. Everything
-     below that point is identical: same contract, same arithmetic, same
-     screen.</p>
+  <h2>Using your own data</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch"><b>Without API</b> takes
+     your purchase register plus the GSTR-2B files you download from the portal
+     yourself. <b>With API</b> takes the register alone and fetches every
+     supplier&rsquo;s history for you. Both produce the same dashboard as this
+     one, from the same arithmetic &mdash; the tabs differ only in where the
+     history comes from.</p>
 </div>"""
 
 
-def risk_live_api_screen(api_message: str = "") -> str:
-    """
-    State 2. A GSP key is configured, so history is fetched, not asked for.
+# The portal's own path to the file, spelled out. A merchant who has never
+# downloaded one will not find it from "get your GSTR-2B": the JSON is four
+# clicks deep and the tile offers an Excel first, which is the wrong file.
+GSTR2B_PATH = ("Download the JSON files from: gst.gov.in &rarr; Services "
+               "&rarr; Returns &rarr; Returns Dashboard &rarr; Select "
+               "Financial Year &amp; Month &rarr; Search &rarr; GSTR-2B Tile "
+               "&rarr; Download &rarr; Generate JSON File to Download.")
 
-    One box, because there is exactly one thing the platform cannot get by
-    itself. The merchant's own purchases are not on the GST portal.
+
+def risk_without_api_screen(summary: dict, register_ready: bool = False) -> str:
     """
-    return f"""
+    Tab 2. Register plus the GSTR-2B files a merchant can fetch themselves.
+
+    Two uploads, and the second is a real cost - twenty-four to thirty-six
+    files, one per month. The page says so rather than hiding it behind a
+    cheerful box, and says what the files can and cannot show, because a
+    merchant who believes GSTR-2B proves payment will read "payment not
+    visible" as a defect rather than as the truth.
+    """
+    if summary:
+        return f"""
 <div class="src ok">
   <span class="src-dot"></span>
-  <div><b>Connected GST API</b>
-    <div class="src-what">Filing history is fetched per supplier when you run
-      an analysis &mdash; 36 tax periods of GSTR-1 and GSTR-3B for every GSTIN
-      in your register. You do not need to upload any of it.
-      {esc(api_message)}</div></div>
-  <a class="btn ghost small" href="/agents/input-credit/setup">Change</a>
+  <div><b>Supplier history on file</b>
+    <div class="src-what">{summary["suppliers"]} suppliers,
+      {summary["periods"]} tax periods,
+      {esc(summary["first_period"])} to {esc(summary["last_period"])}.
+      You will not be asked again unless you replace it.</div></div>
+  <form method="post" action="/agents/input-credit/history/forget"
+    style="flex:0"><button class="ghost small">Replace</button></form>
 </div>
 
 <div class="card">
   <h2>Upload your purchase register</h2>
   <p class="sub" style="margin:3px 0 13px;max-width:66ch">{REGISTER_HELP}</p>
-  <form method="post" action="/agents/input-credit" enctype="multipart/form-data">
-    {_register_field("Purchase register (current period)")}
-    {_agent_toggle()}
-  </form>
-</div>"""
-
-
-def risk_live_manual_screen(summary: dict) -> str:
-    """
-    State 3. Live, no GSP key, so the history has to come from the merchant.
-
-    Two things are asked for, and the page is explicit that the second is a
-    one-time effort with a way out - because it IS a real cost, and hiding
-    that behind a cheerful upload box is how a merchant discovers it halfway
-    through assembling three years of filing dates.
-    """
-    if summary:
-        # The one-time effort is done. Stop asking for it.
-        return f"""
-{_history_on_file(summary)}
-
-<div class="card">
-  <h2>Upload your purchase register</h2>
-  <p class="sub" style="margin:3px 0 13px;max-width:66ch">{REGISTER_HELP}</p>
-  <form method="post" action="/agents/input-credit" enctype="multipart/form-data">
+  <form method="post" action="/agents/input-credit"
+        enctype="multipart/form-data">
     {_register_field("Purchase register (current period)")}
     {_agent_toggle()}
   </form>
@@ -928,65 +919,132 @@ def risk_live_manual_screen(summary: dict) -> str:
 
     return f"""
 <div class="banner warn">
-  <span><b>No GST API is configured for this business.</b>
-    <a href="/agents/input-credit/setup">Connect one in Setup</a> and filing
-    history is fetched automatically. Without an API you have to provide your
-    suppliers&rsquo; historical filing data yourself &mdash; once &mdash; before
-    risk can be calculated.</span>
+  <span><b>No GST API is configured, so supplier history has to come from
+    you.</b> It is a one-time effort &mdash; or connect a GSP on the
+    <a href="/agents/input-credit/with-api">With API</a> tab and it is fetched
+    automatically.</span>
 </div>
 
 <div class="card">
   <div class="card-head"><h2>Step 1 &middot; Supplier filing history</h2>
     <span class="sub">one-time</span></div>
-  <p class="sub" style="margin:3px 0 12px;max-width:70ch">What your suppliers
-     <b>filed</b>, as against what you bought. This is the half that decides
-     whether the credit exists at all &mdash; a supplier who files GSTR-1 and
-     skips GSTR-3B reconciles perfectly against a credit that is not there.
-     One row per supplier per month:
-     <span class="mono">Supplier GSTIN, Period, GSTR-1 Filed Date,
-     GSTR-3B Filed Date</span>. 24 to 36 months.</p>
+  <p class="sub" style="margin:3px 0 12px;max-width:70ch">Twenty-four to
+     thirty-six monthly GSTR-2B files, selected together. Any registered
+     business can pull their own &mdash; no GSP and no special access.</p>
+  <p class="sub" style="margin:0 0 12px;max-width:70ch"><b>{GSTR2B_PATH}</b></p>
   <form method="post" action="/agents/input-credit/history"
         enctype="multipart/form-data">
     <div class="row">
-      <div><label>Filing history (CSV or Excel)</label>
-        <input type="file" name="history" accept=".csv,.xlsx,.xlsm,.txt"
-          required></div>
+      <div><label>GSTR-2B files (JSON), or a filing-history CSV</label>
+        <input type="file" name="history" accept=".json,.csv,.xlsx,.xlsm"
+          multiple required></div>
       <div style="flex:0;align-self:flex-end"><button>Upload</button></div>
     </div>
   </form>
   <p class="sub" style="margin:12px 0 0;font-size:11.5px">
-    <b>A blank filing-date cell counts.</b> It says that period was checked and
-    the return was not filed, which is what makes a default countable. A period
-    with no row at all makes no claim and is not counted against anyone &mdash;
-    so a partial file is safe. Suppliers missing from it are scored
-    <i>unknown</i>, never clean.
+    <b>What these files can and cannot show.</b> They prove what your suppliers
+    <i>reported</i>: which months they filed GSTR-1 for, on what date, and
+    whether they went quiet. They prove <i>payment</i> only where the portal
+    itself flagged a Rule 37A reversal &mdash; so for most months payment is
+    reported as <b>not visible</b> rather than guessed at. A supplier is never
+    accused of not paying on the strength of a file that cannot see payment.
   </p>
-  <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line-2)">
-    <a class="btn ghost small" href="/agents/input-credit/sample-history">
-      Download the format</a>
-    <span class="sub" style="margin-left:9px;font-size:11.5px">An example with
-      the columns filled in, so you know what your accountant needs to
-      produce.</span>
-  </div>
 </div>
 
 <div class="card" style="opacity:.55">
   <div class="card-head"><h2>Step 2 &middot; Purchase register</h2>
     <span class="sub">after step 1</span></div>
-  <p class="sub" style="margin:3px 0 0;max-width:66ch">Once the filing history
-     is in, upload the period you want analysed and every supplier in it is
-     scored against their record.</p>
+  <p class="sub" style="margin:3px 0 0;max-width:66ch">Once the history is in,
+     upload the period you want analysed and every supplier in it is scored
+     against their record.</p>
+</div>"""
+
+
+def risk_with_api_screen(config: Optional[dict], vault_ready: bool = True
+                         ) -> str:
+    """
+    Tab 3. Register only; history fetched per supplier over a GSP.
+
+    The configuration lives on this tab rather than on a Setup page, because
+    the connection is the only thing that makes this tab different from the
+    one beside it.
+    """
+    if config and config.get("key_available"):
+        return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>Connected GST API</b>
+    <div class="src-what">When you run an analysis, every GSTIN in your
+      register is looked up and 36 tax periods of GSTR-1 and GSTR-3B are
+      fetched for it. Nothing to upload but the register.
+      {esc(config.get("message", ""))}</div></div>
+  <form method="post" action="/agents/input-credit/filing-api/forget"
+    style="flex:0"><button class="ghost small">Disconnect</button></form>
+</div>
+
+<div class="card">
+  <h2>Upload your purchase register</h2>
+  <p class="sub" style="margin:3px 0 13px;max-width:66ch">{REGISTER_HELP}</p>
+  <form method="post" action="/agents/input-credit"
+        enctype="multipart/form-data">
+    {_register_field("Purchase register (current period)")}
+    {_agent_toggle()}
+  </form>
+</div>"""
+
+    stale = ""
+    if config:
+        stale = ('<div class="banner warn"><span>A connection is stored but '
+                 'its key cannot be decrypted, so runs will not use it. '
+                 'Re-enter it below.</span></div>')
+    vault_note = "" if vault_ready else (
+        '<p class="sub" style="margin:9px 0 0;font-size:11.5px;'
+        'color:var(--warn)">No encryption key is configured, so the API key '
+        'will not be stored. Set <span class="mono">LEDGERLINE_SECRET_KEY'
+        '</span> to keep it between runs.</p>')
+
+    return f"""
+{stale}
+<div class="card">
+  <h2>Connect a GST filing-status API</h2>
+  <p class="sub" style="margin:3px 0 12px;max-width:70ch">With a GSP or
+     verification API key, each supplier&rsquo;s GSTR-1 and GSTR-3B filing
+     dates are fetched from their GSTIN &mdash; no monthly downloads, and
+     payment history is genuinely visible rather than inferred. Everything
+     after that is identical to the other two tabs.</p>
+  <form method="post" action="/agents/input-credit/filing-api">
+    <div><label>Endpoint URL</label>
+      <input name="url_template" required
+        placeholder="https://your-provider.example/returns/{{gstin}}"></div>
+    <p class="sub" style="margin:5px 0 11px;font-size:11.4px">Must be https and
+      must contain <span class="mono">{{gstin}}</span> &mdash; that is where
+      each supplier&rsquo;s number is substituted in.</p>
+    <div class="row">
+      <div><label>API key</label>
+        <input name="api_key" type="password" autocomplete="off"></div>
+      <div><label>Header name</label>
+        <input name="key_header" placeholder="x-api-key"></div>
+      <div><label>or query parameter</label>
+        <input name="key_param" placeholder="api_key"></div>
+    </div>
+    <div class="row" style="margin-top:11px">
+      <div><label>Test with a GSTIN (optional)</label>
+        <input name="probe_gstin" placeholder="27AAAAA0000A1Z5"></div>
+      <div style="flex:0;align-self:flex-end"><button>Connect</button></div>
+    </div>
+  </form>
+  {vault_note}
 </div>
 
 <div class="card tint">
-  <h2>Why GSTR-2B is not what is being asked for here</h2>
-  <p class="sub" style="margin:4px 0 0;max-width:70ch">GSTR-2B is easy to
-     download and it is the wrong file for this. It shows what suppliers
-     <b>reported</b> (GSTR-1) and carries nothing about what they
-     <b>paid</b> (GSTR-3B) &mdash; so building risk from it would report every
-     supplier in your book as having never paid a rupee of tax. It has a real
-     job on the <a href="/agents/input-credit/reconciliation">Reconciliation</a>
-     tab, which is the question it can answer.</p>
+  <h2>No GSP contract?</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">A GSP is a commercial
+     agreement with a GSTN-authorised provider, not a signup, and most
+     merchants will never have one. The
+     <a href="/agents/input-credit/without-api">Without API</a> tab takes the
+     GSTR-2B files you can download yourself and produces the same dashboard
+     &mdash; with payment reported as not visible where those files cannot
+     see it.</p>
 </div>"""
 
 

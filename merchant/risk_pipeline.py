@@ -290,35 +290,37 @@ def run(imported: ImportResult, *, use_agent: bool = True,
 
 
 def history_service_for(led, business_id: str, *, months: int = 36,
+                        simulated: bool = False,
                         http=None) -> Optional[SupplierHistoryService]:
     """
-    Which source this business's runs read from - or None, meaning refuse.
+    Which source a run reads from - or None, meaning refuse.
 
-    The DATA SOURCE decides first, and that is the important part. A business
-    connected to the simulator gets simulated history even if a GSP key happens
-    to be sitting in its settings; a business on live data never gets simulated
-    history at all. Otherwise the screen a merchant is looking at and the data
-    behind their numbers could disagree, which is the one thing a provenance
-    label exists to prevent.
+    `simulated=True` is the Demo Mode tab saying so explicitly. It is a
+    parameter rather than something inferred, because a run that quietly
+    decided to generate filing records for real companies would be the worst
+    thing this product could do, and "the caller asked for it" is the only
+    acceptable reason to do it.
 
-    Returning None is a real answer, not a failure: live data, no API, and no
-    uploaded history means there is no honest way to score their suppliers.
-    Falling back to the simulator there would put generated filing records
-    against real companies' names and call the result a risk assessment. The
-    caller refuses and says what is missing.
+    Every other run resolves by evidence, in the order the tabs are laid out:
+    a configured API beats uploaded history, because it is more current and
+    because it can see payment. Nothing here reads the Razorpay connector -
+    which settlement source a business uses says nothing about how it gets
+    GST filing history, and keying one off the other was a coupling nobody
+    could have predicted from the screen.
+
+    Returning None is a real answer. No API and no uploaded history means
+    there is no honest way to score anybody's suppliers, and the caller says
+    what is missing instead of inventing it.
     """
     from engine.gst.filing_history import (SimulatedHistoryProvider,
                                            UploadedHistoryProvider)
     from merchant.gstin_lookup import FilingStatusApi
-    from merchant.sources import SourceKind, Sources
+    from merchant.sources import Sources
 
-    sources = Sources(led.conn)
-    kind = sources.kind(business_id)
-
-    if kind is None or kind == SourceKind.SIMULATOR:
+    if simulated:
         return SupplierHistoryService(SimulatedHistoryProvider(), months=months)
 
-    config = sources.filing_api_config(business_id)
+    config = Sources(led.conn).filing_api_config(business_id)
     if config and config["key_available"]:
         return SupplierHistoryService(
             FilingStatusApi(url_template=config["url_template"],
@@ -336,8 +338,8 @@ def history_service_for(led, business_id: str, *, months: int = 36,
 
 
 NO_HISTORY = (
-    "This business is on live data, has no GST API configured, and no supplier "
-    "filing history has been uploaded. There is no honest way to score real "
-    "suppliers without one of those - generated filing records against real "
-    "companies would not be a risk assessment. Upload your suppliers' filing "
-    "history, or connect a GST API in Setup.")
+    "No supplier filing history is available for this business. Upload your "
+    "GSTR-2B files on the Without API tab, or connect a GSP on the With API "
+    "tab. Scoring real suppliers against generated filing records would not "
+    "be a risk assessment, so this run was stopped rather than made up."
+)

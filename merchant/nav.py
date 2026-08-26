@@ -128,15 +128,20 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
     "gst_itc": AgentRoute(
         agent_id="gst_itc", slug="input-credit",
         tabs=(
-            # Supplier risk is the front door now. The manual Suppliers and
-            # Purchases tabs are gone: the workflow is file-driven, and a form
-            # asking a merchant to type invoices one at a time was the demo
-            # scaffolding, not the product.
-            AgentTab("Supplier risk", "",
-                     "who your credit depends on, and how they have behaved"),
-            AgentTab("Reconciliation", "reconciliation",
-                     "this period's invoices against GSTR-2B"),
-            AgentTab("Setup", "setup", "what this agent needs to run"),
+            # The tabs are the three ways a merchant can GET supplier filing
+            # history, because that - not the analysis - is the only thing
+            # that differs between them. Everything downstream is identical:
+            # same FilingHistory contract, same arithmetic, same agent, same
+            # dashboard. Naming the tabs after the ingestion route makes the
+            # choice a merchant actually has to make the first thing they see,
+            # instead of burying it behind a screen that changed shape for
+            # reasons they could not name.
+            AgentTab("Demo Mode", "",
+                     "generated suppliers and generated history, in one click"),
+            AgentTab("Without API", "without-api",
+                     "your register plus GSTR-2B files you download yourself"),
+            AgentTab("With API", "with-api",
+                     "your register; history fetched per supplier over a GSP"),
         )),
 }
 
@@ -157,6 +162,10 @@ MOVED: dict[str, str] = {
     # The manual tabs were removed; their URLs land on what replaced them.
     "/agents/input-credit/purchases": "/agents/input-credit",
     "/agents/input-credit/risk": "/agents/input-credit",
+    # Setup was folded into the tab it configures: the only thing on it that
+    # this agent needed was the GSP connection, and that belongs beside the
+    # flow it enables rather than one tab away from it.
+    "/agents/input-credit/setup": "/agents/input-credit/with-api",
     "/settlements": "/agents/settlement",
     "/settlements/{run_id}": "/agents/settlement/run/{run_id}",
     "/ask": "/agents/settlement/ask",

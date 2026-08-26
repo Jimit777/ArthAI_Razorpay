@@ -1602,7 +1602,7 @@ def _trust_tone(score: int) -> str:
 
 
 def _run_risk(key: str, business_id: str, data: bytes, filename: str,
-              use_agent: bool) -> None:
+              use_agent: bool, simulated: bool = False) -> None:
     from merchant.purchase_import import parse
     from merchant.risk_pipeline import NO_HISTORY, history_service_for
     from merchant.risk_pipeline import run as run_pipeline
@@ -1633,7 +1633,8 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
         # half a table from real filings and half from personas, with nothing
         # saying which, is worse than either alone.
         with ledger(business_id) as led:
-            history = history_service_for(led, business_id)
+            history = history_service_for(led, business_id,
+                                          simulated=simulated)
         if history is None:
             # Live data with nothing to score against. Refusing is the answer;
             # simulating would put invented filing records against real
@@ -1650,52 +1651,56 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
                               "phase": f"{type(exc).__name__}: {exc}"}
 
 
-def _risk_mode(led, business_id: str) -> tuple[str, dict, dict]:
+# --- the three tabs -------------------------------------------------------
+#
+# One question decides which tab a merchant is on: where does supplier filing
+# history come from? Nothing downstream differs. The register is parsed the
+# same way, the history lands in the same FilingHistory contract, the same
+# arithmetic scores it, the same agent explains it, and the same dashboard
+# renders it. The tabs exist because that choice is real and a merchant has to
+# make it; everything after it is deliberately identical.
+
+TAB_DEMO = "demo"
+TAB_WITHOUT_API = "without-api"
+TAB_WITH_API = "with-api"
+
+
+def _tab_state(led, business_id: str) -> dict:
+    """What each of the three screens needs to render itself."""
+    from merchant.sources import Sources
+    from merchant.vault import Vault
+
+    return {
+        "api": Sources(led.conn).filing_api_config(business_id),
+        "history": led.filing_history_summary(),
+        "vault_ready": Vault.from_env() is not None,
+    }
+
+
+def _risk_screen(tab: str, state: dict) -> str:
+    """The upload screen for a tab. One place, so the three cannot drift."""
+    if tab == TAB_WITHOUT_API:
+        return views.risk_without_api_screen(state["history"])
+    if tab == TAB_WITH_API:
+        return views.risk_with_api_screen(state["api"], state["vault_ready"])
+    return views.risk_demo_screen()
+
+
+def _risk_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
     """
-    Which of the three screens this business gets, and what each needs.
+    All three tabs render through here.
 
-    The mode is decided by what the business is CONNECTED to, not by what
-    happens to be uploaded. A merchant on the simulator is in demo mode whether
-    or not a file was once dropped on the old screen, and a merchant on live
-    data does not get a demo button. Anything else and the page would change
-    shape under them for reasons they cannot see.
+    Deliberately one function rather than three routes with their own bodies.
+    The results half - the dashboard, the drawers, the documents - must be
+    byte-identical whichever tab produced the run, and the surest way to
+    guarantee that is for there to be exactly one piece of code that renders
+    it.
     """
-    from merchant.sources import SourceKind, Sources
-
-    sources = Sources(led.conn)
-    kind = sources.kind(business_id)
-    api_config = sources.filing_api_config(business_id)
-    summary = led.filing_history_summary()
-
-    # No source chosen yet is treated as the simulator: it is what a new
-    # business is actually running on, and offering the demo is a better first
-    # screen than an upload box for data the platform cannot yet do anything
-    # with.
-    if kind is None or kind == SourceKind.SIMULATOR:
-        return views.MODE_DEMO, api_config or {}, summary
-    if api_config and api_config.get("key_available"):
-        return views.MODE_LIVE_API, api_config, summary
-    return views.MODE_LIVE_MANUAL, api_config or {}, summary
-
-
-def _risk_screen(mode: str, api_config: dict, summary: dict) -> str:
-    """The upload screen for a mode. One place, so the states cannot drift."""
-    if mode == views.MODE_DEMO:
-        return views.risk_demo_screen()
-    if mode == views.MODE_LIVE_API:
-        return views.risk_live_api_screen(api_config.get("message", ""))
-    return views.risk_live_manual_screen(summary)
-
-
-@app.get("/agents/input-credit", response_class=HTMLResponse)
-def supplier_risk_page(ws: Workspace = Depends(required_workspace),
-                       key: str = "", error: str = "", ok: str = ""):
+    slug = "" if tab == TAB_DEMO else tab
     with ledger(ws.business_id) as led:
         shell = _shell_for(led, ws)
-        head = _workspace_head(led, ws, "gst_itc", "")
-        mode, api_config, summary = _risk_mode(led, ws.business_id)
-
-    screen = _risk_screen(mode, api_config, summary)
+        head = _workspace_head(led, ws, "gst_itc", slug)
+        screen = _risk_screen(tab, _tab_state(led, ws.business_id))
 
     with _risk_lock:
         state = dict(RISK_RUNS.get(key) or {}) if key else {}
@@ -1713,14 +1718,30 @@ def supplier_risk_page(ws: Workspace = Depends(required_workspace),
                   f'{views.esc(state.get("phase", "It failed."))}</span></div>')
 
     payload = state.get("payload")
-    if not payload:
-        return HTMLResponse(views.page(
-            "Supplier risk", head + banner + screen, "agent:gst_itc",
-            **shell))
+    body = (_risk_results(payload, key) if payload else screen)
+    return HTMLResponse(views.page("Supplier risk", head + banner + body,
+                                   "agent:gst_itc", **shell))
 
-    return HTMLResponse(views.page(
-        "Supplier risk", head + banner + _risk_results(payload, key),
-        "agent:gst_itc", **shell))
+
+@app.get("/agents/input-credit", response_class=HTMLResponse)
+def supplier_risk_page(ws: Workspace = Depends(required_workspace),
+                       key: str = "", error: str = "", ok: str = ""):
+    """Tab 1. Generated register, generated history, one button."""
+    return _risk_page(ws, TAB_DEMO, key, error, ok)
+
+
+@app.get("/agents/input-credit/without-api", response_class=HTMLResponse)
+def supplier_risk_without_api(ws: Workspace = Depends(required_workspace),
+                              key: str = "", error: str = "", ok: str = ""):
+    """Tab 2. Register plus the GSTR-2B files a merchant downloads themselves."""
+    return _risk_page(ws, TAB_WITHOUT_API, key, error, ok)
+
+
+@app.get("/agents/input-credit/with-api", response_class=HTMLResponse)
+def supplier_risk_with_api(ws: Workspace = Depends(required_workspace),
+                           key: str = "", error: str = "", ok: str = ""):
+    """Tab 3. Register only; history fetched per supplier over a GSP."""
+    return _risk_page(ws, TAB_WITH_API, key, error, ok)
 
 
 def _risk_running(state: dict, head: str, shell: dict) -> str:
@@ -2344,7 +2365,7 @@ async def run_demo_analysis(request: Request,
     threading.Thread(
         target=_run_risk,
         args=(key, ws.business_id, SAMPLE_REGISTER.encode(),
-              "demo-register.csv", form.get("use_agent") == "yes"),
+              "demo-register.csv", form.get("use_agent") == "yes", True),
         daemon=True).start()
     return RedirectResponse(f"/agents/input-credit?key={key}",
                             status_code=303)
@@ -2354,53 +2375,139 @@ async def run_demo_analysis(request: Request,
 async def upload_filing_history(request: Request,
                                 ws: Workspace = Depends(required_workspace)):
     """
-    Mode B: take a filing-history file and make it this business's source.
+    Tab 2, step 1: take supplier history in whichever form a merchant has it.
 
-    Stored rather than held for one run. A merchant who went to the trouble of
-    assembling three years of filing dates should not be asked for them again
-    on the next page load, and the source badge has to be able to say what is
-    live before any analysis has been started.
+    Two shapes arrive at this one route, because a merchant should not have to
+    know which of two boxes their file belongs in:
+
+        GSTR-2B JSON   what almost everybody will actually upload. Any
+                       registered business can download their own, month by
+                       month, with no GSP. Read as filing history by
+                       gstr2b_history, which is careful about the difference
+                       between what those files prove and what they do not.
+
+        history CSV    a filing register someone assembled, with explicit
+                       GSTR-1 and GSTR-3B dates. Rarer, and strictly better
+                       evidence when it exists, because it can see payment.
+
+    Both land in the same FilingHistory contract and are stored the same way.
     """
     from urllib.parse import quote
 
-    from merchant.purchase_import import parse_filing_history
-
     form = await request.form()
-    upload = form.get("history")
-    if upload is None or not getattr(upload, "filename", ""):
+    uploads = [u for u in form.getlist("history")
+               if getattr(u, "filename", "")]
+    if not uploads:
         return RedirectResponse(
-            "/agents/input-credit?error=" + quote("Choose a file first."),
+            "/agents/input-credit/without-api?error="
+            + quote("Choose at least one file first."), status_code=303)
+
+    files = []
+    for upload in uploads:
+        data = await upload.read()
+        if len(data) > 8 * 1024 * 1024:
+            return RedirectResponse(
+                "/agents/input-credit/without-api?error="
+                + quote(f"{upload.filename} is over 8 MB."), status_code=303)
+        files.append((data, upload.filename))
+
+    jsons = [f for f in files if f[1].lower().endswith(".json")]
+    others = [f for f in files if not f[1].lower().endswith(".json")]
+
+    if jsons and others:
+        return RedirectResponse(
+            "/agents/input-credit/without-api?error="
+            + quote("Upload GSTR-2B JSON files, or one history CSV - not "
+                    "both at once. They are two different ways of saying the "
+                    "same thing and mixing them would leave it unclear which "
+                    "one a figure came from."), status_code=303)
+
+    if jsons:
+        imported, message = _history_from_gstr2b(jsons)
+    else:
+        imported, message = _history_from_csv(others[0])
+
+    if imported is None:
+        return RedirectResponse(
+            "/agents/input-credit/without-api?error=" + quote(message),
             status_code=303)
-
-    data = await upload.read()
-    if len(data) > 8 * 1024 * 1024:
-        return RedirectResponse(
-            "/agents/input-credit?error="
-            + quote("That file is over 8 MB."), status_code=303)
-
-    imported = parse_filing_history(data, upload.filename)
-    if not imported.ok:
-        why = (f"Missing columns: {', '.join(imported.missing_columns)}."
-               if imported.missing_columns else
-               "No supplier rows could be read - check the GSTIN and period "
-               "columns.")
-        return RedirectResponse(
-            "/agents/input-credit?error=" + quote(why), status_code=303)
 
     with ledger(ws.business_id) as led:
         stored = led.replace_filing_history(imported)
         AccessLog(led.conn).record(
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
-            target=upload.filename,
+            target=files[0][1],
             detail=f"uploaded filing history for {stored['suppliers']} suppliers")
 
-    message = (f"Filing history for {stored['suppliers']} suppliers over "
-               f"{stored['periods']} periods. Analyses now use this instead of "
-               f"simulated records.")
+    return RedirectResponse(
+        "/agents/input-credit/without-api?ok=" + quote(message),
+        status_code=303)
+
+
+class _Imported:
+    """The shape Ledger.replace_filing_history wants, from either reader."""
+
+    def __init__(self, histories: dict, filename: str):
+        self.histories = histories
+        self.filename = filename
+
+
+def _history_from_gstr2b(files):
+    """
+    A stack of GSTR-2B files as filing history.
+
+    The honesty of this path is in gstr2b_history: these files prove what
+    suppliers REPORTED and prove payment only where the portal flagged a Rule
+    37A reversal, so most periods come back with payment marked unknown rather
+    than assumed either way. The message says so, because a merchant who reads
+    "payment not visible" as a defect will go looking for a bug that is not
+    there.
+    """
+    from merchant.gstr2b_history import parse_files
+
+    result = parse_files(files)
+    if not result.ok:
+        why = "; ".join(result.skipped[:2]) if result.skipped else (
+            "no supplier invoices could be read - check these are GSTR-2B "
+            "JSON files from the portal, not the Excel version")
+        return None, f"Nothing could be read. {why}"
+
+    periods = len(result.periods)
+    message = (f"Read {periods} period{'' if periods == 1 else 's'} of GSTR-2B "
+               f"covering {result.suppliers} suppliers. ")
+    if result.defaults_found:
+        message += (f"The portal flagged {result.defaults_found} period"
+                    f"{'' if result.defaults_found == 1 else 's'} where a "
+                    f"supplier did not pay. ")
+    message += ("For the rest, these files show what suppliers reported but "
+                "not whether they paid, so payment is scored as not visible "
+                "rather than guessed at.")
+    if periods < 12:
+        message += (f" {12 - periods} more month"
+                    f"{'' if 12 - periods == 1 else 's'} would make the "
+                    f"pattern worth reading.")
+    return _Imported(result.histories, files[0][1]), message
+
+
+def _history_from_csv(file):
+    """A filing register with explicit GSTR-1 and GSTR-3B dates."""
+    from merchant.purchase_import import parse_filing_history
+
+    data, filename = file
+    imported = parse_filing_history(data, filename)
+    if not imported.ok:
+        why = (f"Missing columns: {', '.join(imported.missing_columns)}."
+               if imported.missing_columns else
+               "No supplier rows could be read - check the GSTIN and period "
+               "columns.")
+        return None, why
+
+    message = (f"Filing history for {imported.suppliers} suppliers over "
+               f"{imported.periods} periods, with payment dates - so payment "
+               f"is fully visible on these.")
     if imported.rows_skipped:
         message += f" {len(imported.rows_skipped)} rows were skipped."
-    return RedirectResponse(
-        "/agents/input-credit?ok=" + quote(message), status_code=303)
+    return imported, message
 
 
 @app.post("/agents/input-credit/history/forget")
@@ -2411,9 +2518,8 @@ def forget_filing_history(ws: Workspace = Depends(required_workspace)):
     with ledger(ws.business_id) as led:
         led.forget_filing_history()
     return RedirectResponse(
-        "/agents/input-credit?ok="
-        + quote("Filing history removed. Analyses fall back to simulated "
-                "records until you upload again."), status_code=303)
+        "/agents/input-credit/without-api?ok="
+        + quote("Supplier history removed."), status_code=303)
 
 
 @app.get("/agents/input-credit/sample-history")
@@ -3245,18 +3351,22 @@ def _agent_state(led, ws, spec, source_kind) -> str:
         return (ui.STATE_DEMO if source_kind == SourceKind.SIMULATOR
                 else ui.STATE_ACTIVE)
     if spec.id == "gst_itc":
-        # The DATA SOURCE decides first, exactly as it does for the risk
-        # screen's three modes. It used to be decided by whether any purchase
-        # row was marked "imported", which was true while the only way to get
-        # one was a merchant uploading a file - and stopped being true the
-        # moment the demo button started generating a register and storing it
-        # the same way. A business on the simulator was then badged "Live
-        # data" on the strength of data the platform had invented.
-        if source_kind is None or source_kind == SourceKind.SIMULATOR:
-            return ui.STATE_DEMO
-        if not led.purchases(1):
-            return ui.STATE_SETUP
-        return ui.STATE_ACTIVE
+        # Whether this agent has REAL data, decided by the same evidence the
+        # pipeline uses: a configured GSP, or supplier history somebody
+        # uploaded. Not the Razorpay connector - which settlement source a
+        # business uses says nothing about how it gets GST filing history, and
+        # keying one off the other was a coupling nobody could predict from
+        # the screen. Not "is any purchase row marked imported" either: the
+        # demo button generates a register and stores it exactly that way, so
+        # that test badged invented data as live.
+        from merchant.sources import Sources
+
+        config = Sources(led.conn).filing_api_config(ws.business_id)
+        if config and config.get("key_available"):
+            return ui.STATE_ACTIVE
+        if led.filing_history_summary():
+            return ui.STATE_ACTIVE if led.purchases(1) else ui.STATE_SETUP
+        return ui.STATE_DEMO
     return ui.STATE_SETUP
 
 
@@ -3438,90 +3548,7 @@ def settlement_setup(ws: Workspace = Depends(required_workspace)):
     return _setup_page(ws, "settlement_audit")
 
 
-@app.get("/agents/input-credit/setup", response_class=HTMLResponse)
-def itc_setup(ws: Workspace = Depends(required_workspace), error: str = "",
-              ok: str = ""):
-    return _setup_page(ws, "gst_itc", error=error, ok=ok,
-                       extra=_filing_api_card(ws))
-
-
-def _filing_api_card(ws: Workspace) -> str:
-    """
-    Mode A configuration: a GSP or verification API the merchant has a key for.
-
-    Generic on purpose, exactly like the registration-lookup provider. Half a
-    dozen vendors sell this and they differ only in the URL, where the key
-    goes, and how deeply they nested the government's own field names, so
-    hard-coding one would be picking a favourite on a merchant's behalf and
-    stranding anyone who already pays somebody else.
-    """
-    from merchant.sources import Sources
-    from merchant.vault import Vault
-
-    with ledger(ws.business_id) as led:
-        config = Sources(led.conn).filing_api_config(ws.business_id)
-
-    if config:
-        warn = ""
-        if not config["key_available"]:
-            warn = ('<p class="sub" style="margin:9px 0 0;color:var(--warn)">'
-                    'The stored key cannot be decrypted, so runs fall back to '
-                    'whatever else is available rather than calling the API '
-                    'without one. Re-enter it below.</p>')
-        return f"""
-<div class="card">
-  <div class="card-head"><h2>GST filing-status API</h2>
-    {ui.badge("connected", ui.TONE_GOOD)}</div>
-  <p class="sub" style="margin:4px 0 0">
-    <span class="mono">{views.esc(config["url_template"])}</span></p>
-  <p class="sub" style="margin:7px 0 0">{views.esc(config["message"])}</p>
-  {warn}
-  <form method="post" action="/agents/input-credit/setup/filing-api/forget"
-        style="margin-top:13px">
-    <button class="ghost small">Disconnect</button>
-  </form>
-</div>"""
-
-    vault_note = (
-        "" if Vault.from_env() is not None else
-        '<p class="sub" style="margin:9px 0 0;font-size:11.5px;'
-        'color:var(--warn)">No encryption key is configured, so the API key '
-        'will not be stored. Set <span class="mono">LEDGERLINE_SECRET_KEY'
-        '</span> to keep it between runs.</p>')
-
-    return f"""
-<div class="card">
-  <h2>GST filing-status API</h2>
-  <p class="sub" style="margin:3px 0 12px;max-width:70ch">Optional. With a GSP
-     or verification API key, each supplier&rsquo;s GSTR-1 and GSTR-3B filing
-     dates are read live instead of being uploaded or simulated. Nothing else
-     changes &mdash; the same arithmetic runs over the same contract.</p>
-  <form method="post" action="/agents/input-credit/setup/filing-api">
-    <div><label>Endpoint URL</label>
-      <input name="url_template" required
-        placeholder="https://your-provider.example/returns/{{gstin}}"></div>
-    <p class="sub" style="margin:5px 0 11px;font-size:11.4px">Must be https and
-      must contain <span class="mono">{{gstin}}</span> &mdash; that is where
-      each supplier&rsquo;s number is substituted in.</p>
-    <div class="row">
-      <div><label>API key</label>
-        <input name="api_key" type="password" autocomplete="off"></div>
-      <div><label>Header name</label>
-        <input name="key_header" placeholder="x-api-key"></div>
-      <div><label>or query parameter</label>
-        <input name="key_param" placeholder="api_key"></div>
-    </div>
-    <div class="row" style="margin-top:11px">
-      <div><label>Test with a GSTIN (optional)</label>
-        <input name="probe_gstin" placeholder="27AAAAA0000A1Z5"></div>
-      <div style="flex:0;align-self:flex-end"><button>Save</button></div>
-    </div>
-  </form>
-  {vault_note}
-</div>"""
-
-
-@app.post("/agents/input-credit/setup/filing-api")
+@app.post("/agents/input-credit/filing-api")
 async def connect_filing_api(request: Request,
                              ws: Workspace = Depends(required_workspace)):
     """
@@ -3553,11 +3580,11 @@ async def connect_filing_api(request: Request,
 
     field = "ok" if result.ok else "error"
     return RedirectResponse(
-        f"/agents/input-credit/setup?{field}=" + quote(result.message),
+        f"/agents/input-credit/with-api?{field}=" + quote(result.message),
         status_code=303)
 
 
-@app.post("/agents/input-credit/setup/filing-api/forget")
+@app.post("/agents/input-credit/filing-api/forget")
 def forget_filing_api(ws: Workspace = Depends(required_workspace)):
     from urllib.parse import quote
 
@@ -3568,9 +3595,9 @@ def forget_filing_api(ws: Workspace = Depends(required_workspace)):
     with ledger(ws.business_id) as led:
         Sources(led.conn).disconnect_filing_api(ws.business_id)
     return RedirectResponse(
-        "/agents/input-credit/setup?ok="
-        + quote("Disconnected. Analyses fall back to an uploaded history, or "
-                "to simulated records if there is none."), status_code=303)
+        "/agents/input-credit/with-api?ok="
+        + quote("Disconnected. Runs fall back to whatever history you have "
+                "uploaded."), status_code=303)
 
 
 def _setup_page(ws: Workspace, agent_id: str, *, error: str = "",

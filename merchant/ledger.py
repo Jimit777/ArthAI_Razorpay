@@ -147,6 +147,14 @@ CREATE TABLE IF NOT EXISTS supplier_filing_history (
   period          TEXT NOT NULL,     -- 'YYYY-MM'
   gstr1_filed     TEXT,              -- ISO date, or NULL for 'did not file'
   gstr3b_filed    TEXT,
+  -- Whether anybody KNOWS what happened to the GSTR-3B, as against it being
+  -- known not to have been filed. Without this column the round trip through
+  -- storage collapsed the two: a GSTR-2B history, which can rarely see
+  -- payment, came back out of the database with every period reading "did not
+  -- pay" - and every supplier in a merchant's book was branded a defaulter.
+  -- Defaults to 1 so rows written before this column existed, which came from
+  -- CSVs that DO carry payment dates, keep their meaning.
+  gstr3b_known    INTEGER DEFAULT 1,
   registration_status TEXT DEFAULT 'active',
   source_file     TEXT,
   uploaded_at     INTEGER,
@@ -284,6 +292,10 @@ class Ledger:
     def __init__(self, path, business_id: Optional[str] = None):
         self.store = Store(path)
         self.store.conn.executescript(LIVE_SCHEMA)
+        from merchant.businesses import _add_column
+
+        _add_column(self.store.conn, "supplier_filing_history",
+                    "gstr3b_known", "INTEGER DEFAULT 1")
         self.store.conn.commit()
         from merchant.businesses import Businesses
 
@@ -678,12 +690,14 @@ class Ledger:
                     business_id, gstin, month.period,
                     month.gstr1_filed.isoformat() if month.gstr1_filed else None,
                     month.gstr3b_filed.isoformat() if month.gstr3b_filed else None,
+                    int(month.gstr3b_known),
                     history.registration_status, imported.filename, now))
 
         self.conn.executemany(
             "INSERT INTO supplier_filing_history (business_id, supplier_gstin,"
-            " period, gstr1_filed, gstr3b_filed, registration_status,"
-            " source_file, uploaded_at) VALUES (?,?,?,?,?,?,?,?)", rows)
+            " period, gstr1_filed, gstr3b_filed, gstr3b_known,"
+            " registration_status, source_file, uploaded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)", rows)
         self.conn.commit()
         return {"suppliers": len(imported.histories), "periods": len(rows)}
 
@@ -705,7 +719,8 @@ class Ledger:
             grouped.setdefault(row["supplier_gstin"], []).append({
                 "period": row["period"],
                 "gstr1_filed": row["gstr1_filed"],
-                "gstr3b_filed": row["gstr3b_filed"]})
+                "gstr3b_filed": row["gstr3b_filed"],
+                "gstr3b_known": bool(row["gstr3b_known"])})
             statuses[row["supplier_gstin"]] = (
                 row["registration_status"] or "active")
 

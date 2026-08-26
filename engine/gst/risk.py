@@ -85,11 +85,19 @@ DELAY_FLOOR_DAYS = 180
 # back with interest.
 DEAD_REGISTRATION_CAP = 15
 
+# Where "we do not know" sits. Deliberately mid-scale: it must sort away from
+# both the trusted and the dangerous, because it is neither.
+UNKNOWN_SCORE = 50
+
 PATTERN_CLEAN = "CLEAN_HISTORY"
 PATTERN_LATE = "HABITUAL_LATE_FILER"
 PATTERN_DEFAULTER = "GSTR3B_DEFAULTER"
 PATTERN_ERRATIC = "ERRATIC"
 PATTERN_THIN = "TOO_LITTLE_HISTORY"
+# Reporting is visible and payment is not. What a history built from GSTR-2B
+# alone produces, and a genuinely different thing from any of the above: it
+# describes the limits of the EVIDENCE rather than the supplier's behaviour.
+PATTERN_PAYMENT_UNKNOWN = "PAYMENT_HISTORY_UNKNOWN"
 
 PATTERN_LABEL = {
     PATTERN_CLEAN: "Clean history",
@@ -97,6 +105,7 @@ PATTERN_LABEL = {
     PATTERN_DEFAULTER: "Does not pay the tax",
     PATTERN_ERRATIC: "Erratic",
     PATTERN_THIN: "Too little history",
+    PATTERN_PAYMENT_UNKNOWN: "Files on time; payment not visible",
 }
 
 # Below this many periods, a rate is a couple of data points wearing a
@@ -111,6 +120,12 @@ class RiskProfile:
     periods: int = 0
     gstr1_filed: int = 0
     gstr3b_filed: int = 0
+    # Periods where somebody actually knows what happened to the GSTR-3B.
+    # A GSP feed knows every period; GSTR-2B knows only the ones the portal
+    # flagged under Rule 37A. Every payment ratio below divides by THIS, not
+    # by the number of periods, so a source that cannot see payment produces
+    # "unknown" rather than a confident accusation.
+    gstr3b_known_periods: int = 0
     sold_but_did_not_pay: int = 0
     recent_sold_but_did_not_pay: int = 0
     recent_periods: int = 0
@@ -124,17 +139,31 @@ class RiskProfile:
         return self.gstr1_filed >= MIN_PERIODS
 
     @property
+    def payment_history_known(self) -> bool:
+        """
+        Whether the source can see payment at all.
+
+        False for a history built from GSTR-2B alone, which states what
+        suppliers REPORTED and is silent about what they PAID except where the
+        portal flags a Rule 37A reversal. Everything that divides by payment
+        checks this first.
+        """
+        return self.gstr3b_known_periods >= MIN_PERIODS
+
+    @property
     def compliance_bps(self) -> int:
         """
-        Of the months they reported sales, how many did they pay the tax for.
+        Of the months we can see, how many did they pay the tax for.
 
-        Denominator is GSTR-1 filings, not all periods: a month with no sales
-        has no tax to pay, and counting it as a default would punish a supplier
-        for being quiet.
+        Denominator is periods where the payment status is KNOWN - not all
+        periods, and not all GSTR-1 filings. A month with no sales has no tax
+        to pay and must not count as a default; a month nobody can see the
+        payment for must not count as one either, and that second case is what
+        GSTR-2B produces for almost every row.
         """
-        if not self.gstr1_filed:
+        if not self.gstr3b_known_periods:
             return 0
-        return (self.gstr3b_filed * 10_000) // self.gstr1_filed
+        return (self.gstr3b_filed * 10_000) // self.gstr3b_known_periods
 
     @property
     def coverage_bps(self) -> int:
@@ -149,16 +178,27 @@ class RiskProfile:
 
     @property
     def default_rate_bps(self) -> int:
-        """Observed frequency of reporting a sale and not paying the tax."""
-        if not self.gstr1_filed:
+        """
+        Observed frequency of reporting a sale and not paying the tax.
+
+        Over the periods where payment is visible. Zero when nothing is
+        visible - which is "no evidence of default", not "no defaults", and
+        the pattern and the recommendation both read
+        `payment_history_known` rather than treating this zero as good news.
+        """
+        if not self.gstr3b_known_periods:
             return 0
-        return (self.sold_but_did_not_pay * 10_000) // self.gstr1_filed
+        return (self.sold_but_did_not_pay * 10_000) // self.gstr3b_known_periods
 
     @property
     def recent_default_rate_bps(self) -> int:
         if not self.recent_periods:
             return self.default_rate_bps
         return (self.recent_sold_but_did_not_pay * 10_000) // self.recent_periods
+
+    @property
+    def unknown_payment_periods(self) -> int:
+        return max(0, self.gstr1_filed - self.gstr3b_known_periods)
 
     @property
     def registration_alive(self) -> bool:
@@ -176,10 +216,28 @@ class RiskProfile:
         if not self.enough_history:
             # Not "risky" - unknown. Parked mid-scale so it sorts away from
             # both the trusted and the dangerous, and the UI says why.
-            return 50
+            return UNKNOWN_SCORE
+
+        coverage = (self.coverage_bps * W_COVERAGE) // 10_000
+
+        if not self.payment_history_known:
+            # Payment is the majority of this score and nobody can see it. The
+            # honest answer is not a high score with a caveat underneath - it
+            # is the same mid-scale "unknown" a supplier with no history gets,
+            # nudged by the half of the picture that IS visible. Awarding the
+            # payment marks by default would rate a supplier nobody has
+            # checked above one who has been checked and was fine.
+            visible = W_COVERAGE + W_PUNCTUALITY
+            delay = min(self.avg_gstr3b_delay_days, DELAY_FLOOR_DAYS)
+            punctual = (W_PUNCTUALITY * (DELAY_FLOOR_DAYS - delay)) // DELAY_FLOOR_DAYS
+            earned = coverage + punctual
+            score = UNKNOWN_SCORE + (earned - visible // 2) // 2
+            score = max(1, min(UNKNOWN_SCORE + 15, score))
+            if not self.registration_alive:
+                score = min(score, DEAD_REGISTRATION_CAP)
+            return score
 
         compliance = (self.compliance_bps * W_COMPLIANCE) // 10_000
-        coverage = (self.coverage_bps * W_COVERAGE) // 10_000
         recent = ((10_000 - self.recent_default_rate_bps) * W_RECENT) // 10_000
 
         delay = min(self.avg_gstr3b_delay_days, DELAY_FLOOR_DAYS)
@@ -202,8 +260,16 @@ class RiskProfile:
         """
         if not self.enough_history:
             return PATTERN_THIN
+        # A known default outranks everything, including invisibility: one
+        # Rule 37A flag in a GSTR-2B history is the government stating that
+        # this supplier did not pay, and that is not "unknown".
         if self.default_rate_bps >= 2_500:
             return PATTERN_DEFAULTER
+        # Reporting visible, payment not. Said plainly rather than rounded to
+        # "clean", which is what a zero default rate over zero visible periods
+        # would otherwise look like.
+        if not self.payment_history_known:
+            return PATTERN_PAYMENT_UNKNOWN
         # Silence is its own pattern, and it has to be checked before the
         # clean case - a supplier who files perfectly in the months they file
         # at all still leaves gaps a merchant has to know about.
@@ -222,6 +288,9 @@ class RiskProfile:
             "gstr1_filed": self.gstr1_filed,
             "gstr3b_filed": self.gstr3b_filed,
             "sold_but_did_not_pay": self.sold_but_did_not_pay,
+            "gstr3b_known_periods": self.gstr3b_known_periods,
+            "unknown_payment_periods": self.unknown_payment_periods,
+            "payment_history_known": self.payment_history_known,
             "compliance_pct": round(self.compliance_bps / 100, 1),
             "coverage_pct": round(self.coverage_bps / 100, 1),
             "silent_periods": self.silent_periods,
@@ -249,6 +318,11 @@ def profile(history: FilingHistory) -> RiskProfile:
     for month in history.months:
         if month.gstr1_filed is not None:
             out.gstr1_filed += 1
+        # Counted only where the source can actually see payment. Everything
+        # downstream divides by this, so a GSTR-2B history reports "unknown"
+        # instead of a confident zero.
+        if month.gstr3b_known:
+            out.gstr3b_known_periods += 1
         if month.gstr3b_filed is not None:
             out.gstr3b_filed += 1
             delays.append(month.gstr3b_late_days)
@@ -256,7 +330,7 @@ def profile(history: FilingHistory) -> RiskProfile:
             out.sold_but_did_not_pay += 1
 
     for month in recent:
-        if month.gstr1_filed is not None:
+        if month.gstr1_filed is not None and month.gstr3b_known:
             out.recent_periods += 1
             if month.sold_but_did_not_pay:
                 out.recent_sold_but_did_not_pay += 1
@@ -475,6 +549,12 @@ def recommended_action(profile: "RiskProfile") -> str:
     if not profile.registration_alive:
         return ACT_HOLD
     if not profile.enough_history:
+        return ACT_WATCH
+    # Reporting visible, payment invisible. Never safe_to_pay: "no evidence
+    # they defaulted" is not "evidence they did not", and the whole reason
+    # s.16(2)(c) is dangerous is that a supplier can look perfect in every
+    # document a buyer holds while the tax was never paid.
+    if not profile.payment_history_known:
         return ACT_WATCH
     if profile.recent_default_rate_bps >= HOLD_DEFAULT_BPS:
         return ACT_HOLD

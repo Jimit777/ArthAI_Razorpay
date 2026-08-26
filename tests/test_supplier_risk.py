@@ -129,6 +129,7 @@ def test_a_dead_registration_caps_the_score_whatever_the_history():
     from engine.gst.risk import DEAD_REGISTRATION_CAP, RiskProfile
 
     prof = RiskProfile(gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=36,
+                       gstr3b_known_periods=36,
                        registration_status="cancelled")
     assert prof.trust_score <= DEAD_REGISTRATION_CAP
 
@@ -136,7 +137,8 @@ def test_a_dead_registration_caps_the_score_whatever_the_history():
 def test_thin_history_is_not_scored_as_risk():
     from engine.gst.risk import RiskProfile
 
-    prof = RiskProfile(gstin="X", periods=2, gstr1_filed=2, gstr3b_filed=0)
+    prof = RiskProfile(gstin="X", periods=2, gstr1_filed=2, gstr3b_filed=0,
+                       gstr3b_known_periods=2)
     assert not prof.enough_history
     assert prof.pattern == PATTERN_THIN
     assert prof.trust_score == 50, "unknown must not read as dangerous"
@@ -259,6 +261,7 @@ def test_a_dead_registration_can_never_be_called_safe_to_pay():
     from engine.gst.risk import RiskProfile
 
     prof = RiskProfile(gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=36,
+                       gstr3b_known_periods=36,
                        registration_status="suspended")
     judged = RiskJudgment(pattern=PATTERN_CLEAN, action="safe_to_pay",
                           headline="fine", reasoning="fine")
@@ -350,8 +353,19 @@ def shop(tmp_path, monkeypatch):
 
 
 def _analyse(client, data=None, use_agent="no", timeout=30):
+    """
+    Upload a register and wait for the run.
+
+    Ensures supplier history exists first, because a register with nothing to
+    be scored against is now refused rather than quietly scored off generated
+    records. That refusal is the point of the three-tab split, so the helper
+    goes through the real Without API flow instead of around it.
+    """
     import merchant.app as appmod
 
+    client.post("/agents/input-credit/history",
+                files={"history": ("h.csv", sample_filing_history().encode(),
+                                   "text/csv")})
     r = client.post(
         "/agents/input-credit",
         files={"register": ("r.csv", data or SAMPLE_REGISTER.encode(),
@@ -375,6 +389,9 @@ def test_the_tab_exists_inside_the_input_credit_workspace(shop):
 
 
 def test_uploading_a_register_produces_a_portfolio(shop):
+    shop.post("/agents/input-credit/history",
+              files={"history": ("h.csv", sample_filing_history().encode(),
+                                 "text/csv")})
     key, state = _analyse(shop)
     assert state["state"] == "done"
     page = shop.get(f"/agents/input-credit?key={key}").text
@@ -418,7 +435,10 @@ def test_the_page_says_the_history_is_simulated(shop):
 
 def test_the_demo_warning_survives_onto_the_results(shop):
     """A warning only on the upload screen is a warning nobody reads."""
-    key, _state = _analyse(shop)
+    key = shop.post("/agents/input-credit/demo", data={"use_agent": "no"},
+                    follow_redirects=False
+                    ).headers["location"].split("key=")[-1]
+    _finish(shop, key)
     page = shop.get(f"/agents/input-credit?key={key}").text
     assert "simulated filing history" in page
     assert "Do not act on these against a real supplier" in page
@@ -534,14 +554,15 @@ def test_a_dead_registration_outranks_everything_in_the_ladder():
     for status in ("cancelled", "suspended"):
         spotless_but_dead = RiskProfile(
             gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=36,
-            registration_status=status)
+            gstr3b_known_periods=36, registration_status=status)
         assert recommended_action(spotless_but_dead) != ACT_SAFE, status
 
 
 def test_thin_history_recommends_caution_not_confidence():
     from engine.gst.risk import ACT_WATCH, RiskProfile, recommended_action
 
-    thin = RiskProfile(gstin="X", periods=2, gstr1_filed=2, gstr3b_filed=2)
+    thin = RiskProfile(gstin="X", periods=2, gstr1_filed=2, gstr3b_filed=2,
+                       gstr3b_known_periods=2)
     assert recommended_action(thin) == ACT_WATCH
 
 
@@ -549,7 +570,8 @@ def test_one_missed_payment_is_enough_to_stop_saying_safe():
     from engine.gst.risk import ACT_SAFE, RiskProfile, recommended_action
 
     almost = RiskProfile(gstin="X", periods=36, gstr1_filed=36,
-                         gstr3b_filed=35, sold_but_did_not_pay=1)
+                         gstr3b_filed=35, gstr3b_known_periods=36,
+                         sold_but_did_not_pay=1)
     assert recommended_action(almost) != ACT_SAFE
 
 
@@ -584,7 +606,7 @@ def test_the_agent_wanting_to_go_further_is_recorded_not_discarded():
     from engine.gst.risk import (ACT_SAFE, PATTERN_CLEAN, RiskProfile)
 
     spotless = RiskProfile(gstin="X", periods=36, gstr1_filed=36,
-                           gstr3b_filed=36)
+                           gstr3b_filed=36, gstr3b_known_periods=36)
     stricter = RiskJudgment(pattern=PATTERN_CLEAN, action="hold_payment",
                             headline="something is off",
                             reasoning="the last three months look wrong")
@@ -618,7 +640,8 @@ def test_a_cancelled_registration_means_stop_not_hold():
     from engine.gst.risk import (ACT_HOLD, ACT_STOP, RiskProfile,
                                  recommended_action)
 
-    spotless = dict(gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=36)
+    spotless = dict(gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=36,
+                    gstr3b_known_periods=36)
     assert recommended_action(
         RiskProfile(**spotless, registration_status="cancelled")) == ACT_STOP
     assert recommended_action(
@@ -630,6 +653,7 @@ def test_a_settled_pattern_of_default_means_stop():
 
     terminal = RiskProfile(
         gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=8,
+        gstr3b_known_periods=36,
         sold_but_did_not_pay=28, recent_periods=12,
         recent_sold_but_did_not_pay=10)
     assert recommended_action(terminal) == ACT_STOP
@@ -657,6 +681,7 @@ def test_bad_but_not_terminal_still_means_hold():
     from engine.gst.risk import ACT_HOLD, RiskProfile, recommended_action
 
     bad = RiskProfile(gstin="X", periods=36, gstr1_filed=36, gstr3b_filed=11,
+                      gstr3b_known_periods=36,
                       sold_but_did_not_pay=25, recent_periods=12,
                       recent_sold_but_did_not_pay=7)
     assert recommended_action(bad) == ACT_HOLD
@@ -1028,11 +1053,6 @@ def biz(tmp_path, monkeypatch):
     client = TestClient(appmod.app)
     client.post("/signup", data={"email": "meera@x.in", "password": PASSWORD})
     client.post("/businesses", data={"name": "Meera's Boutique"})
-    # Live, not the simulator: a business on the simulator is in demo mode by
-    # definition and never sees the API-backed screen, whatever is configured.
-    from tests.test_supplier_drawer import go_live
-
-    go_live(client)
     return client
 
 
@@ -1046,22 +1066,22 @@ def test_a_bad_endpoint_is_refused_before_anything_is_stored(biz, url, why):
     supplier every time and quietly score a whole book against one company's
     record; an http URL puts a GST API key in cleartext on every hop.
     """
-    response = biz.post("/agents/input-credit/setup/filing-api",
+    response = biz.post("/agents/input-credit/filing-api",
                         data={"url_template": url, "api_key": "k",
                               "key_header": "x-api-key"},
                         follow_redirects=False)
     assert response.status_code == 303
     assert "error=" in response.headers["location"]
 
-    # Still the manual screen, because nothing was stored.
-    page = biz.get("/agents/input-credit").text
-    assert "No GST API is configured" in page
+    # Still the connect form, because nothing was stored.
+    page = biz.get("/agents/input-credit/with-api").text
+    assert "Connect a GST filing-status API" in page
 
 
 def test_a_key_with_nowhere_to_go_is_refused(biz):
     """A key with neither a header nor a parameter name would be silently
     dropped, and the merchant would think they were authenticated."""
-    response = biz.post("/agents/input-credit/setup/filing-api",
+    response = biz.post("/agents/input-credit/filing-api",
                         data={"url_template": "https://p.test/{gstin}",
                               "api_key": "secret"},
                         follow_redirects=False)
@@ -1073,18 +1093,19 @@ def test_a_configured_api_becomes_the_active_source(biz):
     State 2: one upload box, because the register is the only thing the
     platform cannot fetch for itself.
     """
-    biz.post("/agents/input-credit/setup/filing-api",
+    biz.post("/agents/input-credit/filing-api",
              data={"url_template": "https://p.test/{gstin}"})
 
-    page = biz.get("/agents/input-credit").text
+    page = biz.get("/agents/input-credit/with-api").text
     assert "Connected GST API" in page
     assert "Upload your purchase register" in page
     # No history box: it is fetched, not asked for.
     assert "Step 1" not in page
     assert "Import GSTR-2B" not in page
 
-    biz.post("/agents/input-credit/setup/filing-api/forget")
-    assert "No GST API is configured" in biz.get("/agents/input-credit").text
+    biz.post("/agents/input-credit/filing-api/forget")
+    assert "Connect a GST filing-status API" in \
+        biz.get("/agents/input-credit/with-api").text
 
 
 def test_staff_cannot_change_where_filing_history_comes_from(tmp_path,
@@ -1121,7 +1142,7 @@ def test_staff_cannot_change_where_filing_history_comes_from(tmp_path,
     staff.get(f"/switch?business_id={business['business_id']}")
     assert staff.get("/agents/input-credit").status_code == 200
 
-    response = staff.post("/agents/input-credit/setup/filing-api",
+    response = staff.post("/agents/input-credit/filing-api",
                           data={"url_template": "https://evil.test/{gstin}"},
                           follow_redirects=False)
     assert response.status_code == 403
@@ -1133,107 +1154,22 @@ def test_staff_cannot_change_where_filing_history_comes_from(tmp_path,
             business["business_id"]) is None
 
     # And the owner, in the same business, can.
-    assert owner.post("/agents/input-credit/setup/filing-api",
+    assert owner.post("/agents/input-credit/filing-api",
                       data={"url_template": "https://good.test/{gstin}"},
                       follow_redirects=False).status_code == 303
 
 
-# --- three modes, one screen ---------------------------------------------
+# --- three tabs, one dashboard -------------------------------------------
 #
-# The screen used to show three upload boxes at once and leave the merchant to
-# work out which they needed. It now asks for what the state it is in requires
-# and nothing else, so these tests are as much about what is ABSENT as present.
+# The tabs name the one question that differs between them: where does supplier
+# filing history come from? Everything downstream is deliberately identical, so
+# these tests check both halves - that each tab asks for the right thing, and
+# that what comes out the other end does not depend on which one you used.
 
-def _mode_of(client):
-    """The screen a business currently gets, by what is on it."""
-    page = client.get("/agents/input-credit").text
-    if "Generate &amp; analyse demo data" in page:
-        return "demo"
-    if "Connected GST API" in page:
-        return "live_api"
-    if "No GST API is configured" in page:
-        return "live_manual"
-    return "?"
+DEMO = "/agents/input-credit"
+WITHOUT_API = "/agents/input-credit/without-api"
+WITH_API = "/agents/input-credit/with-api"
 
-
-def test_the_simulator_gets_the_demo_screen_and_no_upload_boxes(shop):
-    page = shop.get("/agents/input-credit").text
-    assert _mode_of(shop) == "demo"
-    assert 'type="file"' not in page
-
-
-def test_live_with_an_api_asks_only_for_the_register(biz):
-    biz.post("/agents/input-credit/setup/filing-api",
-             data={"url_template": "https://p.test/{gstin}"})
-    page = biz.get("/agents/input-credit").text
-
-    assert _mode_of(biz) == "live_api"
-    assert page.count('type="file"') == 1
-    assert 'name="register"' in page
-
-
-def test_live_without_an_api_asks_for_history_first(biz):
-    page = biz.get("/agents/input-credit").text
-    assert _mode_of(biz) == "live_manual"
-    assert 'name="history"' in page
-    assert "one-time" in page
-    # And it says how to make the one-time effort go away.
-    assert "Connect one in Setup" in page
-
-
-def test_the_data_source_decides_the_mode_not_a_stray_api_key(shop):
-    """
-    A business on the simulator is in demo mode whatever else is configured.
-
-    The alternative is a screen that says one thing and a pipeline that does
-    another, which is exactly what a provenance label exists to prevent.
-    """
-    shop.post("/agents/input-credit/setup/filing-api",
-              data={"url_template": "https://p.test/{gstin}"})
-    assert _mode_of(shop) == "demo"
-
-    import merchant.app as appmod
-    from merchant.risk_pipeline import history_service_for
-
-    with appmod.ledger(None) as led:
-        business = led.conn.execute(
-            "SELECT business_id FROM businesses LIMIT 1").fetchone()
-        led.business_id = business["business_id"]
-        service = history_service_for(led, business["business_id"])
-    assert service.source == "simulated"
-
-
-def test_gstr2b_is_not_on_the_risk_screen_in_any_mode(biz):
-    """
-    It has no GSTR-3B evidence in it, so it cannot answer this question - and
-    putting it beside two boxes that can is how a merchant comes to believe
-    otherwise.
-
-    One client walked through all three states rather than two fixtures: each
-    fixture points app.DB at its own temp file, so two in one test would have
-    them fighting over the same module global.
-    """
-    # live, no API
-    assert _mode_of(biz) == "live_manual"
-    assert "Import GSTR-2B" not in biz.get("/agents/input-credit").text
-
-    # live, API configured
-    biz.post("/agents/input-credit/setup/filing-api",
-             data={"url_template": "https://p.test/{gstin}"})
-    assert _mode_of(biz) == "live_api"
-    assert "Import GSTR-2B" not in biz.get("/agents/input-credit").text
-
-    # demo
-    biz.post("/sources/simulator")
-    assert _mode_of(biz) == "demo"
-    assert "Import GSTR-2B" not in biz.get("/agents/input-credit").text
-
-    # It is still available, on the tab whose question it answers.
-    assert "Import GSTR-2B" in \
-        biz.get("/agents/input-credit/reconciliation").text
-
-
-# --- the demo runs in one click ------------------------------------------
 
 def _finish(client, key, timeout=30):
     import merchant.app as appmod
@@ -1248,14 +1184,78 @@ def _finish(client, key, timeout=30):
     raise AssertionError("the analysis never finished")
 
 
-def test_the_demo_button_produces_a_full_analysis(shop):
-    """Both halves generated, scored and on screen, with nothing uploaded."""
-    response = shop.post("/agents/input-credit/demo",
-                         data={"use_agent": "no"}, follow_redirects=False)
-    assert response.status_code == 303
-    key = response.headers["location"].split("key=")[-1]
+def _register_run(client, url=DEMO):
+    return _finish(client, client.post(
+        "/agents/input-credit",
+        files={"register": ("r.csv", SAMPLE_REGISTER.encode(), "text/csv")},
+        data={"use_agent": "no"},
+        follow_redirects=False).headers["location"].split("key=")[-1])
 
+
+def test_the_tabs_are_the_three_ingestion_routes():
+    from merchant.nav import AGENT_ROUTES
+
+    tabs = AGENT_ROUTES["gst_itc"].tabs
+    assert [t.label for t in tabs] == ["Demo Mode", "Without API", "With API"]
+    assert [t.slug for t in tabs] == ["", "without-api", "with-api"]
+
+
+def test_demo_mode_asks_for_nothing(shop):
+    """Both halves are generated, so there is nothing to upload."""
+    page = shop.get(DEMO).text
+    assert "Generate &amp; analyse demo data" in page
+    assert 'type="file"' not in page
+    assert "Do not act on any of it against a real supplier" in page
+
+
+def test_without_api_asks_for_history_then_the_register(shop):
+    page = shop.get(WITHOUT_API).text
+    assert "Step 1" in page
+    assert 'name="history"' in page
+    assert "one-time" in page
+    assert "Generate &amp; analyse demo data" not in page
+
+
+def test_without_api_spells_out_the_portal_path(shop):
+    """
+    A merchant who has never downloaded a GSTR-2B will not find it from "get
+    your GSTR-2B" - the JSON is four clicks deep and the tile offers an Excel
+    first, which is the wrong file.
+    """
+    page = shop.get(WITHOUT_API).text
+    for step in ("gst.gov.in", "Services", "Returns", "Returns Dashboard",
+                 "Select Financial Year", "Search", "GSTR-2B Tile",
+                 "Download", "Generate JSON File to Download"):
+        assert step in page, step
+
+
+def test_with_api_offers_the_connection_then_the_register(shop):
+    page = shop.get(WITH_API).text
+    assert "Connect a GST filing-status API" in page
+    assert 'name="url_template"' in page
+
+    shop.post("/agents/input-credit/filing-api",
+              data={"url_template": "https://p.test/{gstin}"})
+    connected = shop.get(WITH_API).text
+    assert "Connected GST API" in connected
+    assert 'name="register"' in connected
+    # No history box: it is fetched, not asked for.
+    assert 'name="history"' not in connected
+
+
+def test_only_the_demo_tab_offers_generated_data(shop):
+    for url in (WITHOUT_API, WITH_API):
+        assert "Generate &amp; analyse demo data" not in shop.get(url).text
+
+
+# --- what each tab actually runs -----------------------------------------
+
+def test_demo_mode_generates_both_halves_and_scores_them(shop):
+    key = shop.post("/agents/input-credit/demo", data={"use_agent": "no"},
+                    follow_redirects=False
+                    ).headers["location"].split("key=")[-1]
     state = _finish(shop, key)
+
     assert state["state"] == "done", state
     payload = state["payload"]
     assert payload["portfolio"]["history_source"] == "simulated"
@@ -1264,90 +1264,145 @@ def test_the_demo_button_produces_a_full_analysis(shop):
     assert all(len(s["compliance_grid"]) == 36 for s in payload["suppliers"])
 
 
-def test_the_demo_is_not_offered_on_live_data(biz):
-    """A demo button on a real merchant's data screen is an invitation to
-    generate figures about their actual suppliers."""
-    assert "Generate &amp; analyse demo data" not in \
-        biz.get("/agents/input-credit").text
+def test_without_api_joins_the_register_to_the_uploaded_history(shop):
+    shop.post("/agents/input-credit/history",
+              files={"history": ("h.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    state = _register_run(shop)
 
-
-# --- the refusal that keeps live mode honest ------------------------------
-
-def test_live_with_no_history_refuses_rather_than_simulating(biz):
-    """
-    The most important guardrail in this flow.
-
-    A merchant on live data with no API and no uploaded history has given us
-    nothing to score their suppliers against. Falling back to the simulator
-    would put generated filing records against real companies' names and
-    present the result as a risk assessment.
-    """
-    response = biz.post("/agents/input-credit",
-                        files={"register": ("r.csv", SAMPLE_REGISTER.encode(),
-                                            "text/csv")},
-                        data={"use_agent": "no"}, follow_redirects=False)
-    key = response.headers["location"].split("key=")[-1]
-
-    state = _finish(biz, key)
-    assert state["state"] == "failed"
-    assert "no honest way to score" in state["phase"]
-    assert "payload" not in state
-
-    page = biz.get(f"/agents/input-credit?key={key}").text
-    assert "no honest way to score" in page
-
-
-def test_the_same_register_succeeds_once_history_is_supplied(biz):
-    """The refusal is about missing evidence, not about live mode."""
-    biz.post("/agents/input-credit/history",
-             files={"history": ("h.csv", sample_filing_history().encode(),
-                                "text/csv")})
-    response = biz.post("/agents/input-credit",
-                        files={"register": ("r.csv", SAMPLE_REGISTER.encode(),
-                                            "text/csv")},
-                        data={"use_agent": "no"}, follow_redirects=False)
-    key = response.headers["location"].split("key=")[-1]
-
-    state = _finish(biz, key)
     assert state["state"] == "done", state
     assert state["payload"]["portfolio"]["history_source"] == "file"
+    assert state["payload"]["portfolio"]["history_is_demo"] is False
 
 
-def test_every_mode_reaches_the_identical_dashboard(biz):
+def test_with_api_fetches_history_for_the_registers_gstins(shop, monkeypatch):
     """
-    The strict requirement: the results are agnostic to how history arrived.
+    The register's GSTINs are what gets looked up - nothing else is uploaded.
 
-    The same business is run twice over the same register - once in demo mode
-    off generated history, once on live data off an uploaded file - and the two
-    dashboards must be identical apart from the provenance fields that exist
-    precisely to differ. Asserted through the HTTP routes a person actually
-    clicks, not at the provider level where it is easier to be right.
+    Asserted on which GSTINs the provider was asked about, because that is the
+    claim the tab makes: extract the suppliers from the register, then fetch
+    each one.
     """
-    from tests.test_supplier_drawer import go_live
+    import merchant.risk_pipeline as pipeline
+    from engine.gst.filing_history import history_for
+    from merchant.gstin_lookup import FilingStatusApi
 
-    # Demo: nothing uploaded, both halves generated.
-    biz.post("/sources/simulator")
-    demo = _finish(biz, biz.post(
+    asked = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def http(_method, url, **_kw):
+        from engine.gst.filing_history import as_gstn_payload
+
+        gstin = url.rsplit("/", 1)[-1]
+        asked.append(gstin)
+        return Response(as_gstn_payload(history_for(gstin)))
+
+    real = pipeline.history_service_for
+
+    def with_fake_http(led, business_id, **kw):
+        return real(led, business_id, **{**kw, "http": http})
+
+    # merchant.app imports this inside the function it runs in, so patching
+    # the pipeline module's attribute is what actually takes effect.
+    monkeypatch.setattr(pipeline, "history_service_for", with_fake_http)
+
+    shop.post("/agents/input-credit/filing-api",
+              data={"url_template": "https://p.test/returns/{gstin}"})
+    state = _register_run(shop)
+
+    assert state["state"] == "done", state
+    assert state["payload"]["portfolio"]["history_source"] == "api"
+
+    from merchant.purchase_import import parse
+
+    expected = {g.supplier_gstin
+                for g in parse(SAMPLE_REGISTER.encode(), "r.csv").groups}
+    assert set(asked) == expected
+
+
+def test_a_register_with_no_history_refuses_rather_than_simulating(shop):
+    """
+    The guardrail the whole three-tab split rests on.
+
+    A register uploaded on Without API before any history exists has nothing
+    to be scored against. Falling back to the simulator would put generated
+    filing records against real companies' names and call it a risk
+    assessment.
+    """
+    state = _register_run(shop)
+
+    assert state["state"] == "failed"
+    assert "would not be a risk assessment" in state["phase"]
+    assert "payload" not in state
+
+
+def test_the_api_outranks_an_uploaded_history(shop):
+    """More current, and it can see payment - which GSTR-2B usually cannot."""
+    shop.post("/agents/input-credit/history",
+              files={"history": ("h.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    shop.post("/agents/input-credit/filing-api",
+              data={"url_template": "https://p.test/{gstin}"})
+
+    import merchant.app as appmod
+    from merchant.risk_pipeline import history_service_for
+
+    with appmod.ledger(None) as led:
+        biz = led.businesses.all()[0]["business_id"]
+        led.business_id = biz
+        assert history_service_for(led, biz).source == "api"
+
+
+def test_the_settlement_connector_does_not_decide_gst_history(shop):
+    """
+    Which settlement source a business uses says nothing about how it gets GST
+    filing history. Keying one off the other was a coupling nobody could have
+    predicted from the screen.
+    """
+    import merchant.app as appmod
+    from merchant.risk_pipeline import history_service_for
+
+    shop.post("/agents/input-credit/history",
+              files={"history": ("h.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    with appmod.ledger(None) as led:
+        biz = led.businesses.all()[0]["business_id"]
+        led.business_id = biz
+        assert history_service_for(led, biz).source == "file"
+
+
+def test_every_tab_reaches_the_identical_dashboard(shop):
+    """
+    The strict requirement: the agent must not be able to tell which tab a run
+    came from, and neither should the dashboard.
+
+    The same register is run twice - once off generated history, once off an
+    uploaded file - and the payloads must match apart from the provenance
+    fields that exist precisely to differ.
+    """
+    demo = _finish(shop, shop.post(
         "/agents/input-credit/demo", data={"use_agent": "no"},
         follow_redirects=False).headers["location"].split("key=")[-1])
     assert demo["state"] == "done", demo
 
-    # Live: the same suppliers' history, supplied as a file.
-    go_live(biz)
-    biz.post("/agents/input-credit/history",
-             files={"history": ("h.csv", sample_filing_history().encode(),
-                                "text/csv")})
-    live = _finish(biz, biz.post(
-        "/agents/input-credit",
-        files={"register": ("r.csv", SAMPLE_REGISTER.encode(), "text/csv")},
-        data={"use_agent": "no"},
-        follow_redirects=False).headers["location"].split("key=")[-1])
-    assert live["state"] == "done", live
+    shop.post("/agents/input-credit/history",
+              files={"history": ("h.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    uploaded = _register_run(shop)
+    assert uploaded["state"] == "done", uploaded
 
     assert demo["payload"]["portfolio"]["history_source"] == "simulated"
-    assert live["payload"]["portfolio"]["history_source"] == "file"
+    assert uploaded["payload"]["portfolio"]["history_source"] == "file"
     assert _without_provenance(demo["payload"]) == \
-        _without_provenance(live["payload"])
+        _without_provenance(uploaded["payload"])
 
 
 def test_a_demo_run_does_not_badge_the_agent_as_live(shop):
