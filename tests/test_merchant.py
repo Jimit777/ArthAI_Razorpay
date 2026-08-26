@@ -553,7 +553,8 @@ def test_the_rate_card_carries_the_guardrails_the_gate_needs(tmp_path):
 # The agents that actually have an implementation. Kept as a literal so that
 # flipping a status to "live" without writing a runner fails here rather than
 # in front of an audience.
-IMPLEMENTED = {"settlement_audit", "gst_itc", "three_way_recon"}
+IMPLEMENTED = {"settlement_audit", "gst_itc", "three_way_recon",
+               "cash_forecaster"}
 
 
 def test_the_live_agents_are_exactly_the_implemented_ones():
@@ -566,6 +567,7 @@ def test_the_live_agents_are_exactly_the_implemented_ones():
     import merchant.agents.gst  # noqa: F401
     import merchant.agents.recon  # noqa: F401
     import merchant.agents.settlement  # noqa: F401
+    import merchant.agents.treasury  # noqa: F401
     from merchant.catalog import all_agents, live_agents
 
     assert {a.id for a in live_agents()} == IMPLEMENTED
@@ -576,6 +578,7 @@ def test_a_live_agent_actually_has_something_to_run():
     import merchant.agents.gst  # noqa: F401
     import merchant.agents.recon  # noqa: F401
     import merchant.agents.settlement  # noqa: F401
+    import merchant.agents.treasury  # noqa: F401
     from merchant.catalog import live_agents
 
     for spec in live_agents():
@@ -1166,16 +1169,33 @@ def test_the_zero_mdr_citation_the_engine_prints_matches_the_rate_card(tmp_path)
 
 # --- the information architecture ----------------------------------------
 
+# Everything in the rail that is not an agent: Home, Agents, Data, Businesses,
+# Business settings, Team, Activity, Admin, Accuracy.
+FIXED_RAIL_ITEMS = 9
+
+
 def test_the_sidebar_stays_small_as_agents_are_added(client):
     """
     Every new agent used to add three root-level items. The rail is now driven
-    by merchant/nav.py, where an agent contributes one entry under Workspace
+    by merchant/nav.py, where an agent contributes ONE entry under Workspace
     and everything else becomes a tab inside its own workspace.
+
+    Asserted as that invariant rather than as a maximum. The maximum was a
+    number that had to be raised every time a real agent shipped, which meant
+    the test failed for the one reason it was not about - and a tripwire that
+    cries wolf on good news is one people learn to bump without reading.
     """
+    from merchant.catalog import live_agents
+
     _start(client)
     rail = client.get("/").text
     rail = rail.split('<nav>')[1].split('</nav>')[0]
-    assert rail.count('class="item') <= 12, "the rail is growing again"
+
+    items = rail.count('class="item')
+    allowed = FIXED_RAIL_ITEMS + len(live_agents())
+    assert items <= allowed, (
+        f"the rail has {items} items for {len(live_agents())} agents - "
+        f"an agent is contributing more than one entry again")
 
 
 def test_agent_pages_live_under_their_agent(client):

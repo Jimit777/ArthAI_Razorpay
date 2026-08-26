@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS live_gstr2b (
   recorded_at     INTEGER
 );
 
+-- What the cash forecaster is built from: balances, scheduled outflows, and
+-- the monthly charges nobody schedules.
+--
+-- One table with a `kind`, for the same reason recon_sources is one table:
+-- they share a lifecycle - replaced together, scoped together, forgotten
+-- together - and three tables always written in the same breath is three
+-- chances for one to be left behind.
+CREATE TABLE IF NOT EXISTS treasury_inputs (
+  business_id  TEXT NOT NULL,
+  kind         TEXT NOT NULL,      -- 'account' | 'payout' | 'recurring'
+  ref          TEXT NOT NULL,
+  payload      TEXT NOT NULL,      -- the record as JSON
+  source_file  TEXT,
+  uploaded_at  INTEGER,
+  PRIMARY KEY (business_id, kind, ref)
+);
+
 -- The three sources of the three-way reconciliation, as a merchant uploaded
 -- them. Stored rather than held for one run: assembling three exports is a
 -- real piece of work, and asking for all three again because somebody
@@ -756,6 +773,112 @@ class Ledger:
             " recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         self.conn.commit()
         return {"added": len(rows), "removed": removed}
+
+    # --- the cash forecaster's inputs -------------------------------------
+
+    def replace_treasury_input(self, kind: str, records,
+                               filename: str = "") -> int:
+        """Store balances, payouts or recurring charges, replacing the last lot."""
+        import json
+        import time
+
+        business_id = self._scoped()
+        self.conn.execute(
+            "DELETE FROM treasury_inputs WHERE business_id = ? AND kind = ?",
+            (business_id, kind))
+
+        now = int(time.time())
+        rows = []
+        for index, record in enumerate(records):
+            payload = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                       for k, v in vars(record).items()}
+            ref = str(payload.get("account_id") or payload.get("payout_id")
+                      or payload.get("name") or index)
+            rows.append((business_id, kind, ref, json.dumps(payload),
+                         filename, now))
+
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO treasury_inputs (business_id, kind, ref,"
+            " payload, source_file, uploaded_at) VALUES (?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def treasury_inputs(self, *, receipts=None):
+        """
+        The stored inputs, in the shape the forecaster already takes.
+
+        Returns None without balances and payouts. A forecast needs a starting
+        point and something to spend - without either it is not a cautious
+        forecast, it is a straight line, and drawing one would be worse than
+        saying what is missing.
+
+        Recurring charges are OPTIONAL and inferred from payout history when
+        absent, because a curve that silently omits rent is cheerful and wrong
+        in the direction that hurts.
+        """
+        import json
+        from datetime import date as _date
+
+        from engine.treasury.records import (BankAccount, RecurringExpense,
+                                             ScheduledPayout, TreasuryInputs)
+        from merchant.treasury_import import infer_recurring
+
+        held: dict = {"account": [], "payout": [], "recurring": []}
+        for row in self.conn.execute(
+                "SELECT kind, payload FROM treasury_inputs"
+                " WHERE business_id = ? ORDER BY ref", (self._scoped(),)):
+            held.setdefault(row["kind"], []).append(json.loads(row["payload"]))
+
+        if not held["account"] or not held["payout"]:
+            return None
+
+        def when(value):
+            try:
+                return _date.fromisoformat(str(value)[:10])
+            except (TypeError, ValueError):
+                return _date.today()
+
+        out = TreasuryInputs(as_of=_date.today())
+        out.accounts = [BankAccount(
+            account_id=r["account_id"], nickname=r["nickname"],
+            balance=r["balance"], as_of=when(r["as_of"]),
+            overdraft_limit=r.get("overdraft_limit", 0))
+            for r in held["account"]]
+        out.payouts = [ScheduledPayout(
+            payout_id=r["payout_id"], payee=r["payee"], amount=r["amount"],
+            due_on=when(r["due_on"]), kind=r.get("kind", "vendor"))
+            for r in held["payout"]]
+
+        if held["recurring"]:
+            out.recurring = [RecurringExpense(
+                name=r["name"], amount=r["amount"],
+                day_of_month=r["day_of_month"], kind=r.get("kind", "recurring"),
+                seen_in_months=r.get("seen_in_months", 0),
+                confidence=r.get("confidence", 1.0))
+                for r in held["recurring"]]
+        else:
+            out.recurring = infer_recurring(out.payouts)
+
+        out.receipts = list(receipts or [])
+        return out
+
+    def treasury_held(self) -> dict:
+        """What is on file for each input, for the page to describe it."""
+        out = {}
+        for row in self.conn.execute(
+                "SELECT kind, COUNT(*) n, MAX(uploaded_at) at,"
+                " MAX(source_file) f FROM treasury_inputs"
+                " WHERE business_id = ? GROUP BY kind", (self._scoped(),)):
+            out[row["kind"]] = {"records": row["n"], "uploaded_at": row["at"],
+                                "source_file": row["f"] or ""}
+        return out
+
+    def forget_treasury_inputs(self) -> int:
+        removed = self.conn.execute(
+            "DELETE FROM treasury_inputs WHERE business_id = ?",
+            (self._scoped(),)).rowcount
+        self.conn.commit()
+        return removed
 
     # --- the three-way sources --------------------------------------------
 

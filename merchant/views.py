@@ -1559,3 +1559,538 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
 {_recon_source_card("bank", held)}
 {_recon_run_card(held, all(held.get(k) for k in
                            ("invoice", "settlement", "bank")), connected=True)}"""
+
+
+# --- the forward cash forecaster ------------------------------------------
+#
+# One chart and one decision. A thirty-day forecast is a shape before it is a
+# table - a controller wants to see WHERE the dip is before they read what is
+# in it - so the curve leads, and everything under it explains that shape.
+
+CASH_TONE = {
+    "CASH_HEALTHY": "good", "CASH_TIGHT": "warn",
+    "CASH_CRUNCH_WARNING": "bad", "CASH_OVERDRAWN": "bad",
+}
+
+
+def cash_curve(forecast: dict, height: int = 190) -> str:
+    """
+    Thirty days as an inline SVG, with the danger zone shaded.
+
+    Hand-built rather than charted: it is one polyline, one shaded band and a
+    marker, and pulling in a charting library for that would add a dependency
+    and a build step to draw thirty points. Everything is computed server-side
+    - the browser is handed coordinates, never figures to work out.
+    """
+    positions = forecast.get("positions") or []
+    if not positions:
+        return ""
+
+    floor = forecast.get("floor", 0)
+    balances = [p["closing"] for p in positions]
+    top = max(max(balances), floor) * 1.08 or 1
+    bottom = min(min(balances), 0)
+    span = (top - bottom) or 1
+
+    width, pad = 720, 8
+    step = (width - pad * 2) / max(1, len(positions) - 1)
+
+    def y(value: int) -> float:
+        return pad + (top - value) / span * (height - pad * 2)
+
+    points = " ".join(f"{pad + i * step:.1f},{y(b):.1f}"
+                      for i, b in enumerate(balances))
+    area = (f"{pad:.1f},{y(bottom):.1f} " + points
+            + f" {pad + (len(balances) - 1) * step:.1f},{y(bottom):.1f}")
+
+    # The danger zone: everything below the safe floor, shaded across the
+    # whole width so the curve entering it is visible rather than inferred.
+    floor_y = y(floor)
+    danger = (f'<rect x="{pad}" y="{floor_y:.1f}" width="{width - pad * 2}" '
+              f'height="{max(0, y(bottom) - floor_y):.1f}" '
+              f'fill="var(--danger)" opacity="0.09"></rect>'
+              f'<line x1="{pad}" y1="{floor_y:.1f}" x2="{width - pad}" '
+              f'y2="{floor_y:.1f}" stroke="var(--danger)" '
+              f'stroke-dasharray="4 4" stroke-width="1"></line>')
+
+    trough = forecast.get("trough") or {}
+    marker = ""
+    if trough:
+        index = max(0, min(len(balances) - 1, trough["day"] - 1))
+        cx, cy = pad + index * step, y(trough["balance"])
+        breached = trough.get("shortfall", 0) > 0
+        colour = "var(--danger)" if breached else "var(--warn)"
+        marker = (
+            f'<line x1="{cx:.1f}" y1="{pad}" x2="{cx:.1f}" '
+            f'y2="{y(bottom):.1f}" stroke="{colour}" stroke-width="1" '
+            f'opacity=".45"></line>'
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4.5" fill="{colour}">'
+            f'</circle>')
+
+    # The LINE turns red when the month breaks; the area under it does not.
+    # Filling thirty days in danger colour because one of them is bad reads as
+    # "this whole month is a crisis", which is both untrue and the fastest way
+    # to teach somebody to ignore the colour.
+    breached = bool(trough.get("shortfall") or 0)
+    stroke = "var(--danger)" if breached else "var(--brand)"
+    first, last = positions[0], positions[-1]
+    return f"""
+<div class="curve">
+  <svg viewBox="0 0 {width} {height}" preserveAspectRatio="none"
+       role="img" aria-label="Thirty day cash projection">
+    {danger}
+    <polygon points="{area}" fill="var(--brand)" opacity="0.06"></polygon>
+    <polyline points="{points}" fill="none" stroke="{stroke}"
+      stroke-width="2" stroke-linejoin="round"></polyline>
+    {marker}
+  </svg>
+  <div class="curve-axis">
+    <span>{esc(first["date"])} &middot; day 1</span>
+    <span class="curve-floor">safe floor
+      {esc(forecast.get("floor_display", ""))}</span>
+    <span>{esc(last["date"])} &middot; day {last["day"]}</span>
+  </div>
+</div>"""
+
+
+def cash_results(payload: dict, key: str = "") -> str:
+    """The curve, the alert, then the days that made the shape."""
+    from merchant.ui import badge
+
+    meta = payload["metadata"]
+    forecast = payload["forecast"]
+    trough = forecast.get("trough") or {}
+    tone = CASH_TONE.get(forecast["finding_type"], "")
+
+    accuracy = meta.get("accuracy") or {}
+    measured = ""
+    if accuracy.get("total"):
+        checks = "".join(
+            f'<div class="working-line"><span>{esc(c["what"])}</span>'
+            f'<b style="color:{"var(--good)" if c["ok"] else "var(--danger)"}">'
+            f'{"yes" if c["ok"] else "no"}</b></div>'
+            for c in accuracy["checks"])
+        measured = (
+            f'<details class="working" style="margin-top:13px">'
+            f'<summary>Checked against the planted scenario &mdash; '
+            f'{accuracy["passed"]} of {accuracy["total"]}</summary>'
+            f'<div class="working-body">{checks}'
+            f'<p style="margin:11px 0 0;font-size:11.5px;color:var(--muted)">'
+            f'The demo scenario was built to break on a particular day in a '
+            f'particular way. These are the engine&rsquo;s answers against '
+            f'that, so the crunch on the chart is a finding rather than a '
+            f'coincidence.</p></div></details>')
+
+    spend = ""
+    usage = meta.get("usage") or {}
+    if usage.get("calls"):
+        spend = (f'<div style="padding:11px 16px;border-top:1px solid '
+                 f'var(--line-2);color:var(--muted);font-size:11.5px">'
+                 f'{usage["calls"]} agent call &mdash; '
+                 f'<b>${usage["usd"]:.3f}</b> (about Rs '
+                 f'{usage["rupees"]:.0f}). One, not thirty: there is a single '
+                 f'decision in a cash forecast and it is what to do about the '
+                 f'low point.</div>')
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is paid, moved or scheduled.</b> This projects a
+  balance and recommends. Every action is a proposal waiting for you.</span>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
+  <div class="stats">
+    <div class="stat"><b>{esc(forecast["opening_display"])}</b>
+      <span>in the account today</span></div>
+    <div class="stat"><b style="color:{"var(--danger)" if trough.get("shortfall")
+                                       else "var(--ink)"}">
+      {esc(trough.get("balance_display", "&mdash;"))}</b>
+      <span>lowest point, day {trough.get("day", "&mdash;")}</span></div>
+    <div class="stat"><b style="color:{"var(--danger)" if trough.get("shortfall")
+                                       else "var(--muted)"}">
+      {esc(trough.get("shortfall_display", "Rs 0.00"))}</b>
+      <span>below the safe floor</span></div>
+    <div class="stat"><b>{esc(forecast["closing_display"])}</b>
+      <span>after {meta["days"]} days</span></div>
+  </div>
+  {cash_curve(forecast)}
+  <div style="padding:11px 16px;border-top:1px solid var(--line-2);
+    color:var(--muted);font-size:11.5px">
+    {esc(forecast["detail"])} Every figure here was computed before the agent
+    was asked &mdash; the model is not permitted to do arithmetic on a running
+    balance, where being right ninety-nine times out of a hundred still means
+    being wrong about the month.
+    {measured}
+  </div>
+  {spend}
+</div>
+
+{_cash_alert(payload, tone, badge)}
+{_cash_days(forecast)}"""
+
+
+def _cash_alert(payload: dict, tone: str, badge) -> str:
+    """The finding and what to do about it, as a finding-card."""
+    forecast = payload["forecast"]
+    verdict = payload.get("verdict") or {}
+    trough = forecast.get("trough") or {}
+
+    if forecast["finding_type"] == "CASH_HEALTHY":
+        return f"""
+<div class="finding-card">
+  <div class="finding-card-top">
+    <div><div class="finding-card-who">The month holds</div>
+      <div class="finding-card-inv">Lowest point
+        {esc(trough.get("balance_display", ""))} on
+        {esc(trough.get("date", ""))}</div></div>
+    {badge(forecast["finding_label"], "good")}
+  </div>
+  <p class="finding-card-why">{esc(forecast["detail"])}</p>
+</div>"""
+
+    held = ""
+    if verdict.get("hold_payout_id"):
+        days = verdict.get("hold_days")
+        held = (f'<div class="draft"><b>Move '
+                f'{esc(verdict["hold_payout_id"])}</b>'
+                + (f' by {days} day{"" if days == 1 else "s"}.' if days
+                   else '.')
+                + ' Nothing is moved for you &mdash; this is the proposal.'
+                + '</div>')
+
+    corrections = ""
+    if verdict.get("corrections"):
+        corrections = (
+            '<p class="sub" style="margin:9px 0 0;color:var(--warn);'
+            'font-size:11.8px">The agent was corrected: '
+            + esc("; ".join(verdict["corrections"])) + '</p>')
+
+    unmovable = "".join(
+        f'<div class="working-line"><span>{esc(row.get("payee", ""))} '
+        f'&middot; {esc(row.get("kind", ""))}</span>'
+        f'<b>{esc(row.get("amount_display", ""))}</b></div>'
+        for row in forecast.get("unmovable_near_trough", []))
+    movable = "".join(
+        f'<div class="working-line"><span>'
+        f'{esc(row.get("payee") or row.get("name", ""))} &middot; day '
+        f'{row.get("day", "")} &middot; can move '
+        f'{row.get("delay_days", 5)} days</span>'
+        f'<b>{esc(row.get("amount_display", ""))}</b></div>'
+        for row in forecast.get("movable_near_trough", []))
+
+    return f"""
+<div class="finding-card" style="border-left:3px solid var(--danger)">
+  <div class="finding-card-top">
+    <div>
+      <div class="finding-card-who">Cash drops to
+        {esc(trough.get("balance_display", ""))} on
+        {esc(trough.get("date", ""))}</div>
+      <div class="finding-card-inv">Day {trough.get("day", "")} of
+        {len(forecast.get("positions", []))} &middot;
+        {esc(trough.get("shortfall_display", ""))} below the
+        {esc(forecast.get("floor_display", ""))} floor</div>
+    </div>
+    {badge(forecast["finding_label"], tone or "bad")}
+  </div>
+  <p class="finding-card-why">
+    {esc(verdict.get("reasoning") or forecast["detail"])}</p>
+
+  <div class="facts">
+    <div class="fact"><span>Short by</span>
+      <b style="color:var(--danger)">
+        {esc(trough.get("shortfall_display", ""))}</b></div>
+    <div class="fact"><span>Could be moved</span>
+      <b>{esc(forecast.get("movable_total_display", ""))}</b>
+      <em>{len(forecast.get("movable_near_trough", []))} payments</em></div>
+    <div class="fact"><span>Cannot be moved</span>
+      <b>{len(forecast.get("unmovable_near_trough", []))} payments</b>
+      <em>payroll and statutory dues</em></div>
+    <div class="fact"><span>Arriving after</span>
+      <b>{esc(forecast.get("receipts_after_trough_display", ""))}</b></div>
+  </div>
+
+  <div class="recommend">
+    <span class="recommend-label">Recommended</span>
+    {esc(forecast["action_label"])}
+  </div>
+  {held}
+  {corrections}
+
+  <details class="working" style="margin-top:13px">
+    <summary>What falls due around that date</summary>
+    <div class="working-body">
+      <p style="margin:0 0 7px;font-size:11.5px;color:var(--muted)">
+        Cannot be moved</p>
+      {unmovable or '<div class="working-line"><span>nothing</span></div>'}
+      <p style="margin:11px 0 7px;font-size:11.5px;color:var(--muted)">
+        Could be moved</p>
+      {movable or '<div class="working-line"><span>nothing</span></div>'}
+    </div>
+  </details>
+</div>"""
+
+
+def _cash_days(forecast: dict) -> str:
+    """The days that actually moved, so the shape can be traced to its causes."""
+    rows = []
+    for position in forecast.get("positions", []):
+        if not (position["receipts"] or position["payouts"]
+                or position["recurring"]):
+            continue
+        names = [line.get("payee") or line.get("name", "")
+                 for line in position["payout_lines"]
+                 + position["recurring_lines"]]
+        low = (forecast.get("trough") or {}).get("day") == position["day"]
+        rows.append(f"""
+      <tr{' style="background:var(--danger-wash)"' if low else ''}>
+        <td>{position["day"]}<div style="color:var(--muted);font-size:10.5px">
+          {esc(position["date"])}</div></td>
+        <td class="r" style="color:var(--good)">
+          {esc(rupees(position["receipts"])) if position["receipts"] else "&mdash;"}</td>
+        <td class="r" style="color:var(--danger)">
+          {esc(rupees(position["payouts"] + position["recurring"]))
+           if (position["payouts"] + position["recurring"]) else "&mdash;"}</td>
+        <td style="color:var(--muted);font-size:11.5px;max-width:36ch">
+          {esc(", ".join(n for n in names if n)) or "&mdash;"}</td>
+        <td class="r" style="font-weight:{'600' if low else '400'}">
+          {esc(position["closing_display"])}</td>
+      </tr>""")
+
+    return f"""
+<div class="card flush">
+  <div class="card-head"><h2>The days that move</h2>
+    <span class="sub">quiet days are left out</span></div>
+  <div style="overflow-x:auto">
+  <table>
+    <tr><th>Day</th><th class="r">In</th><th class="r">Out</th>
+        <th>What</th><th class="r">Balance</th></tr>
+    {"".join(rows)}
+  </table>
+  </div>
+</div>"""
+
+
+COMPONENTS += """
+/* --- the thirty-day cash curve ----------------------------------------- */
+/* One polyline, one shaded danger band, one marker on the low point. Drawn
+   server-side from computed coordinates - the browser is never handed a
+   figure to work out. */
+.curve { padding:14px 16px 10px; border-top:1px solid var(--line-2) }
+.curve svg { width:100%; height:190px; display:block }
+.curve-axis { display:flex; justify-content:space-between; margin-top:6px;
+  font-size:10.6px; color:var(--faint) }
+.curve-floor { color:var(--danger); opacity:.75 }
+
+/* --- what a cash forecast needs before it can run ----------------------- */
+.needs { display:grid; grid-template-columns:repeat(3,1fr); gap:11px;
+  margin-top:12px }
+.needs > div { border:1px solid var(--line-2); border-radius:9px;
+  padding:11px 13px }
+.needs b { display:block; font-size:12.3px; margin-bottom:3px }
+.needs span { font-size:11.3px; color:var(--ink-2); line-height:1.45 }
+.needs .have { border-color:var(--good); background:var(--good-wash) }
+@media (max-width:720px) { .needs { grid-template-columns:1fr } }
+"""
+
+CSS = TOKENS + SHELL + COMPONENTS
+
+
+CASH_UPLOAD_HELP = {
+    "account": ("Bank balances", "balances",
+                "What is in your accounts today. A one-line export, or the "
+                "balance row from your statement. Needs a balance; an "
+                "overdraft limit helps if you have one."),
+    "payout": ("Scheduled payouts", "payouts",
+               "What you owe and when - an AP ageing report or a payment run "
+               "from your accounting package. Needs an amount and a due "
+               "date. Payroll and tax rows are recognised by name and marked "
+               "as unmovable, so nothing here will ever suggest delaying a "
+               "salary."),
+    "recurring": ("Recurring charges", "recurring",
+                  "Optional. Rent, cloud bills, subscriptions. Leave it out "
+                  "and they are inferred from your payout history instead, "
+                  "with the confidence stated - because a forecast that "
+                  "silently omits rent is cheerful and wrong."),
+}
+
+
+def _cash_need_card(kind: str, held: dict) -> str:
+    title, field, blurb = CASH_UPLOAD_HELP[kind]
+    on_file = held.get(kind)
+    if on_file:
+        return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>{esc(title)} &mdash; {on_file["records"]} records</b>
+    <div class="src-what">From
+      <span class="mono">{esc(on_file["source_file"] or "your upload")}</span>.
+      Upload again to replace it.</div></div>
+</div>"""
+    optional = " <span class=\"sub\">(optional)</span>" if kind == "recurring" else ""
+    return f"""
+<div class="card">
+  <h2>{esc(title)}{optional}</h2>
+  <p class="sub" style="margin:3px 0 12px;max-width:68ch">{esc(blurb)}</p>
+  <form method="post" action="/agents/cash-forecaster/upload"
+        enctype="multipart/form-data">
+    <input type="hidden" name="kind" value="{kind}">
+    <div class="row">
+      <div><label>{esc(title)} (CSV or Excel)</label>
+        <input type="file" name="{field}" accept=".csv,.xlsx,.xlsm,.txt"
+          required></div>
+      <div style="flex:0;align-self:flex-end"><button>Upload</button></div>
+    </div>
+  </form>
+</div>"""
+
+
+def cash_demo_screen() -> str:
+    """Tab 1. A generated month with a crunch planted in it."""
+    return """
+<div class="src demo">
+  <span class="src-dot"></span>
+  <div><b>Demo mode &mdash; this is a generated month</b>
+    <div class="src-what">A balance, three weeks of gateway settlements, a
+      payroll run, a tax instalment, rent, a cloud bill and eight vendor
+      invoices &mdash; with a cash crunch deliberately placed on day 14. The
+      arithmetic is real; the company is not.</div></div>
+</div>
+
+<div class="card" style="text-align:center;padding:34px 24px">
+  <h2 style="margin:0">Thirty days forward</h2>
+  <p class="sub" style="margin:7px auto 18px;max-width:58ch">One click builds
+     the scenario, projects every day, finds the low point and asks the agent
+     which payment to move. Nothing is scheduled and nothing is paid.</p>
+  <form method="post" action="/agents/cash-forecaster/run">
+    <input type="hidden" name="source" value="demo">
+    <button style="font-size:14px;padding:12px 26px">
+      Forecast the next 30 days</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent which payout to move
+    </label>
+  </form>
+</div>
+
+<div class="card tint">
+  <h2>Why the crunch is on day 14 and not day 2</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">A cash crunch found on
+     the day it happens is not a finding, it is a crisis. Found two weeks out
+     it is a phone call to a supplier. That gap is the entire product, so the
+     demo is built to show it &mdash; payroll and the quarterly tax instalment
+     land together on the 14th, and the settlements that would have covered
+     them arrive on the 16th.</p>
+</div>"""
+
+
+def cash_upload_screen(held: dict) -> str:
+    """Tab 2. Your own balances and payables."""
+    ready = bool(held.get("account") and held.get("payout"))
+    run_card = f"""
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Ready to forecast</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">
+     {held.get("account", {}).get("records", 0)} accounts and
+     {held.get("payout", {}).get("records", 0)} scheduled payouts on file.
+     {"Recurring charges will be inferred from your payout history."
+      if not held.get("recurring") else ""}</p>
+  <form method="post" action="/agents/cash-forecaster/run">
+    <input type="hidden" name="source" value="upload">
+    <button style="font-size:14px;padding:12px 26px">
+      Forecast the next 30 days</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent which payout to move
+    </label>
+  </form>
+  <form method="post" action="/agents/cash-forecaster/forget"
+        style="margin-top:12px">
+    <button class="ghost small">Clear what is on file</button>
+  </form>
+</div>""" if ready else """
+<div class="card tint">
+  <h2>Not ready yet</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:68ch">A forecast needs a
+     starting balance and something to spend. Without either it is not a
+     cautious projection &mdash; it is a straight line, and drawing one would
+     be worse than saying what is missing.</p>
+</div>"""
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is paid, moved or scheduled.</b> Your files are read
+  and projected forward. Nothing is sent anywhere.</span>
+</div>
+
+{run_card}
+{_cash_need_card("account", held)}
+{_cash_need_card("payout", held)}
+{_cash_need_card("recurring", held)}
+
+<div class="card tint">
+  <h2>What is not asked for</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Your incoming gateway
+     settlements. This platform already pulls those &mdash; connect an account
+     on the <a href="/agents/cash-forecaster/connected">With API</a> tab and
+     the receivable side of the forecast fills itself. Asking you to export a
+     file the product can fetch would be inventing work.</p>
+</div>"""
+
+
+def cash_connected_screen(held: dict, source_kind: Optional[str],
+                          receipts: int = 0) -> str:
+    """Tab 3. Settlements pulled; balances still the merchant's to supply."""
+    if source_kind != "razorpay":
+        return """
+<div class="banner warn">
+  <span><b>No Razorpay account is connected to this business.</b> Connect one
+    in <a href="/data">Data &amp; integrations</a> and the incoming half of
+    the forecast fills itself from your pending settlements.</span>
+</div>
+
+<div class="card tint">
+  <h2>What connecting changes, and what it does not</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Money coming IN stops
+     being something you supply. Captured payments that have not yet been
+     credited are exactly the receivable a thirty-day forecast turns on, and
+     the gateway is the only party that knows them.</p>
+  <p class="sub" style="margin:9px 0 0;max-width:70ch">Your balance and your
+     payables stay uploads. The balance lives at your bank, which has no API
+     a small merchant can use &mdash; the same wall as an Account Aggregator
+     for statements, or a GSP for GST filing history. Open Banking would
+     close it; nothing available today does.</p>
+</div>"""
+
+    return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>Razorpay connected</b>
+    <div class="src-what">{receipts} pending settlements will be read as
+      money arriving. Your balance and your payables are still yours to
+      supply &mdash; neither is on the gateway.</div></div>
+</div>
+
+{_cash_need_card("account", held)}
+{_cash_need_card("payout", held)}
+
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Forecast with live receivables</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">Pending
+     settlements are pulled at run time, so the incoming side is as current as
+     your gateway is.</p>
+  <form method="post" action="/agents/cash-forecaster/run">
+    <input type="hidden" name="source" value="connected">
+    <button style="font-size:14px;padding:12px 26px">
+      Forecast the next 30 days</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent which payout to move
+    </label>
+  </form>
+</div>"""

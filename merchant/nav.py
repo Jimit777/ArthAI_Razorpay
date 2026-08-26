@@ -159,6 +159,16 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             AgentTab("Matched", "matched",
                      "every line the three sources closed between them"),
         )),
+    "cash_forecaster": AgentRoute(
+        agent_id="cash_forecaster", slug="cash-forecaster",
+        tabs=(
+            AgentTab("Demo Mode", "",
+                     "a generated month with a crunch planted on day 14"),
+            AgentTab("Without API", "upload",
+                     "your balances and your payables, as files"),
+            AgentTab("With API", "connected",
+                     "settlements pulled; balances still yours to supply"),
+        )),
 }
 
 SLUG_TO_AGENT = {r.slug: r for r in AGENT_ROUTES.values()}

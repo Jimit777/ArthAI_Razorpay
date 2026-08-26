@@ -41,6 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 import merchant.agents.gst  # noqa: F401  - registers the live agent
 import merchant.agents.recon  # noqa: F401  - registers the live agent
+import merchant.agents.treasury  # noqa: F401  - registers the live agent
 import merchant.agents.settlement  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
 from merchant import catalog, views
@@ -1661,6 +1662,291 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
         with _risk_lock:
             RISK_RUNS[key] = {"state": "failed",
                               "phase": f"{type(exc).__name__}: {exc}"}
+
+
+# --- forward cash forecaster ----------------------------------------------
+#
+# Runs held in memory like the other two thread-driven agents, and for the same
+# reason: this produces a projection to act on, not a ledger entry. Nothing
+# here schedules, moves or pays anything.
+
+CASH_RUNS: dict = {}
+_cash_lock = threading.Lock()
+
+CASH_FIELD = {"account": "balances", "payout": "payouts",
+              "recurring": "recurring"}
+
+
+def _cash_state(key: str, business_id: str = "") -> tuple[str, dict]:
+    """This run, or this business's latest. Scoped, for the obvious reason."""
+    with _cash_lock:
+        if key:
+            return key, dict(CASH_RUNS.get(key) or {})
+        if not business_id:
+            return "", {}
+        for found, state in reversed(list(CASH_RUNS.items())):
+            if (state.get("business_id") == business_id
+                    and state.get("state") == "done"):
+                return found, dict(state)
+    return "", {}
+
+
+def _pending_receipts(led, business_id: str) -> list:
+    """
+    Gateway money captured and not yet credited, as expected receipts.
+
+    Read from the settlement lines this platform already holds. A payment that
+    has settled is not a receivable any more, so only unsettled ones count -
+    counting both would inflate the incoming side of a forecast, which is the
+    direction that gets somebody into trouble.
+    """
+    from datetime import timedelta
+
+    from engine.treasury.records import ExpectedReceipt
+
+    today = date.today()
+    try:
+        rows = led.conn.execute(
+            "SELECT payment_id, amount, fee, tax, captured_at FROM"
+            " live_payments WHERE business_id = ? AND settled_at IS NULL",
+            (business_id,)).fetchall()
+    except Exception:                                       # noqa: BLE001
+        return []
+
+    out = []
+    for row in rows:
+        net = int(row["amount"] or 0) - int(row["fee"] or 0) - int(row["tax"] or 0)
+        if net <= 0:
+            continue
+        captured = (date.fromtimestamp(row["captured_at"])
+                    if row["captured_at"] else today)
+        # T+2 is Razorpay's standard cycle. Stated rather than guessed, and
+        # never before today - money does not arrive in the past.
+        expected = max(today + timedelta(days=1), captured + timedelta(days=2))
+        out.append(ExpectedReceipt(
+            reference=row["payment_id"], source="gateway settlement",
+            amount=net, expected_on=expected))
+    return out
+
+
+def _run_cash(key: str, business_id: str, use_agent: bool,
+              source: str = "demo") -> None:
+    from merchant.treasury_pipeline import run as run_cash
+
+    def progress(**kw):
+        with _cash_lock:
+            state = CASH_RUNS.get(key)
+            if state is not None:
+                state.update(kw)
+
+    try:
+        planted = None
+        if source == "demo":
+            from generator.synthetic_treasury import generate
+
+            inputs, planted = generate()
+            business = "the demo business"
+        else:
+            with ledger(business_id) as led:
+                receipts = (_pending_receipts(led, business_id)
+                            if source == "connected" else [])
+                inputs = led.treasury_inputs(receipts=receipts)
+                row = led.businesses.get(business_id)
+                business = row["name"] if row else ""
+            if inputs is None:
+                raise ValueError(
+                    "A forecast needs a starting balance and something to "
+                    "spend. Upload your bank balances and your scheduled "
+                    "payouts, then run again.")
+
+        result = run_cash(inputs, use_agent=use_agent, planted=planted,
+                          business=business, source=source,
+                          on_progress=progress)
+        with _cash_lock:
+            CASH_RUNS[key] = {"state": "done", "business_id": business_id,
+                              "phase": "done", "payload": result.as_dict()}
+    except Exception as exc:                                # noqa: BLE001
+        with _cash_lock:
+            CASH_RUNS[key] = {"state": "failed", "business_id": business_id,
+                              "phase": f"{type(exc).__name__}: {exc}"}
+
+
+def _cash_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
+    """All three tabs render through here, so the results cannot drift."""
+    from merchant.sources import Sources
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "cash_forecaster", tab)
+        held = led.treasury_held()
+        row = Sources(led.conn).get(ws.business_id)
+        source_kind = row["kind"] if row else None
+        receipts = len(_pending_receipts(led, ws.business_id))
+
+    key, state = _cash_state(key, ws.business_id)
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    if state.get("state") == "running":
+        return HTMLResponse(_risk_running(
+            state, head, shell, title="Cash forecast",
+            active="agent:cash_forecaster",
+            doing="Projecting the next thirty days"))
+    if state.get("state") == "failed":
+        banner = (f'<div class="banner warn"><span>'
+                  f'{views.esc(state.get("phase", "It failed."))}</span></div>')
+
+    payload = state.get("payload")
+    if payload:
+        body = views.cash_results(payload, key)
+    elif tab == "upload":
+        body = views.cash_upload_screen(held)
+    elif tab == "connected":
+        body = views.cash_connected_screen(held, source_kind, receipts)
+    else:
+        body = views.cash_demo_screen()
+
+    return HTMLResponse(views.page("Cash forecast", head + banner + body,
+                                   "agent:cash_forecaster", **shell))
+
+
+@app.get("/agents/cash-forecaster", response_class=HTMLResponse)
+def cash_page(ws: Workspace = Depends(required_workspace),
+              key: str = "", error: str = "", ok: str = ""):
+    return _cash_page(ws, "", key, error, ok)
+
+
+@app.get("/agents/cash-forecaster/upload", response_class=HTMLResponse)
+def cash_upload_page(ws: Workspace = Depends(required_workspace),
+                     key: str = "", error: str = "", ok: str = ""):
+    return _cash_page(ws, "upload", key, error, ok)
+
+
+@app.get("/agents/cash-forecaster/connected", response_class=HTMLResponse)
+def cash_connected_page(ws: Workspace = Depends(required_workspace),
+                        key: str = "", error: str = "", ok: str = ""):
+    return _cash_page(ws, "connected", key, error, ok)
+
+
+@app.post("/agents/cash-forecaster/upload")
+async def upload_cash_input(request: Request,
+                            ws: Workspace = Depends(required_workspace)):
+    """Take balances, payouts or recurring charges and store them."""
+    from urllib.parse import quote
+
+    from merchant import treasury_import
+
+    form = await request.form()
+    kind = str(form.get("kind") or "")
+    if kind not in CASH_FIELD:
+        return RedirectResponse(
+            "/agents/cash-forecaster/upload?error="
+            + quote("That is not one of the inputs."), status_code=303)
+
+    upload = form.get(CASH_FIELD[kind])
+    if upload is None or not getattr(upload, "filename", ""):
+        return RedirectResponse(
+            "/agents/cash-forecaster/upload?error="
+            + quote("Choose a file first."), status_code=303)
+
+    data = await upload.read()
+    if len(data) > 12 * 1024 * 1024:
+        return RedirectResponse(
+            "/agents/cash-forecaster/upload?error="
+            + quote(f"{upload.filename} is over 12 MB."), status_code=303)
+
+    parse = {"account": treasury_import.parse_balances,
+             "payout": treasury_import.parse_payouts,
+             "recurring": treasury_import.parse_recurring}[kind]
+    result = parse(data, upload.filename)
+    if not result.ok:
+        return RedirectResponse(
+            "/agents/cash-forecaster/upload?error="
+            + quote(f"Could not read {upload.filename}. Missing columns: "
+                    f"{', '.join(result.missing_columns)}."), status_code=303)
+
+    records = (result.accounts if kind == "account" else
+               result.payouts if kind == "payout" else result.recurring)
+    if not records:
+        return RedirectResponse(
+            "/agents/cash-forecaster/upload?error="
+            + quote(f"{upload.filename} had the right columns and no usable "
+                    f"rows. {'; '.join(result.rows_skipped[:2])}"),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        stored = led.replace_treasury_input(kind, records, upload.filename)
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=upload.filename,
+            detail=f"uploaded {stored} {kind} records for the cash forecast")
+
+    message = f"{stored} {kind} records read from {upload.filename}."
+    if kind == "payout":
+        unmovable = sum(1 for r in records if not r.movable)
+        if unmovable:
+            message += (f" {unmovable} are payroll or statutory dues and are "
+                        f"marked unmovable - nothing will suggest delaying "
+                        f"them.")
+    if result.rows_skipped:
+        message += f" {len(result.rows_skipped)} rows were skipped."
+    return RedirectResponse(
+        "/agents/cash-forecaster/upload?ok=" + quote(message), status_code=303)
+
+
+@app.post("/agents/cash-forecaster/forget")
+def forget_cash_inputs(ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        led.forget_treasury_inputs()
+    return RedirectResponse(
+        "/agents/cash-forecaster/upload?ok="
+        + quote("Cleared."), status_code=303)
+
+
+@app.post("/agents/cash-forecaster/run")
+async def start_cash_forecast(request: Request,
+                              ws: Workspace = Depends(required_workspace)):
+    form = await request.form()
+    source = str(form.get("source") or "demo")
+
+    key = f"cash_{int(time.time() * 1000)}"
+    with _cash_lock:
+        CASH_RUNS[key] = {"state": "running", "business_id": ws.business_id,
+                          "phase": "Building the scenario", "done": 0,
+                          "total": 1}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail=f"ran a 30-day cash forecast ({source})")
+
+    threading.Thread(
+        target=_run_cash,
+        args=(key, ws.business_id, form.get("use_agent") == "yes", source),
+        daemon=True).start()
+
+    landing = {"demo": "/agents/cash-forecaster",
+               "upload": "/agents/cash-forecaster/upload",
+               "connected": "/agents/cash-forecaster/connected"}.get(
+                   source, "/agents/cash-forecaster")
+    return RedirectResponse(f"{landing}?key={key}", status_code=303)
+
+
+@app.get("/agents/cash-forecaster/{key}.json")
+def cash_json(key: str, ws: Workspace = Depends(required_workspace)):
+    _found, state = _cash_state(key)
+    if not state:
+        return JSONResponse({"error": "no such run"}, status_code=404)
+    if state.get("state") != "done":
+        return JSONResponse({"state": state.get("state"),
+                             "phase": state.get("phase", "")})
+    return JSONResponse(state["payload"])
 
 
 # --- three-way reconciliation ---------------------------------------------
