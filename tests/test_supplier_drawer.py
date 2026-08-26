@@ -221,6 +221,27 @@ def shop(tmp_path, monkeypatch):
     return client
 
 
+def go_live(client):
+    """
+    Put this business on live data.
+
+    Written straight into data_sources because the only public route that gets
+    there validates real Razorpay credentials against Razorpay, which a test
+    cannot and should not do. What is being simulated is the STATE - "this
+    merchant is not on the built-in simulator" - which is exactly what the
+    three-mode switch reads.
+    """
+    import merchant.app as appmod
+    from merchant.sources import SourceKind, Sources
+
+    with appmod.ledger(None) as led:
+        business = led.conn.execute(
+            "SELECT business_id FROM businesses LIMIT 1").fetchone()
+        Sources(led.conn)._set(business["business_id"], SourceKind.RAZORPAY,
+                               "rzp_test_x", "ok", "connected")
+    return business["business_id"]
+
+
 def _analyse(shop, timeout=30):
     import merchant.app as appmod
 
@@ -240,9 +261,14 @@ def _analyse(shop, timeout=30):
 
 
 def test_supplier_risk_is_the_landing_view(shop):
+    """On the simulator the landing view is the demo button, not an upload."""
     page = shop.get("/agents/input-credit").text
-    assert "Upload your purchase register" in page
+    assert "Generate &amp; analyse demo data" in page
     assert "Supplier risk" in page
+    # The three stacked upload boxes are gone.
+    assert "Upload your purchase register" not in page
+    assert "Import GSTR-2B" not in page
+    assert "Step 1" not in page
 
 
 def test_the_manual_tabs_are_gone(shop):
@@ -364,6 +390,7 @@ def test_a_button_in_the_page_actually_works(shop):
 # --- the drawer is not a simulator privilege ------------------------------
 
 def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
+    go_live(shop)
     """
     Every interactive piece has to work whatever produced the data.
 
@@ -397,28 +424,37 @@ def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
     assert "no longer in memory" not in notice.text
 
 
-def test_an_upload_switches_the_source_badge(shop):
-    """The badge is how a merchant knows which world they are looking at."""
+def test_an_upload_completes_the_one_time_step(shop):
+    """
+    State 3 stops asking once the one-time effort is done.
+
+    A page that keeps demanding three years of filing history after it has been
+    given three years of filing history is a page nobody finishes.
+    """
+    go_live(shop)
     before = shop.get("/agents/input-credit").text
-    assert "Simulated 36-month history" in before
+    assert "Step 1" in before
+    assert "No GST API is configured" in before
 
     shop.post("/agents/input-credit/history",
               files={"history": ("history.csv", sample_filing_history().encode(),
                                  "text/csv")})
     after = shop.get("/agents/input-credit").text
-    assert "Uploaded filing history" in after
-    assert "Simulated 36-month history" not in after
+    assert "Supplier filing history on file" in after
+    assert "Step 1" not in after
+    assert "Upload your purchase register" in after
 
     shop.post("/agents/input-credit/history/forget")
-    assert "Simulated 36-month history" in shop.get("/agents/input-credit").text
+    assert "Step 1" in shop.get("/agents/input-credit").text
 
 
 def test_a_history_upload_survives_a_page_load(shop):
     """Stored, not held for one run. A merchant who assembled three years of
     filing dates is not asked for them again."""
+    go_live(shop)
     shop.post("/agents/input-credit/history",
               files={"history": ("history.csv", sample_filing_history().encode(),
                                  "text/csv")})
     page = shop.get("/agents/input-credit").text
-    assert "periods" in page
+    assert "tax periods" in page
     assert "2023-" in page or "2024-" in page

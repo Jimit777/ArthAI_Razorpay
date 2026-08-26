@@ -1593,7 +1593,7 @@ def _trust_tone(score: int) -> str:
 def _run_risk(key: str, business_id: str, data: bytes, filename: str,
               use_agent: bool) -> None:
     from merchant.purchase_import import parse
-    from merchant.risk_pipeline import history_service_for
+    from merchant.risk_pipeline import NO_HISTORY, history_service_for
     from merchant.risk_pipeline import run as run_pipeline
 
     def progress(**kw):
@@ -1623,6 +1623,11 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
         # saying which, is worse than either alone.
         with ledger(business_id) as led:
             history = history_service_for(led, business_id)
+        if history is None:
+            # Live data with nothing to score against. Refusing is the answer;
+            # simulating would put invented filing records against real
+            # companies and present it as a risk assessment.
+            raise ValueError(NO_HISTORY)
         portfolio = run_pipeline(imported, use_agent=use_agent,
                                  history=history, on_progress=progress)
         with _risk_lock:
@@ -1634,21 +1639,52 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
                               "phase": f"{type(exc).__name__}: {exc}"}
 
 
+def _risk_mode(led, business_id: str) -> tuple[str, dict, dict]:
+    """
+    Which of the three screens this business gets, and what each needs.
+
+    The mode is decided by what the business is CONNECTED to, not by what
+    happens to be uploaded. A merchant on the simulator is in demo mode whether
+    or not a file was once dropped on the old screen, and a merchant on live
+    data does not get a demo button. Anything else and the page would change
+    shape under them for reasons they cannot see.
+    """
+    from merchant.sources import SourceKind, Sources
+
+    sources = Sources(led.conn)
+    kind = sources.kind(business_id)
+    api_config = sources.filing_api_config(business_id)
+    summary = led.filing_history_summary()
+
+    # No source chosen yet is treated as the simulator: it is what a new
+    # business is actually running on, and offering the demo is a better first
+    # screen than an upload box for data the platform cannot yet do anything
+    # with.
+    if kind is None or kind == SourceKind.SIMULATOR:
+        return views.MODE_DEMO, api_config or {}, summary
+    if api_config and api_config.get("key_available"):
+        return views.MODE_LIVE_API, api_config, summary
+    return views.MODE_LIVE_MANUAL, api_config or {}, summary
+
+
+def _risk_screen(mode: str, api_config: dict, summary: dict) -> str:
+    """The upload screen for a mode. One place, so the states cannot drift."""
+    if mode == views.MODE_DEMO:
+        return views.risk_demo_screen()
+    if mode == views.MODE_LIVE_API:
+        return views.risk_live_api_screen(api_config.get("message", ""))
+    return views.risk_live_manual_screen(summary)
+
+
 @app.get("/agents/input-credit", response_class=HTMLResponse)
 def supplier_risk_page(ws: Workspace = Depends(required_workspace),
                        key: str = "", error: str = "", ok: str = ""):
-    from merchant.risk_pipeline import history_service_for
-    from merchant.sources import Sources
-
     with ledger(ws.business_id) as led:
         shell = _shell_for(led, ws)
         head = _workspace_head(led, ws, "gst_itc", "")
-        held = led.gstr2b_periods()
-        history = history_service_for(led, ws.business_id)
-        history_note = led.filing_history_summary()
-        api_config = Sources(led.conn).filing_api_config(ws.business_id)
+        mode, api_config, summary = _risk_mode(led, ws.business_id)
 
-    source = _history_badge(history, history_note, api_config)
+    screen = _risk_screen(mode, api_config, summary)
 
     with _risk_lock:
         state = dict(RISK_RUNS.get(key) or {}) if key else {}
@@ -1668,211 +1704,12 @@ def supplier_risk_page(ws: Workspace = Depends(required_workspace),
     payload = state.get("payload")
     if not payload:
         return HTMLResponse(views.page(
-            "Supplier risk", head + banner + _risk_upload(held, source),
-            "agent:gst_itc",
+            "Supplier risk", head + banner + screen, "agent:gst_itc",
             **shell))
 
     return HTMLResponse(views.page(
         "Supplier risk", head + banner + _risk_results(payload, key),
         "agent:gst_itc", **shell))
-
-
-def _history_badge(history, summary: dict, api_config) -> str:
-    """
-    Which of the three sources is live, said plainly and near the top.
-
-    This is the most important sentence on the page when the source is the
-    simulator, because everything below it - a trust score, a recommendation to
-    stop buying from a named company - reads as fact and is not. So the demo
-    state gets warn styling and an explicit "do not act on this", while the two
-    real sources get a quiet confirmation and stay out of the way.
-    """
-    from engine.gst.filing_history import SOURCE_API, SOURCE_FILE
-
-    source = history.source
-    if source == SOURCE_API:
-        detail = views.esc(api_config["message"] or "") if api_config else ""
-        return f"""
-<div class="src ok">
-  <span class="src-dot"></span>
-  <div><b>Connected GST API</b>
-    <div class="src-what">Filing history is read per supplier from the API
-      configured for this business. {detail}</div></div>
-  <a class="btn ghost small" href="/agents/input-credit/setup">Change</a>
-</div>"""
-
-    if source == SOURCE_FILE:
-        span = ""
-        if summary:
-            span = (f'{summary["suppliers"]} suppliers, '
-                    f'{summary["periods"]} periods, '
-                    f'{views.esc(summary["first_period"])} to '
-                    f'{views.esc(summary["last_period"])}.')
-        return f"""
-<div class="src ok">
-  <span class="src-dot"></span>
-  <div><b>Uploaded filing history</b>
-    <div class="src-what">{span} Scores come from this file &mdash; nothing
-      here re-checks the portal, so it is as current as the file is.</div></div>
-  <form method="post" action="/agents/input-credit/history/forget"
-        style="flex:0"><button class="ghost small">Remove</button></form>
-</div>"""
-
-    return """
-<div class="src demo">
-  <span class="src-dot"></span>
-  <div><b>Simulated 36-month history &mdash; demo mode</b>
-    <div class="src-what">No GST API is configured and no filing history has
-      been uploaded, so supplier filing records are <b>generated</b>. The
-      register, the arithmetic and the law are real; the filing dates are not.
-      <b>Do not act on these against a real supplier.</b> Add a real source
-      below and every number on this page is computed the same way from it.
-      </div></div>
-</div>"""
-
-
-def _risk_upload(held=(), source: str = "") -> str:
-    periods_held = ""
-    if held:
-        period_rows = "".join(
-            f'<div class="working-line"><span>{views.esc(h["filed_period"])}'
-            f' &middot; {h["suppliers"]} suppliers</span>'
-            f'<b>{rupees(h["tax"])}</b></div>' for h in held)
-        enough = ("Enough history for the supplier watch."
-                  if len(held) >= 3 else
-                  f"{3 - len(held)} more period"
-                  f"{'' if 3 - len(held) == 1 else 's'} would let the watch "
-                  f"tell a supplier who stopped filing from one who has not "
-                  f"filed yet.")
-        periods_held = (
-            f'<details class="working" style="margin-top:13px">'
-            f'<summary>{len(held)} period'
-            f'{"" if len(held) == 1 else "s"} imported</summary>'
-            f'<div class="working-body">{period_rows}'
-            f'<p style="margin:11px 0 0;font-size:11.5px;color:var(--muted)">'
-            f'{views.esc(enough)}</p></div></details>')
-
-    return f"""
-<div class="banner brand" style="margin-bottom:16px">
-  <span><b>Nothing here is filed, claimed or paid.</b> This reads your
-  register and your suppliers&rsquo; records, and recommends.</span>
-</div>
-
-{source}
-
-<div class="card">
-  <h2>Upload your purchase register</h2>
-  <p class="sub" style="margin:3px 0 13px;max-width:66ch">A CSV or Excel export
-     from Tally, Zoho, Busy or your own spreadsheet. It needs a supplier GSTIN
-     column and the CGST, SGST and IGST amounts &mdash; the column names do not
-     have to match anything, and anything unreadable is listed rather than
-     silently dropped.</p>
-  <form method="post" action="/agents/input-credit" enctype="multipart/form-data">
-    <div class="row">
-      <div><label>Register file</label>
-        <input type="file" name="register" accept=".csv,.xlsx,.xlsm,.txt"
-          required></div>
-      <div style="flex:0;align-self:flex-end">
-        <button>Analyse suppliers</button></div>
-    </div>
-    <label style="display:flex;align-items:center;gap:8px;margin-top:12px;
-      font-size:12.6px;color:var(--ink-2)">
-      <input type="checkbox" name="use_agent" value="yes" checked
-        style="width:auto;margin:0">
-      Ask the agent to judge each supplier &mdash; without this you still get
-      every score and pattern, computed from their record.
-    </label>
-  </form>
-  <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line-2)">
-    <a class="btn ghost small" href="/agents/input-credit/sample">
-      Download a sample register</a>
-    <span class="sub" style="margin-left:9px;font-size:11.5px">Eight suppliers,
-      one of each kind of filing record.</span>
-  </div>
-</div>
-
-<div class="card">
-  <h2>Import GSTR-2B</h2>
-  <p class="sub" style="margin:3px 0 12px;max-width:68ch">The government&rsquo;s
-     own record of what your suppliers reported about you. Download it from
-     <b>gst.gov.in &rarr; Services &rarr; Returns &rarr; Return Dashboard</b>,
-     pick a month, and take the <b>JSON</b> &mdash; not the Excel. Any
-     registered business can pull their own; no special access needed.</p>
-  <form method="post" action="/agents/input-credit/gstr2b"
-        enctype="multipart/form-data">
-    <div class="row">
-      <div><label>GSTR-2B files</label>
-        <input type="file" name="gstr2b" accept=".json" multiple required></div>
-      <div style="flex:0;align-self:flex-end"><button>Import</button></div>
-    </div>
-  </form>
-  <p class="sub" style="margin:12px 0 0;font-size:11.5px">
-    Select several months at once. The supplier watch needs at least three
-    periods to tell a supplier who has <i>stopped</i> filing from one who
-    simply has not filed yet, so one month at a time is the slow road to a
-    feature that cannot work. Importing a period you already have replaces it
-    rather than duplicating it.
-  </p>
-  {periods_held}
-</div>
-
-<div class="card">
-  <h2>Upload supplier filing history</h2>
-  <p class="sub" style="margin:3px 0 12px;max-width:68ch">What your suppliers
-     <b>filed</b>, as against what you bought. This is the half that decides
-     whether the credit exists at all &mdash; a supplier who files GSTR-1 and
-     skips GSTR-3B reconciles perfectly against a credit that is not there.
-     One row per supplier per month: <span class="mono">Supplier GSTIN,
-     Period, GSTR-1 Filed Date, GSTR-3B Filed Date</span>.</p>
-  <form method="post" action="/agents/input-credit/history"
-        enctype="multipart/form-data">
-    <div class="row">
-      <div><label>Filing history file</label>
-        <input type="file" name="history" accept=".csv,.xlsx,.xlsm,.txt"
-          required></div>
-      <div style="flex:0;align-self:flex-end"><button>Upload</button></div>
-    </div>
-  </form>
-  <p class="sub" style="margin:12px 0 0;font-size:11.5px">
-    <b>A blank filing-date cell counts.</b> It says that period was checked and
-    the return was not filed, which is what makes a default countable. A period
-    with no row at all makes no claim and is not counted against anyone &mdash;
-    so a partial file is safe to upload. Suppliers missing from it are scored
-    as <i>unknown</i>, never as clean.
-  </p>
-  <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line-2)">
-    <a class="btn ghost small" href="/agents/input-credit/sample-history">
-      Download a sample history</a>
-    <span class="sub" style="margin-left:9px;font-size:11.5px">The demo
-      suppliers&rsquo; 36 months, in the upload format. Upload it and every
-      score lands identically &mdash; same contract, same arithmetic.</span>
-  </div>
-</div>
-
-<div class="card tint">
-  <h2>Where filing history comes from</h2>
-  <p class="sub" style="margin:4px 0 10px;max-width:70ch">Three sources, one
-     pipeline. <b>Regardless of data source, every supplier is profiled across
-     the same 36 tax periods using the same risk model</b> &mdash; the source
-     changes what you had to do to get the data, never the arithmetic applied
-     to it or the screen it lands on.</p>
-  <div class="modes">
-    <div><b>Connected GST API</b><span>A GSP or verification API you hold a key
-      for. Current, per supplier, no upload. Configure it in
-      <a href="/agents/input-credit/setup">Setup</a>.</span></div>
-    <div><b>Uploaded filing history</b><span>The honest option without API
-      access: your accountant&rsquo;s records, filing acknowledgements, or a
-      quarterly pass through the portal.</span></div>
-    <div><b>Simulated history</b><span>Neither of the above. Deterministic
-      personas so the engine has something to score. Marked as demo on every
-      screen it touches.</span></div>
-  </div>
-  <p class="sub" style="margin:12px 0 0;font-size:11.5px">GSTR-2B is
-     deliberately <b>not</b> one of them. It carries GSTR-1 evidence and no
-     GSTR-3B evidence, so using it as filing history would report every
-     supplier in your book as having never paid a rupee of tax. It feeds the
-     reconciliation, which is the question it can answer.</p>
-</div>"""
 
 
 def _risk_running(state: dict, head: str, shell: dict) -> str:
@@ -2463,6 +2300,45 @@ async def start_supplier_risk(request: Request,
                             status_code=303)
 
 
+@app.post("/agents/input-credit/demo")
+async def run_demo_analysis(request: Request,
+                            ws: Workspace = Depends(required_workspace)):
+    """
+    State 1, in one click: build both halves and analyse them.
+
+    The register and the filing history are generated here rather than being
+    offered as files to download and upload back. That round trip is theatre -
+    the platform holds both halves already, and making a person fetch them only
+    adds two clicks and a chance to pick the wrong file.
+
+    What is NOT skipped is the pipeline. The generated register goes through
+    the same parser a real CSV does, and the generated history goes out through
+    the GSTN wire format and back through the same reader a live GSP response
+    uses. A demo that took a shortcut past either would stop being evidence
+    that the thing works.
+    """
+    form = await request.form()
+    key = f"risk_{int(time.time() * 1000)}"
+    with _risk_lock:
+        RISK_RUNS[key] = {"state": "running", "phase": "Building demo data",
+                          "done": 0, "total": 0}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail="ran a supplier risk analysis on demo data")
+
+    from merchant.purchase_import import SAMPLE_REGISTER
+
+    threading.Thread(
+        target=_run_risk,
+        args=(key, ws.business_id, SAMPLE_REGISTER.encode(),
+              "demo-register.csv", form.get("use_agent") == "yes"),
+        daemon=True).start()
+    return RedirectResponse(f"/agents/input-credit?key={key}",
+                            status_code=303)
+
+
 @app.post("/agents/input-credit/history")
 async def upload_filing_history(request: Request,
                                 ws: Workspace = Depends(required_workspace)):
@@ -2778,6 +2654,7 @@ def suppliers_page(ws: Workspace = Depends(required_workspace),
         _head = _workspace_head(led, ws, "gst_itc", "")
         _needs = _setup_banner(_requirements(led, ws, "gst_itc"))
         last = led.last_check()
+        gstr2b_held = led.gstr2b_periods()
         register = led.supplier_register()
         raised = led.raised_in(last["check_id"]) if last else []
         looked_at = (led.raised_in(last["check_id"], only_raised=False)
@@ -2962,6 +2839,8 @@ def suppliers_page(ws: Workspace = Depends(required_workspace),
 </div>
 
 {"".join(raised_card(r) for r in raised)}
+
+{views.gstr2b_import_card(gstr2b_held)}
 
 <div class="card flush">
   <div class="card-head">
@@ -3355,13 +3234,18 @@ def _agent_state(led, ws, spec, source_kind) -> str:
         return (ui.STATE_DEMO if source_kind == SourceKind.SIMULATOR
                 else ui.STATE_ACTIVE)
     if spec.id == "gst_itc":
+        # The DATA SOURCE decides first, exactly as it does for the risk
+        # screen's three modes. It used to be decided by whether any purchase
+        # row was marked "imported", which was true while the only way to get
+        # one was a merchant uploading a file - and stopped being true the
+        # moment the demo button started generating a register and storing it
+        # the same way. A business on the simulator was then badged "Live
+        # data" on the strength of data the platform had invented.
+        if source_kind is None or source_kind == SourceKind.SIMULATOR:
+            return ui.STATE_DEMO
         if not led.purchases(1):
             return ui.STATE_SETUP
-        # Imported bills are real; anything the supplier simulator filed is not.
-        imported = led.conn.execute(
-            "SELECT COUNT(*) n FROM live_purchases WHERE business_id = ?"
-            " AND behaviour = 'imported'", (ws.business_id,)).fetchone()["n"]
-        return ui.STATE_ACTIVE if imported else ui.STATE_DEMO
+        return ui.STATE_ACTIVE
     return ui.STATE_SETUP
 
 

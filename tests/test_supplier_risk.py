@@ -405,16 +405,15 @@ def test_a_sample_register_can_be_downloaded(shop):
 
 def test_the_page_says_the_history_is_simulated(shop):
     """
-    With no API and no upload, the page must say the filing dates are made up.
+    In demo mode the page must say the filing dates are made up.
 
     Not a cosmetic assertion. Everything below that badge - a trust score, a
-    recommendation to stop buying from a named company - reads as fact, and on
-    a fresh install none of it is. The warning is the feature.
+    recommendation to stop buying from a named company - reads as fact, and in
+    demo mode none of it is. The warning is the feature.
     """
     page = shop.get("/agents/input-credit").text
-    assert "Simulated 36-month history" in page
-    assert "demo mode" in page
-    assert "Do not act on these against a real supplier" in page
+    assert "Demo mode" in page
+    assert "Do not act on any of it against a real supplier" in page
 
 
 def test_the_demo_warning_survives_onto_the_results(shop):
@@ -1029,7 +1028,11 @@ def biz(tmp_path, monkeypatch):
     client = TestClient(appmod.app)
     client.post("/signup", data={"email": "meera@x.in", "password": PASSWORD})
     client.post("/businesses", data={"name": "Meera's Boutique"})
-    client.post("/sources/simulator")
+    # Live, not the simulator: a business on the simulator is in demo mode by
+    # definition and never sees the API-backed screen, whatever is configured.
+    from tests.test_supplier_drawer import go_live
+
+    go_live(client)
     return client
 
 
@@ -1050,8 +1053,9 @@ def test_a_bad_endpoint_is_refused_before_anything_is_stored(biz, url, why):
     assert response.status_code == 303
     assert "error=" in response.headers["location"]
 
+    # Still the manual screen, because nothing was stored.
     page = biz.get("/agents/input-credit").text
-    assert "Simulated 36-month history" in page
+    assert "No GST API is configured" in page
 
 
 def test_a_key_with_nowhere_to_go_is_refused(biz):
@@ -1065,17 +1069,22 @@ def test_a_key_with_nowhere_to_go_is_refused(biz):
 
 
 def test_a_configured_api_becomes_the_active_source(biz):
-    """Evidence first: a configured API outranks an upload, which outranks the
-    simulator."""
+    """
+    State 2: one upload box, because the register is the only thing the
+    platform cannot fetch for itself.
+    """
     biz.post("/agents/input-credit/setup/filing-api",
              data={"url_template": "https://p.test/{gstin}"})
 
     page = biz.get("/agents/input-credit").text
     assert "Connected GST API" in page
-    assert "Simulated 36-month history" not in page
+    assert "Upload your purchase register" in page
+    # No history box: it is fetched, not asked for.
+    assert "Step 1" not in page
+    assert "Import GSTR-2B" not in page
 
     biz.post("/agents/input-credit/setup/filing-api/forget")
-    assert "Simulated 36-month history" in biz.get("/agents/input-credit").text
+    assert "No GST API is configured" in biz.get("/agents/input-credit").text
 
 
 def test_staff_cannot_change_where_filing_history_comes_from(tmp_path,
@@ -1127,3 +1136,248 @@ def test_staff_cannot_change_where_filing_history_comes_from(tmp_path,
     assert owner.post("/agents/input-credit/setup/filing-api",
                       data={"url_template": "https://good.test/{gstin}"},
                       follow_redirects=False).status_code == 303
+
+
+# --- three modes, one screen ---------------------------------------------
+#
+# The screen used to show three upload boxes at once and leave the merchant to
+# work out which they needed. It now asks for what the state it is in requires
+# and nothing else, so these tests are as much about what is ABSENT as present.
+
+def _mode_of(client):
+    """The screen a business currently gets, by what is on it."""
+    page = client.get("/agents/input-credit").text
+    if "Generate &amp; analyse demo data" in page:
+        return "demo"
+    if "Connected GST API" in page:
+        return "live_api"
+    if "No GST API is configured" in page:
+        return "live_manual"
+    return "?"
+
+
+def test_the_simulator_gets_the_demo_screen_and_no_upload_boxes(shop):
+    page = shop.get("/agents/input-credit").text
+    assert _mode_of(shop) == "demo"
+    assert 'type="file"' not in page
+
+
+def test_live_with_an_api_asks_only_for_the_register(biz):
+    biz.post("/agents/input-credit/setup/filing-api",
+             data={"url_template": "https://p.test/{gstin}"})
+    page = biz.get("/agents/input-credit").text
+
+    assert _mode_of(biz) == "live_api"
+    assert page.count('type="file"') == 1
+    assert 'name="register"' in page
+
+
+def test_live_without_an_api_asks_for_history_first(biz):
+    page = biz.get("/agents/input-credit").text
+    assert _mode_of(biz) == "live_manual"
+    assert 'name="history"' in page
+    assert "one-time" in page
+    # And it says how to make the one-time effort go away.
+    assert "Connect one in Setup" in page
+
+
+def test_the_data_source_decides_the_mode_not_a_stray_api_key(shop):
+    """
+    A business on the simulator is in demo mode whatever else is configured.
+
+    The alternative is a screen that says one thing and a pipeline that does
+    another, which is exactly what a provenance label exists to prevent.
+    """
+    shop.post("/agents/input-credit/setup/filing-api",
+              data={"url_template": "https://p.test/{gstin}"})
+    assert _mode_of(shop) == "demo"
+
+    import merchant.app as appmod
+    from merchant.risk_pipeline import history_service_for
+
+    with appmod.ledger(None) as led:
+        business = led.conn.execute(
+            "SELECT business_id FROM businesses LIMIT 1").fetchone()
+        led.business_id = business["business_id"]
+        service = history_service_for(led, business["business_id"])
+    assert service.source == "simulated"
+
+
+def test_gstr2b_is_not_on_the_risk_screen_in_any_mode(biz):
+    """
+    It has no GSTR-3B evidence in it, so it cannot answer this question - and
+    putting it beside two boxes that can is how a merchant comes to believe
+    otherwise.
+
+    One client walked through all three states rather than two fixtures: each
+    fixture points app.DB at its own temp file, so two in one test would have
+    them fighting over the same module global.
+    """
+    # live, no API
+    assert _mode_of(biz) == "live_manual"
+    assert "Import GSTR-2B" not in biz.get("/agents/input-credit").text
+
+    # live, API configured
+    biz.post("/agents/input-credit/setup/filing-api",
+             data={"url_template": "https://p.test/{gstin}"})
+    assert _mode_of(biz) == "live_api"
+    assert "Import GSTR-2B" not in biz.get("/agents/input-credit").text
+
+    # demo
+    biz.post("/sources/simulator")
+    assert _mode_of(biz) == "demo"
+    assert "Import GSTR-2B" not in biz.get("/agents/input-credit").text
+
+    # It is still available, on the tab whose question it answers.
+    assert "Import GSTR-2B" in \
+        biz.get("/agents/input-credit/reconciliation").text
+
+
+# --- the demo runs in one click ------------------------------------------
+
+def _finish(client, key, timeout=30):
+    import merchant.app as appmod
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with appmod._risk_lock:
+            state = dict(appmod.RISK_RUNS.get(key) or {})
+        if state.get("state") != "running":
+            return state
+        time.sleep(0.05)
+    raise AssertionError("the analysis never finished")
+
+
+def test_the_demo_button_produces_a_full_analysis(shop):
+    """Both halves generated, scored and on screen, with nothing uploaded."""
+    response = shop.post("/agents/input-credit/demo",
+                         data={"use_agent": "no"}, follow_redirects=False)
+    assert response.status_code == 303
+    key = response.headers["location"].split("key=")[-1]
+
+    state = _finish(shop, key)
+    assert state["state"] == "done", state
+    payload = state["payload"]
+    assert payload["portfolio"]["history_source"] == "simulated"
+    assert payload["portfolio"]["history_is_demo"] is True
+    assert len(payload["suppliers"]) == 6
+    assert all(len(s["compliance_grid"]) == 36 for s in payload["suppliers"])
+
+
+def test_the_demo_is_not_offered_on_live_data(biz):
+    """A demo button on a real merchant's data screen is an invitation to
+    generate figures about their actual suppliers."""
+    assert "Generate &amp; analyse demo data" not in \
+        biz.get("/agents/input-credit").text
+
+
+# --- the refusal that keeps live mode honest ------------------------------
+
+def test_live_with_no_history_refuses_rather_than_simulating(biz):
+    """
+    The most important guardrail in this flow.
+
+    A merchant on live data with no API and no uploaded history has given us
+    nothing to score their suppliers against. Falling back to the simulator
+    would put generated filing records against real companies' names and
+    present the result as a risk assessment.
+    """
+    response = biz.post("/agents/input-credit",
+                        files={"register": ("r.csv", SAMPLE_REGISTER.encode(),
+                                            "text/csv")},
+                        data={"use_agent": "no"}, follow_redirects=False)
+    key = response.headers["location"].split("key=")[-1]
+
+    state = _finish(biz, key)
+    assert state["state"] == "failed"
+    assert "no honest way to score" in state["phase"]
+    assert "payload" not in state
+
+    page = biz.get(f"/agents/input-credit?key={key}").text
+    assert "no honest way to score" in page
+
+
+def test_the_same_register_succeeds_once_history_is_supplied(biz):
+    """The refusal is about missing evidence, not about live mode."""
+    biz.post("/agents/input-credit/history",
+             files={"history": ("h.csv", sample_filing_history().encode(),
+                                "text/csv")})
+    response = biz.post("/agents/input-credit",
+                        files={"register": ("r.csv", SAMPLE_REGISTER.encode(),
+                                            "text/csv")},
+                        data={"use_agent": "no"}, follow_redirects=False)
+    key = response.headers["location"].split("key=")[-1]
+
+    state = _finish(biz, key)
+    assert state["state"] == "done", state
+    assert state["payload"]["portfolio"]["history_source"] == "file"
+
+
+def test_every_mode_reaches_the_identical_dashboard(biz):
+    """
+    The strict requirement: the results are agnostic to how history arrived.
+
+    The same business is run twice over the same register - once in demo mode
+    off generated history, once on live data off an uploaded file - and the two
+    dashboards must be identical apart from the provenance fields that exist
+    precisely to differ. Asserted through the HTTP routes a person actually
+    clicks, not at the provider level where it is easier to be right.
+    """
+    from tests.test_supplier_drawer import go_live
+
+    # Demo: nothing uploaded, both halves generated.
+    biz.post("/sources/simulator")
+    demo = _finish(biz, biz.post(
+        "/agents/input-credit/demo", data={"use_agent": "no"},
+        follow_redirects=False).headers["location"].split("key=")[-1])
+    assert demo["state"] == "done", demo
+
+    # Live: the same suppliers' history, supplied as a file.
+    go_live(biz)
+    biz.post("/agents/input-credit/history",
+             files={"history": ("h.csv", sample_filing_history().encode(),
+                                "text/csv")})
+    live = _finish(biz, biz.post(
+        "/agents/input-credit",
+        files={"register": ("r.csv", SAMPLE_REGISTER.encode(), "text/csv")},
+        data={"use_agent": "no"},
+        follow_redirects=False).headers["location"].split("key=")[-1])
+    assert live["state"] == "done", live
+
+    assert demo["payload"]["portfolio"]["history_source"] == "simulated"
+    assert live["payload"]["portfolio"]["history_source"] == "file"
+    assert _without_provenance(demo["payload"]) == \
+        _without_provenance(live["payload"])
+
+
+def test_a_demo_run_does_not_badge_the_agent_as_live(shop):
+    """
+    Regression. The badge read "Live data" whenever a purchase row was marked
+    "imported", which was sound while only a merchant's upload could produce
+    one - and wrong the moment the demo button began generating a register and
+    storing it the same way. A business on the simulator was badged live on
+    the strength of data the platform had invented.
+    """
+    _finish(shop, shop.post("/agents/input-credit/demo",
+                            data={"use_agent": "no"}, follow_redirects=False
+                            ).headers["location"].split("key=")[-1])
+
+    page = shop.get("/agents/input-credit").text
+    assert "Demo data" in page
+    assert "Live data" not in page
+
+
+def test_live_data_is_badged_live_once_a_real_register_is_in(biz):
+    """The other half: the badge has to be reachable, or it means nothing."""
+    biz.post("/agents/input-credit/history",
+             files={"history": ("h.csv", sample_filing_history().encode(),
+                                "text/csv")})
+    _finish(biz, biz.post(
+        "/agents/input-credit",
+        files={"register": ("r.csv", SAMPLE_REGISTER.encode(), "text/csv")},
+        data={"use_agent": "no"},
+        follow_redirects=False).headers["location"].split("key=")[-1])
+
+    page = biz.get("/agents/input-credit").text
+    assert "Live data" in page
+    assert "Demo data" not in page

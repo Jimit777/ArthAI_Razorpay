@@ -442,12 +442,13 @@ def test_there_is_no_manual_purchase_form_at_all(shop):
     """
     It used to ask a merchant how their supplier files - a demo control in a
     real data-entry screen. The whole form is gone now: the workflow is
-    file-driven, and the old URL lands on the upload.
+    driven by what the business is connected to, and the old URL lands on it.
     """
     landing = shop.get("/agents/input-credit").text
     assert "Record a purchase invoice" not in landing
     assert 'name="behaviour"' not in landing
-    assert "Upload your purchase register" in landing
+    # This fixture is on the simulator, so the landing view is the demo run.
+    assert "Generate &amp; analyse demo data" in landing
 
     moved = shop.get("/agents/input-credit/purchases", follow_redirects=False)
     assert moved.status_code == 307

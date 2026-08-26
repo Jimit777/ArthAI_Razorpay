@@ -229,19 +229,19 @@ def test_several_months_can_be_imported_in_one_go(shop):
 
 def test_the_page_says_how_much_history_is_held(shop):
     _upload(shop, "052026", "062026", "072026")
-    page = shop.get("/agents/input-credit").text
+    page = shop.get("/agents/input-credit/reconciliation").text
     assert "3 periods imported" in page
     assert "Enough history for the supplier watch" in page
 
 
 def test_the_page_says_when_there_is_not_enough_yet(shop):
     _upload(shop, "072026")
-    page = shop.get("/agents/input-credit").text
+    page = shop.get("/agents/input-credit/reconciliation").text
     assert "2 more periods" in page
 
 
 def test_the_page_explains_where_to_get_the_file(shop):
-    page = shop.get("/agents/input-credit").text
+    page = shop.get("/agents/input-credit/reconciliation").text
     assert "Return Dashboard" in page
     assert "JSON" in page
 

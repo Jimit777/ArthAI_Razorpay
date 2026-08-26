@@ -460,19 +460,61 @@ class SimulatedHistoryProvider:
     Deterministic from the GSTIN, so the same supplier has the same history
     every time the page is opened - a risk profile that changed on refresh
     would be worse than none.
+
+    ## Why it goes out through the wire format and back
+
+    The generated months are serialised to the GSTN's own payload shape and
+    read back through `from_gstn_payload` - the same parser a live GSP response
+    goes through. It would be simpler to hand the objects over directly, and
+    that is exactly the shortcut worth refusing: a demo that bypasses the
+    parser cannot catch a parser bug, and the demo is the path that gets run a
+    hundred times more often than the one with a real API key behind it.
+
+    So the honest claim is not "the formats are compatible". It is that there
+    is one parser and everything goes through it.
     """
 
     source = SOURCE_SIMULATED
 
-    def __init__(self, *, personas: Optional[dict] = None):
+    def __init__(self, *, personas: Optional[dict] = None,
+                 through_wire_format: bool = True):
         # Only used by tests and the sample register, where a specific mix of
         # behaviours is wanted rather than the weighted draw.
         self._personas = personas or {}
+        self._through_wire_format = through_wire_format
 
     def history_for(self, gstin: str, *, months: int = DEFAULT_MONTHS,
                     ending: Optional[date] = None) -> FilingHistory:
-        return history_for(gstin, months=months, ending=ending,
-                           persona=self._personas.get(gstin.strip().upper()))
+        generated = history_for(gstin, months=months, ending=ending,
+                                persona=self._personas.get(gstin.strip().upper()))
+        if not self._through_wire_format:
+            return generated
+
+        # Registration status is passed alongside rather than embedded, because
+        # the portal does not carry it in the returns list either - it comes
+        # from the separate taxpayer-search call. Same join a real integration
+        # has to make.
+        history = from_gstn_payload(
+            gstin, as_gstn_payload(generated), months=months,
+            source=SOURCE_SIMULATED,
+            registration_status=generated.registration_status,
+            suspensions=generated.suspensions)
+        history.persona = generated.persona
+        history.source_note = SOURCE_NOTE[SOURCE_SIMULATED]
+        return history
+
+    def as_payloads(self, gstins, *, months: int = DEFAULT_MONTHS) -> dict:
+        """
+        The demo suppliers' history as GSTN-shaped JSON, one payload per GSTIN.
+
+        What the "generate demo data" button hands to the pipeline, and what a
+        merchant can download to see precisely what shape their own GSP
+        response needs to be in.
+        """
+        return {g.strip().upper(): as_gstn_payload(
+                    history_for(g, months=months,
+                                persona=self._personas.get(g.strip().upper())))
+                for g in gstins}
 
 
 class UploadedHistoryProvider:
@@ -564,3 +606,159 @@ class SupplierHistoryService:
     def as_dict(self) -> dict:
         return {"source": self.source, "label": self.label, "note": self.note,
                 "is_demo": self.is_demo, "months": self.months}
+
+
+# --- the government's own wire format --------------------------------------
+#
+# The GSTN's "Get Return Filing Status" call returns a flat list of returns,
+# one entry per form per period. Every GSP wraps it, none of them reshape it,
+# so this is the format real filing history actually arrives in.
+#
+# Both the live API and the simulator produce it, and BOTH are read back by
+# `from_gstn_payload` below. That is deliberate and it is what makes the
+# convergence claim structural rather than a promise: the demo does not take a
+# shortcut past the parser that production depends on, so a parsing bug cannot
+# hide behind a demo that never exercises it.
+#
+# The parser lives here, in the engine, rather than beside the HTTP client -
+# it is pure, it is the part worth testing, and putting it here is what lets
+# the simulator reach it without importing a network module.
+
+FILING_LIST_KEYS = ("EFiledlist", "efiledlist", "filing_status", "FilingStatus",
+                    "returns", "return_filing_status", "records", "items")
+
+RETURN_TYPE_FIELDS = ("rtntype", "return_type", "returnType", "rtn_type",
+                      "form", "form_type")
+PERIOD_FIELDS = ("ret_prd", "retPrd", "period", "tax_period", "taxPeriod",
+                 "return_period")
+FILED_ON_FIELDS = ("dof", "date_of_filing", "dateOfFiling", "filed_date",
+                   "filing_date", "filedDate", "doc_date")
+FILED_STATUS_FIELDS = ("status", "filing_status", "sts")
+
+# A provider that reports a status word rather than only a date. Anything not
+# in here is read as NOT filed, which is the cautious direction: it can make a
+# supplier look worse on the row - and the merchant is told the source - rather
+# than rounding a defaulter into a clean supplier, which is the error that
+# costs money.
+FILED_WORDS = {"filed", "f", "y", "yes", "submitted", "valid", "true"}
+
+
+def _field(payload: dict, names) -> Optional[str]:
+    for name in names:
+        value = payload.get(name)
+        if value not in (None, "", "NA"):
+            return str(value)
+    return None
+
+
+def _flatten(node) -> list:
+    """The filing list, however deeply a provider nested it."""
+    if isinstance(node, dict):
+        return [node]
+    if isinstance(node, list):
+        out = []
+        for item in node:
+            out.extend(_flatten(item))
+        return out
+    return []
+
+
+def filings_in(payload: dict) -> list[dict]:
+    """Find the list of returns wherever this provider decided to put it."""
+    for key in ("data", "result", "response", "gstr_filing"):
+        inner = payload.get(key)
+        if isinstance(inner, dict):
+            payload = {**payload, **inner}
+        elif isinstance(inner, list) and inner:
+            return _flatten(inner)
+    for key in FILING_LIST_KEYS:
+        if key in payload:
+            return _flatten(payload[key])
+    return []
+
+
+def _was_filed(entry: dict, filed_on) -> bool:
+    if filed_on is not None:
+        return True
+    return str(_field(entry, FILED_STATUS_FIELDS) or "").strip().lower() \
+        in FILED_WORDS
+
+
+def gstn_period(period: str) -> str:
+    """Our "2026-07" in the portal's MMYYYY."""
+    year, _, month = period.partition("-")
+    return f"{month}{year}"
+
+
+def as_gstn_payload(history: FilingHistory) -> dict:
+    """
+    A history in the shape the portal would have returned it.
+
+    Used by the simulator so that demo data goes over the same wire format and
+    through the same parser as a live GSP response. A return that was not filed
+    is emitted with a status word and no date, because that is what the portal
+    does - it does not omit the row, and the difference matters: an omitted row
+    means "not looked at" and a status row means "looked at, not filed".
+    """
+    entries = []
+    for month in history.months:
+        period = gstn_period(month.period)
+        for kind, filed in (("GSTR1", month.gstr1_filed),
+                            ("GSTR3B", month.gstr3b_filed)):
+            entry = {"rtntype": kind, "ret_prd": period}
+            if filed is not None:
+                entry["dof"] = filed.strftime("%d-%m-%Y")
+                entry["status"] = "Filed"
+            else:
+                entry["status"] = "Not Filed"
+            entries.append(entry)
+    return {"EFiledlist": entries}
+
+
+def from_gstn_payload(gstin: str, payload: dict, *,
+                      months: int = DEFAULT_MONTHS,
+                      source: str = SOURCE_API,
+                      registration_status: str = "active",
+                      suspensions: Optional[list[str]] = None) -> FilingHistory:
+    """
+    A GSTN-shaped response in our contract.
+
+    Registration status is a parameter rather than a field because the portal
+    does not put it here: it comes from the separate taxpayer-search call. The
+    simulator passes it for the same reason a live integration would - two
+    sources of truth, joined by the caller.
+    """
+    by_period: dict[str, dict] = {}
+
+    for entry in filings_in(payload or {}):
+        if not isinstance(entry, dict):
+            continue
+        period = normalise_period(_field(entry, PERIOD_FIELDS))
+        if period is None:
+            continue
+        kind = str(_field(entry, RETURN_TYPE_FIELDS) or "").upper()
+        kind = kind.replace("-", "").replace(" ", "")
+        if kind not in {"GSTR1", "GSTR3B"}:
+            continue
+
+        filed_on = normalise_date(_field(entry, FILED_ON_FIELDS))
+        if not _was_filed(entry, filed_on):
+            filed_on = None
+
+        slot = by_period.setdefault(
+            period, {"period": period, "gstr1_filed": None,
+                     "gstr3b_filed": None})
+        column = "gstr1_filed" if kind == "GSTR1" else "gstr3b_filed"
+        existing = slot[column]
+        # A period can be filed, then revised, and reported twice. The EARLIEST
+        # date decides whether it was late, so an amendment must not overwrite
+        # it and turn a punctual filer into a late one.
+        if filed_on is not None and (existing is None or filed_on < existing):
+            slot[column] = filed_on
+
+    history = from_filing_rows(
+        gstin, by_period.values(), source=source,
+        registration_status=registration_status, suspensions=suspensions)
+    if months and len(history.months) > months:
+        history.months = history.months[-months:]
+    return history

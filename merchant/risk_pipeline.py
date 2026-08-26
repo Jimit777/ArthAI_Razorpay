@@ -290,26 +290,35 @@ def run(imported: ImportResult, *, use_agent: bool = True,
 
 
 def history_service_for(led, business_id: str, *, months: int = 36,
-                        http=None) -> SupplierHistoryService:
+                        http=None) -> Optional[SupplierHistoryService]:
     """
-    Which of the three sources this business actually has, resolved once.
+    Which source this business's runs read from - or None, meaning refuse.
 
-    Evidence first: a configured API beats an uploaded file beats the
-    simulator, because that is the order of how current the data is. The
-    fallback is silent in the code and extremely loud in the UI - a merchant
-    must never have to wonder whether the numbers in front of them came from
-    their suppliers or from a persona generator.
+    The DATA SOURCE decides first, and that is the important part. A business
+    connected to the simulator gets simulated history even if a GSP key happens
+    to be sitting in its settings; a business on live data never gets simulated
+    history at all. Otherwise the screen a merchant is looking at and the data
+    behind their numbers could disagree, which is the one thing a provenance
+    label exists to prevent.
 
-    A configured API whose key cannot be decrypted is skipped rather than
-    called without one. Sending unauthenticated requests at a paid endpoint on
-    a merchant's behalf is not a graceful degradation.
+    Returning None is a real answer, not a failure: live data, no API, and no
+    uploaded history means there is no honest way to score their suppliers.
+    Falling back to the simulator there would put generated filing records
+    against real companies' names and call the result a risk assessment. The
+    caller refuses and says what is missing.
     """
     from engine.gst.filing_history import (SimulatedHistoryProvider,
                                            UploadedHistoryProvider)
     from merchant.gstin_lookup import FilingStatusApi
-    from merchant.sources import Sources
+    from merchant.sources import SourceKind, Sources
 
-    config = Sources(led.conn).filing_api_config(business_id)
+    sources = Sources(led.conn)
+    kind = sources.kind(business_id)
+
+    if kind is None or kind == SourceKind.SIMULATOR:
+        return SupplierHistoryService(SimulatedHistoryProvider(), months=months)
+
+    config = sources.filing_api_config(business_id)
     if config and config["key_available"]:
         return SupplierHistoryService(
             FilingStatusApi(url_template=config["url_template"],
@@ -323,4 +332,12 @@ def history_service_for(led, business_id: str, *, months: int = 36,
         return SupplierHistoryService(
             UploadedHistoryProvider(held), months=months)
 
-    return SupplierHistoryService(SimulatedHistoryProvider(), months=months)
+    return None
+
+
+NO_HISTORY = (
+    "This business is on live data, has no GST API configured, and no supplier "
+    "filing history has been uploaded. There is no honest way to score real "
+    "suppliers without one of those - generated filing records against real "
+    "companies would not be a risk assessment. Upload your suppliers' filing "
+    "history, or connect a GST API in Setup.")
