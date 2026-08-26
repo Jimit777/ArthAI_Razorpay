@@ -426,12 +426,24 @@ def test_the_request_shape_is_accepted_by_the_real_sdk(audited, open_variances):
 
     A real Anthropic client, pointed at a dead port. Every keyword argument is
     validated by the SDK before a socket is opened, so a misspelled parameter
-    or a shape the SDK does not accept raises TypeError here rather than in
-    front of a judge. What reaches the transport instead is a connection error,
-    which exercises the escalate-on-failure path with a genuine client.
+    or a shape the SDK does not accept fails there rather than in front of a
+    judge. What reaches the transport instead is a connection error, which
+    exercises the escalate-on-failure path with a genuine client.
 
     This is the test that catches SDK drift - the day a parameter is renamed,
     this goes red.
+
+    ## How the drift signal survived the failure handling being widened
+
+    The classifier now catches every exception rather than only the two API
+    ones, because a missing key raises TypeError at request time and used to
+    take a whole run down with it. That means drift no longer RAISES out of
+    here - it lands on `verdict.error` instead.
+
+    So the assertion is on what that error says. A healthy SDK gives
+    APIConnectionError from the dead port; a renamed parameter gives TypeError,
+    and the assertion below goes red exactly as before. Broadening the catch
+    made the product survive a missing key without costing this test its job.
     """
     import anthropic
 
@@ -442,7 +454,10 @@ def test_the_request_shape_is_accepted_by_the_real_sdk(audited, open_variances):
 
     assert verdict.exception_code == ExceptionCode.UNEXPLAINED
     assert verdict.action == Action.ESCALATE
-    assert "connection failed" in (verdict.error or "")
+    assert "APIConnectionError" in (verdict.error or "")
+    # The drift tripwire: anything the SDK rejected before opening a socket
+    # arrives as a TypeError, and the request never got as far as the port.
+    assert "TypeError" not in (verdict.error or "")
 
 
 def test_a_tool_name_in_evidence_used_is_not_treated_as_fabricated(open_variances):

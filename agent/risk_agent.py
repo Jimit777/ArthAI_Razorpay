@@ -39,6 +39,7 @@ from typing import Callable, Literal, Optional
 from pydantic import BaseModel, Field
 
 from engine.gst import rules
+from agent import failures
 from engine.gst.risk import PATTERN_LABEL, RiskProfile
 
 MODEL = "claude-opus-5"
@@ -344,19 +345,40 @@ class ClaudeRiskAgent:
                  effort: str = DEFAULT_EFFORT, max_workers: int = MAX_WORKERS):
         import anthropic
 
-        self._client = client if client is not None else anthropic.Anthropic()
         self._model = model
         self._effort = effort
         self._max_workers = max_workers
+        # A missing key used to raise out of the SDK constructor and take the
+        # whole run down - which turned "you have not set an env var" into
+        # "the analysis crashes", for anyone who cloned the repo and pressed
+        # the button. The agent is an addition to a complete answer, never a
+        # precondition for one, so failing to build it must degrade the run
+        # rather than end it.
+        self._unavailable: Optional[str] = None
+        if client is not None:
+            self._client = client
+            return
+        try:
+            self._client = anthropic.Anthropic()
+        except Exception as exc:                            # noqa: BLE001
+            self._client = None
+            self._unavailable = str(exc)
+
+    # Set once a fatal error is seen, so the remaining suppliers are not each
+    # given their own doomed round trip. Fifty identical failures cost no
+    # tokens and a minute of somebody's attention.
+    _fatal: Optional[str] = None
 
     def judge(self, profile: RiskProfile, supplier_name: str,
               exposure_paise: int, at_risk_paise: int,
               recent_rows: list[dict]) -> RiskVerdict:
-        import anthropic
-
         evidence = render(profile, supplier_name, exposure_paise,
                           at_risk_paise, recent_rows)
         started = time.monotonic()
+
+        blocked = self._unavailable or self._fatal
+        if blocked:
+            return self._failed(profile, supplier_name, blocked, started)
 
         try:
             runner = self._client.beta.messages.tool_runner(
@@ -372,9 +394,19 @@ class ClaudeRiskAgent:
                 cache_control={"type": "ephemeral"},
             )
             response = runner.until_done()
-        except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
-            return self._failed(profile, supplier_name,
-                                f"{type(exc).__name__}: {exc}", started)
+        except Exception as exc:                            # noqa: BLE001
+            # Deliberately broad. The contract this class offers is that a
+            # failed judgment degrades to the arithmetic, and that has to hold
+            # for every way a call can fail - not only the two the SDK
+            # documents. A missing key, for instance, surfaces as a TypeError
+            # raised at REQUEST time rather than when the client is built, and
+            # catching only API errors let it escape and take down a run that
+            # had every score already computed.
+            message = f"{type(exc).__name__}: {exc}"
+            if failures.is_fatal(message):
+                # Every remaining supplier fails identically, so stop asking.
+                self._fatal = message
+            return self._failed(profile, supplier_name, message, started)
 
         parsed = getattr(response, "parsed_output", None)
         if parsed is None:
@@ -423,11 +455,15 @@ class ClaudeRiskAgent:
             pattern=profile.pattern,
             action=_recommended(profile),
             headline=f"{supplier_name}: scored from their record only",
+            # The raw exception used to land here, so a merchant read a Python
+            # traceback with a JSON blob in it and concluded the tool was
+            # broken - while every figure on the row beside it was correct.
+            # The exception is still carried, on `error`, for whoever is
+            # actually debugging.
             reasoning=(f"Their filing record reads as "
                        f"{PATTERN_LABEL.get(profile.pattern, profile.pattern)} "
-                       f"and scores {profile.trust_score}/100. The agent could "
-                       f"not be reached ({message}), so this row is the "
-                       f"arithmetic without the judgment on top."),
+                       f"and scores {profile.trust_score}/100. "
+                       f"{failures.explain(message)}"),
             model=self._model,
             latency_ms=int((time.monotonic() - started) * 1000),
             error=message)

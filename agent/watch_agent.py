@@ -278,8 +278,6 @@ class ClaudeWatchAgent:
 
     def judge(self, change: Change,
               on_event: Optional[Callable[[str, str], None]] = None) -> Raised:
-        import anthropic
-
         evidence = render_change(change)
         started = time.monotonic()
         if on_event:
@@ -302,7 +300,13 @@ class ClaudeWatchAgent:
                 cache_control={"type": "ephemeral"},
             )
             response = runner.until_done()
-        except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+        except Exception as exc:                            # noqa: BLE001
+            # Broad on purpose: the contract is that a failed judgment falls
+            # back to the arithmetic, and that must hold for every way a call
+            # can fail. A missing API key surfaces as a TypeError raised at
+            # REQUEST time, not when the client is built, so catching only API
+            # errors let it escape and crash a run whose figures were already
+            # computed.
             return self._failed(change, f"{type(exc).__name__}: {exc}", started)
 
         parsed = getattr(response, "parsed_output", None)

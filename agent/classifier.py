@@ -351,8 +351,6 @@ class ClaudeClassifier:
         calls only once the whole thing returns leaves a watcher staring at a
         still screen for the entire time the interesting part is happening.
         """
-        import anthropic
-
         def report(kind: str, detail: str = "") -> None:
             if on_event is not None:
                 on_event(kind, detail)
@@ -405,10 +403,14 @@ class ClaudeClassifier:
                     totals["cache_read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
             final = runner.until_done()
 
-        except anthropic.APIStatusError as exc:
+        except Exception as exc:                            # noqa: BLE001
+            # Broad on purpose: the contract is that a failed judgment falls
+            # back to the arithmetic, and that must hold for every way a call
+            # can fail. A missing API key surfaces as a TypeError raised at
+            # REQUEST time, not when the client is built, so catching only API
+            # errors let it escape and crash a run whose figures were already
+            # computed.
             return self._failed(variance, f"{type(exc).__name__}: {exc}", started)
-        except anthropic.APIConnectionError as exc:
-            return self._failed(variance, f"connection failed: {exc}", started)
 
         parsed = final.parsed_output
         if parsed is None:
