@@ -300,6 +300,14 @@ def test_a_csv_history_still_reads_as_fully_visible(tmp_path):
     led.replace_filing_history(
         parse_filing_history(sample_filing_history().encode(), "h.csv"))
 
-    for history in led.filing_history().values():
+    seen = led.filing_history().values()
+    assert seen
+    for history in seen:
+        # Every period carries a payment answer - which is the claim being
+        # tested. Whether there are ENOUGH of them to form a view is a
+        # separate question, and a newly registered supplier legitimately
+        # fails it.
         assert all(m.gstr3b_known for m in history.months)
-        assert profile(history).payment_history_known
+        prof = profile(history)
+        assert prof.gstr3b_known_periods == prof.periods
+    assert any(profile(h).payment_history_known for h in seen)

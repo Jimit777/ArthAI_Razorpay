@@ -258,21 +258,63 @@ def parse(data: bytes, filename: str) -> ImportResult:
 
 # --- a register somebody can actually try -----------------------------------
 #
-# Chosen rather than random. The personas in filing_history are weighted the
-# way suppliers really are - about one in ten defaults - so a demo drawing
-# fifteen suppliers at random has a one-in-six chance of containing nothing
-# worth looking at. These GSTINs are picked because their generated history
-# lands on one of each, so the feature can be tried in one click.
+# Composed rather than drawn at random, and larger than it needs to be to
+# prove the arithmetic works.
+#
+# The personas in filing_history are weighted the way suppliers really are -
+# about one in ten defaults - so a demo of six suppliers can easily contain
+# nothing worth looking at, and did: an earlier version showed four clean
+# suppliers and one late filer, which demonstrates a working table and not a
+# working product. Twenty-two suppliers with a deliberate spread means every
+# pattern the engine can find is on the first screen:
+#
+#     9  file everything on time            CLEAN_HISTORY
+#     5  file late but always file          HABITUAL_LATE_FILER
+#     3  report sales and never pay         GSTR3B_DEFAULTER
+#     3  no pattern at all                  ERRATIC
+#     2  registered too recently to judge   TOO_LITTLE_HISTORY
+#
+# The GSTINs are real in shape and their generated history lands on the
+# persona named above, because history_for seeds on the GSTIN. Changing one
+# character changes that supplier's entire record, so they are fixed here
+# rather than generated per run.
+#
+# The names are ordinary Indian trade names from the sectors a textile
+# merchant in Maharashtra would actually buy from, and the state codes are
+# the real ones - so the CGST/SGST versus IGST split is genuine rather than
+# arbitrary, and an inter-state supply looks like one.
 SAMPLE_REGISTER = """\
 Party Name,GSTIN of Supplier,Invoice No,Invoice Date,Taxable Value,CGST,SGST,IGST
-Anand Textiles,24FJAMH3956X5ZJ,ANA/2041,2026-08-04,240000,0,0,43200
-Anand Textiles,24FJAMH3956X5ZJ,ANA/2088,2026-08-19,180000,0,0,32400
-Kaveri Silk Mills,27GQRIR1135W5ZQ,KAV/774,2026-08-06,150000,13500,13500,0
-Deepak Packaging,29NYOZN7564Z9ZV,DEE/1190,2026-08-02,400000,0,0,72000
-Deepak Packaging,29NYOZN7564Z9ZV,DEE/1204,2026-08-21,260000,0,0,46800
-Bright Print House,24IARVY9763E8ZD,BRI/318,2026-08-11,60000,0,0,10800
-Coimbatore Yarns,27XJGQI1052H7ZR,COI/905,2026-08-14,180000,16200,16200,0
-Nashik Logistics,27VLBAN4982B2ZX,NAS/66,2026-08-17,45000,4050,4050,0
+Deepak Packaging,24RWIZN6453L6ZT,DEE/1470,2026-08-10,400000,0,0,72000
+Deepak Packaging,24RWIZN6453L6ZT,DEE/5254,2026-08-18,400000,0,0,72000
+Bright Print House,27OENNZ1701S7ZP,BRI/3836,2026-08-05,260000,23400,23400,0
+Surat Fabrics,24TRQGP7249B1ZD,SUR/3492,2026-08-11,45000,0,0,8100
+Pune Threads,27BBHQB9848A8ZC,PUN/9338,2026-08-03,84000,7560,7560,0
+Pune Threads,27BBHQB9848A8ZC,PUN/196,2026-08-03,120000,10800,10800,0
+Ludhiana Wool,06MTMYP0271S9ZJ,LUD/9628,2026-08-20,120000,0,0,21600
+Erode Dyeing,33EKEQC2642X7ZO,ERO/5527,2026-08-08,84000,0,0,15120
+Salem Weaves,33TOSGH7225K8ZC,SAL/1695,2026-08-03,400000,0,0,72000
+Salem Weaves,33TOSGH7225K8ZC,SAL/896,2026-08-22,240000,0,0,43200
+Karur Textiles,33OBCMX5225H5ZB,KAR/7016,2026-08-05,150000,0,0,27000
+Noida Electronics,09PADDP4378A9ZX,NOI/9366,2026-08-02,400000,0,0,72000
+Kaveri Silk Mills,29PEFVE7643H2ZZ,KAV/8780,2026-08-03,45000,0,0,8100
+Kaveri Silk Mills,29PEFVE7643H2ZZ,KAV/975,2026-08-05,240000,0,0,43200
+Nashik Logistics,27WXGGN9582G3ZM,NAS/3409,2026-08-18,84000,7560,7560,0
+Tirupur Knits,33OEUMR8101E9ZB,TIR/1632,2026-08-19,400000,0,0,72000
+Panipat Home Furnishing,06ISEQT9952A3ZH,PAN/9166,2026-08-15,150000,0,0,27000
+Panipat Home Furnishing,06ISEQT9952A3ZH,PAN/1177,2026-08-18,120000,0,0,21600
+Rajkot Machine Tools,24GSTKO3920D3ZE,RAJ/6751,2026-08-09,45000,0,0,8100
+Anand Textiles,27GQRIR1135W5ZQ,ANA/5280,2026-08-26,320000,28800,28800,0
+Bhilwara Suiting,08LBMTG4381T4ZM,BHI/8486,2026-08-25,180000,0,0,32400
+Bhilwara Suiting,08LBMTG4381T4ZM,BHI/2955,2026-08-03,240000,0,0,43200
+Kanpur Leather,09IFEBG8410K5ZS,KAN/8640,2026-08-10,60000,0,0,10800
+Jaipur Blocks,08SHPUA3119N2ZY,JAI/8321,2026-08-18,120000,0,0,21600
+Aligarh Locks,09NVMIU3344T3ZY,ALI/2733,2026-08-17,150000,0,0,27000
+Aligarh Locks,09NVMIU3344T3ZY,ALI/9875,2026-08-16,260000,0,0,46800
+Kochi Marine Exports,32QUTXK8026L6ZQ,KOC/6352,2026-08-14,260000,0,0,46800
+Coimbatore Yarns,33QJAEU7258T1ZT,COI/439,2026-08-04,45000,0,0,8100
+Bhadohi Carpets,09GSLOD6294R2ZF,BHA/6388,2026-08-20,320000,0,0,57600
+Bhadohi Carpets,09GSLOD6294R2ZF,BHA/1600,2026-08-26,240000,0,0,43200
 """
 
 

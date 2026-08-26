@@ -124,7 +124,12 @@ def test_the_clocks_are_computed_before_the_page_is_built():
                   use_agent=False).as_dict()
     for supplier in payload["suppliers"]:
         assert supplier["clocks"]["invoices"]
-        assert len(supplier["compliance_grid"]) == 36
+        # As long as their own record, not a fixed 36 - a recently
+        # registered supplier has fewer months, and padding them out
+        # would draw months they did not exist in as months in which
+        # they filed nothing.
+        assert supplier["compliance_grid"]
+        assert len(supplier["compliance_grid"]) <= 36
 
 
 # --- the documents --------------------------------------------------------
@@ -306,7 +311,14 @@ def test_each_drawer_carries_a_full_grid(shop):
     page = shop.get(f"/agents/input-credit?key={key}").text
     suppliers = len(state["payload"]["suppliers"])
     cells = re.findall(r'<i class="g-[a-z_]+" title=', page)
-    assert len(cells) == 36 * suppliers
+    # One cell per period the supplier actually has. Not 36 x suppliers: a
+    # recently registered supplier has a short record, and padding it out
+    # with blanks would draw months in which they did not exist as months in
+    # which they filed nothing.
+    expected = sum(len(s["compliance_grid"])
+                   for s in state["payload"]["suppliers"])
+    assert len(cells) == expected
+    assert expected > 0
     assert page.count('<div class="grid36">') == suppliers
 
 
@@ -435,7 +447,12 @@ def test_the_drawer_renders_the_same_from_an_uploaded_history(shop):
     assert "Do not act on these against a real supplier" not in page
 
     for supplier in state["payload"]["suppliers"]:
-        assert len(supplier["compliance_grid"]) == 36
+        # As long as their own record, not a fixed 36 - a recently
+        # registered supplier has fewer months, and padding them out
+        # would draw months they did not exist in as months in which
+        # they filed nothing.
+        assert supplier["compliance_grid"]
+        assert len(supplier["compliance_grid"]) <= 36
         assert supplier["clocks"]["invoices"]
 
     gstin = state["payload"]["suppliers"][0]["gstin"]

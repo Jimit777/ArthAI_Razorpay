@@ -1621,7 +1621,18 @@ def _run_risk(key: str, business_id: str, data: bytes, filename: str,
             # here and once on another screen - would be two chances for a
             # merchant's register to mean two different things.
             with ledger(business_id) as led:
-                led.replace_purchase_register(imported)
+                # The demo also generates the supplier side - what each of
+                # them reported to the government about these same invoices -
+                # because that is the half the reconciliation compares
+                # against. Without it every invoice came back
+                # "absent from GSTR-2B" and the discrepancies the engine can
+                # actually tell apart never appeared.
+                #
+                # A real upload never gets this: the merchant's own GSTR-2B is
+                # the evidence, and manufacturing it would be inventing the
+                # thing being checked.
+                led.replace_purchase_register(imported,
+                                              simulate_filing=simulated)
         if not imported.ok:
             raise ValueError(
                 "No supplier rows could be read. "
@@ -2361,6 +2372,15 @@ async def run_demo_analysis(request: Request,
             target=key, detail="ran a supplier risk analysis on demo data")
 
     from merchant.purchase_import import SAMPLE_REGISTER
+    from merchant.suppliers import SupplierBehaviour
+
+    # Every behaviour on, so the demo shows every finding the reconciler can
+    # make. The switch on Data & integrations governs invoices a person
+    # records by hand; a demo whose whole job is demonstration should not be
+    # able to launch showing nothing.
+    with ledger(ws.business_id) as led:
+        led.businesses.set_supplier_behaviour(
+            ws.business_id, [str(b) for b in SupplierBehaviour])
 
     threading.Thread(
         target=_run_risk,

@@ -780,11 +780,20 @@ def _three_services():
     uploaded = parse_filing_history(
         filing_history_csv(simulated.values()).encode(), "history.csv")
 
+    # Registration status is joined on for every source, because it is a
+    # separate lookup in reality - the portal answers "what did they file" and
+    # "is this registration alive" with two different calls, and a returns
+    # feed carries only the first. A Mode A integration makes both; so does
+    # history_service_for; so does this.
+    statuses = {g: h.registration_status for g, h in simulated.items()}
+
     return imported, {
-        "api": SupplierHistoryService(_api_serving(simulated)),
+        "api": SupplierHistoryService(_api_serving(simulated),
+                                      statuses=statuses),
         "file": SupplierHistoryService(
-            UploadedHistoryProvider(uploaded.histories)),
-        "simulated": SupplierHistoryService(SimulatedHistoryProvider()),
+            UploadedHistoryProvider(uploaded.histories), statuses=statuses),
+        "simulated": SupplierHistoryService(SimulatedHistoryProvider(),
+                                            statuses=statuses),
     }
 
 
@@ -853,7 +862,10 @@ def test_the_grid_and_the_clocks_are_built_the_same_way_in_every_mode():
     for service in services.values():
         payload = run(imported, use_agent=False, history=service).as_dict()
         for supplier in payload["suppliers"]:
-            assert len(supplier["compliance_grid"]) == DEFAULT_MONTHS
+            # Length follows the supplier's own record - see the grid test in
+            # test_supplier_drawer for why it is not a fixed 36.
+            assert supplier["compliance_grid"]
+            assert len(supplier["compliance_grid"]) <= DEFAULT_MONTHS
             assert supplier["clocks"]["invoices"]
             assert supplier["clocks"]["window_days"] == 180
 
@@ -1260,8 +1272,11 @@ def test_demo_mode_generates_both_halves_and_scores_them(shop):
     payload = state["payload"]
     assert payload["portfolio"]["history_source"] == "simulated"
     assert payload["portfolio"]["history_is_demo"] is True
-    assert len(payload["suppliers"]) == 6
-    assert all(len(s["compliance_grid"]) == 36 for s in payload["suppliers"])
+    from merchant.purchase_import import parse
+
+    expected = len(parse(SAMPLE_REGISTER.encode(), "r.csv").groups)
+    assert len(payload["suppliers"]) == expected
+    assert all(s["compliance_grid"] for s in payload["suppliers"])
 
 
 def test_without_api_joins_the_register_to_the_uploaded_history(shop):
@@ -1436,3 +1451,92 @@ def test_live_data_is_badged_live_once_a_real_register_is_in(biz):
     page = biz.get("/agents/input-credit").text
     assert "Live data" in page
     assert "Demo data" not in page
+
+
+# --- the demo has to demonstrate ------------------------------------------
+#
+# Both of these pin a defect that shipped. The register was six suppliers and
+# the personas are weighted the way real ones are - about one in ten defaults -
+# so the demo showed four clean suppliers and one late filer: a working table,
+# and no evidence the product does anything. And the demo stored purchases
+# with no GSTR-2B at all, so every invoice reconciled as "absent from GSTR-2B"
+# and the four discrepancies the engine can actually tell apart never appeared.
+#
+# A demo that can only produce one finding demonstrates almost nothing, so the
+# coverage is asserted rather than left to the weighting.
+
+def test_the_demo_register_covers_every_risk_pattern():
+    from collections import Counter
+
+    from engine.gst.filing_history import history_for
+    from engine.gst.risk import (PATTERN_CLEAN, PATTERN_DEFAULTER,
+                                 PATTERN_ERRATIC, PATTERN_LATE, PATTERN_THIN)
+    from merchant.purchase_import import parse
+
+    groups = parse(SAMPLE_REGISTER.encode(), "r.csv").groups
+    assert len(groups) >= 20, "a demo this small can contain nothing to find"
+
+    found = Counter(profile(history_for(g.supplier_gstin)).pattern
+                    for g in groups)
+    for pattern in (PATTERN_CLEAN, PATTERN_LATE, PATTERN_DEFAULTER,
+                    PATTERN_ERRATIC, PATTERN_THIN):
+        assert found[pattern] >= 1, f"{pattern} never appears: {found}"
+
+    # And most suppliers are fine, because most suppliers are fine. A demo
+    # where everybody is a defaulter is as useless as one where nobody is.
+    assert found[PATTERN_CLEAN] > found[PATTERN_DEFAULTER]
+
+
+def test_the_demo_run_covers_every_reconciliation_discrepancy(shop):
+    """
+    The half that was missing entirely.
+
+    The demo must generate what the suppliers reported as well as what the
+    merchant bought, because the gap between those two IS the reconciliation.
+    Without it every invoice came back absent_from_2b.
+    """
+    from collections import Counter
+
+    import merchant.app as appmod
+    from engine.gst.detector import detect_batch
+
+    key = shop.post("/agents/input-credit/demo", data={"use_agent": "no"},
+                    follow_redirects=False
+                    ).headers["location"].split("key=")[-1]
+    assert _finish(shop, key)["state"] == "done"
+
+    with appmod.ledger(None) as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM live_gstr2b").fetchone()["n"] > 0
+        variances = detect_batch(led.build_itc_batch())
+
+    found = Counter(v.signals[0].kind if v.signals else "CLEAN"
+                    for v in variances)
+    for kind in ("matched_exactly", "absent_from_2b",
+                 "absent_but_similar_elsewhere", "tax_short_in_2b",
+                 "filed_in_later_period"):
+        assert found[kind] >= 1, f"{kind} never appears: {dict(found)}"
+
+
+def test_a_real_upload_never_gets_a_generated_gstr2b(shop):
+    """
+    The line the demo must not cross.
+
+    For a real register the other half has to be the merchant's own GSTR-2B.
+    Manufacturing it would be inventing the evidence the product exists to
+    check against - a reconciliation that always balances because both sides
+    came from the same generator.
+    """
+    import merchant.app as appmod
+
+    shop.post("/agents/input-credit/history",
+              files={"history": ("h.csv", sample_filing_history().encode(),
+                                 "text/csv")})
+    state = _register_run(shop)
+    assert state["state"] == "done", state
+
+    with appmod.ledger(None) as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM live_gstr2b").fetchone()["n"] == 0

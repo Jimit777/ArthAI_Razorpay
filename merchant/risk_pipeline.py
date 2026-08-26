@@ -314,11 +314,22 @@ def history_service_for(led, business_id: str, *, months: int = 36,
     """
     from engine.gst.filing_history import (SimulatedHistoryProvider,
                                            UploadedHistoryProvider)
-    from merchant.gstin_lookup import FilingStatusApi
+    from merchant.gstin_lookup import FilingStatusApi, GstinStatus
     from merchant.sources import Sources
 
+    # Registration status is a separate question from filing history and comes
+    # from a separate lookup, so it is joined on for every source rather than
+    # left to whichever one happens to carry it. Without this a Mode A run
+    # reported every supplier as "active", because a returns feed has nothing
+    # else to say - and a cancelled registration is the one finding that
+    # outranks all the others.
+    statuses = {gstin: row["status"] for gstin, row
+                in GstinStatus(led.conn).statuses_for(
+                    _register_gstins(led)).items()}
+
     if simulated:
-        return SupplierHistoryService(SimulatedHistoryProvider(), months=months)
+        return SupplierHistoryService(SimulatedHistoryProvider(),
+                                      months=months, statuses=statuses)
 
     config = Sources(led.conn).filing_api_config(business_id)
     if config and config["key_available"]:
@@ -327,14 +338,24 @@ def history_service_for(led, business_id: str, *, months: int = 36,
                             api_key=config["api_key"],
                             key_header=config["key_header"],
                             key_param=config["key_param"], http=http),
-            months=months)
+            months=months, statuses=statuses)
 
     held = led.filing_history()
     if held:
         return SupplierHistoryService(
-            UploadedHistoryProvider(held), months=months)
+            UploadedHistoryProvider(held), months=months, statuses=statuses)
 
     return None
+
+
+def _register_gstins(led) -> list:
+    """Every supplier GSTIN this business has bought from."""
+    try:
+        return [r["supplier_gstin"] for r in led.conn.execute(
+            "SELECT DISTINCT supplier_gstin FROM live_purchases"
+            " WHERE business_id = ?", (led.business_id,))]
+    except Exception:                                       # noqa: BLE001
+        return []
 
 
 NO_HISTORY = (

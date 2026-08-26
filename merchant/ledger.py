@@ -629,7 +629,28 @@ class Ledger:
         self.conn.commit()
         return purchase_id
 
-    def replace_purchase_register(self, imported) -> dict:
+    def _simulated_behaviour(self, business_id: str, group):
+        """
+        How this supplier files, for a demo register.
+
+        Rotates through whichever behaviours the simulator has switched on,
+        keyed on the supplier's position in the register so the spread is even
+        and the same register always tells the same story. Deterministic on
+        purpose - a demo whose findings changed on every click would be worse
+        than one with a single finding.
+        """
+        from merchant.suppliers import next_behaviour, parse_behaviours
+
+        chosen = self.businesses.supplier_behaviour(business_id)
+        options = parse_behaviours(chosen)
+        if len(options) == 1:
+            return options[0]
+        seat = getattr(self, "_demo_seat", 0)
+        self._demo_seat = seat + 1
+        return next_behaviour(chosen, seat)
+
+    def replace_purchase_register(self, imported, simulate_filing: bool = False
+                                  ) -> dict:
         """
         Store an uploaded register, replacing whatever was held before.
 
@@ -637,8 +658,27 @@ class Ledger:
         period's purchases, and a merchant who uploads a corrected export
         expects it to correct things rather than double them. Anything already
         reconciled keeps its run id so the findings still point at real rows.
+
+        ## simulate_filing, and why it is off by default
+
+        A purchase register is only half the reconciliation. The other half is
+        GSTR-2B - what the suppliers reported about the same invoices - and
+        the gap between them is the entire finding.
+
+        For a real upload that half must come from the merchant's own GSTR-2B,
+        and manufacturing it here would be inventing the evidence the product
+        exists to check against. So this defaults to off.
+
+        For the DEMO it has to be on, and its absence was a real defect: the
+        demo stored purchases and no GSTR-2B at all, so every invoice
+        reconciled as absent_from_2b and the four discrepancies the engine can
+        actually tell apart - a wrong GSTIN, a short-reported tax, a late
+        filing, a clean match - never appeared. A demo that can only produce
+        one finding demonstrates almost nothing.
         """
         import time
+
+        from merchant.suppliers import current_period, file_invoice
 
         business_id = self._scoped()
         removed = self.conn.execute(
@@ -655,6 +695,40 @@ class Ledger:
                     invoice.invoice_number, invoice.invoice_date,
                     invoice.taxable_value, invoice.cgst, invoice.sgst,
                     invoice.igst, None, None, "imported", now))
+
+        if simulate_filing:
+            self.conn.execute(
+                "DELETE FROM live_gstr2b WHERE business_id = ?", (business_id,))
+            filed_rows = []
+            for group in imported.groups:
+                # One behaviour per supplier, from whichever ones the simulator
+                # has switched on. Per supplier rather than per invoice for the
+                # same reason record_purchase does it: a supplier who misfiles
+                # to another state does it every time, and that consistency is
+                # what makes a cross-GSTIN search find them.
+                behaviour = self._simulated_behaviour(business_id, group)
+                for invoice in group.invoices:
+                    when = _as_date(invoice.invoice_date)
+                    filed = file_invoice(
+                        supplier_gstin=group.supplier_gstin,
+                        invoice_number=invoice.invoice_number,
+                        invoice_date=when,
+                        taxable_value=invoice.taxable_value,
+                        cgst=invoice.cgst, sgst=invoice.sgst, igst=invoice.igst,
+                        period=current_period(when), behaviour=behaviour)
+                    if filed is None:
+                        continue
+                    filed_rows.append((
+                        f"2b_{secrets.token_hex(6)}", business_id,
+                        filed["supplier_gstin"], filed["invoice_number"],
+                        str(filed["invoice_date"]), filed["taxable_value"],
+                        filed["cgst"], filed["sgst"], filed["igst"],
+                        filed["filed_period"], now))
+            self.conn.executemany(
+                "INSERT INTO live_gstr2b (entry_id, business_id,"
+                " supplier_gstin, invoice_number, invoice_date, taxable_value,"
+                " cgst, sgst, igst, filed_period, recorded_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)", filed_rows)
 
         self.conn.executemany(
             "INSERT INTO live_purchases (purchase_id, business_id,"
@@ -1107,3 +1181,13 @@ class Ledger:
                        "SELECT * FROM bank_credits WHERE run_id = ?", (run_id,))]
         return Batch(records=records, bank_credits=credits, seed=0,
                      rate_card=rate_card)
+
+
+def _as_date(text):
+    """An invoice date from a register row, as a date."""
+    from datetime import date as _date
+
+    try:
+        return _date.fromisoformat(str(text)[:10])
+    except (TypeError, ValueError):
+        return _date.today()

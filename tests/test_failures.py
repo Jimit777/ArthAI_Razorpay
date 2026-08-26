@@ -113,8 +113,9 @@ def test_a_run_with_no_api_key_completes_instead_of_crashing(monkeypatch):
                     history=SupplierHistoryService(SimulatedHistoryProvider()))
     payload = portfolio.as_dict()
 
-    assert payload["portfolio"]["suppliers"] == 6
-    assert payload["portfolio"]["failed_calls"] == 6
+    expected = len(imported.groups)
+    assert payload["portfolio"]["suppliers"] == expected
+    assert payload["portfolio"]["failed_calls"] == expected
     assert payload["portfolio"]["usage"]["usd"] == 0
 
     for supplier in payload["suppliers"]:
@@ -122,7 +123,10 @@ def test_a_run_with_no_api_key_completes_instead_of_crashing(monkeypatch):
         assert supplier["trust_score"] > 0
         assert supplier["pattern"]
         assert supplier["action"]
-        assert len(supplier["compliance_grid"]) == 36
+        # A supplier registered recently genuinely has fewer months. The grid
+        # is their record, not a fixed-size box padded out with blanks.
+        assert supplier["compliance_grid"]
+        assert len(supplier["compliance_grid"]) <= 36
         # And the explanation says why it is missing, in English.
         assert "No ANTHROPIC_API_KEY is set" in supplier["reasoning"]
         assert "TypeError" not in supplier["reasoning"]

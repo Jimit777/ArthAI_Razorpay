@@ -130,6 +130,12 @@ class Persona(StrEnum):
     LATE = "habitual_late_filer"
     DEFAULTER = "gstr3b_defaulter"
     ERRATIC = "erratic"
+    # Registered recently, so there is barely any record to read. Not a
+    # behaviour at all - a supplier who has done nothing wrong and nothing
+    # long enough to prove anything. The only honest way to reach
+    # TOO_LITTLE_HISTORY, which otherwise never appears because every other
+    # persona fills all thirty-six months.
+    NEW = "new_registration"
 
 
 PERSONA_LABEL = {
@@ -137,7 +143,13 @@ PERSONA_LABEL = {
     Persona.LATE: "Files late, but always files",
     Persona.DEFAULTER: "Reports sales, does not pay the tax",
     Persona.ERRATIC: "Sometimes on time, sometimes not at all",
+    Persona.NEW: "Registered recently - too little record to judge",
 }
+
+# How many periods a newly registered supplier has been filing for. Below the
+# six the scoring needs, deliberately: the point of this persona is a supplier
+# nobody can yet form a view about.
+NEW_REGISTRATION_MONTHS = (2, 5)
 
 PERSONA_NOTE = {
     Persona.HONEST:
@@ -152,6 +164,10 @@ PERSONA_NOTE = {
         "does not exist.",
     Persona.ERRATIC:
         "No pattern. Some months clean, some months nothing at all.",
+    Persona.NEW:
+        "Nothing against them and nothing for them. A merchant extending "
+        "credit to a supplier this new is taking a position on a company "
+        "with no track record, and should know that is what they are doing.",
 }
 
 
@@ -271,6 +287,14 @@ def history_for(gstin: str, *, months: int = DEFAULT_MONTHS,
     rng = random.Random(f"filing:{gstin.strip().upper()}")
     persona = persona or _persona_for(rng)
     ending = ending or date.today()
+
+    if persona is Persona.NEW:
+        # A supplier registered four months ago has four months of history,
+        # not thirty-six with the first thirty-two blank. Blank periods would
+        # read as silence - a supplier who filed nothing - and that is a
+        # different and much worse thing than not having existed yet.
+        months = rng.randint(*NEW_REGISTRATION_MONTHS)
+
     start = _months_before(ending, months)
 
     out = FilingHistory(gstin=gstin.strip().upper(), persona=str(persona),
@@ -292,8 +316,9 @@ def history_for(gstin: str, *, months: int = DEFAULT_MONTHS,
 def _persona_for(rng: random.Random) -> Persona:
     """Most suppliers are fine. The interesting ones are the minority."""
     return rng.choices(
-        [Persona.HONEST, Persona.LATE, Persona.DEFAULTER, Persona.ERRATIC],
-        weights=[62, 22, 10, 6])[0]
+        [Persona.HONEST, Persona.LATE, Persona.DEFAULTER, Persona.ERRATIC,
+         Persona.NEW],
+        weights=[58, 21, 10, 6, 5])[0]
 
 
 def _month(persona: Persona, rng: random.Random, period: str,
@@ -316,6 +341,11 @@ def _month(persona: Persona, rng: random.Random, period: str,
             period, gstr1_due, gstr1_due + timedelta(days=rng.randint(0, 4)),
             gstr3b_due,
             gstr3b_due + timedelta(days=rng.randint(0, 30)) if paid else None)
+
+    if persona is Persona.NEW:
+        # Files properly - they have simply not been around long.
+        return MonthlyFiling(period, gstr1_due, gstr1_due - timedelta(days=1),
+                             gstr3b_due, gstr3b_due - timedelta(days=1))
 
     roll = rng.random()
     if roll < 0.45:
@@ -602,9 +632,23 @@ class SupplierHistoryService:
     """
 
     def __init__(self, provider: Optional[HistoryProvider] = None, *,
-                 months: int = DEFAULT_MONTHS):
+                 months: int = DEFAULT_MONTHS,
+                 statuses: Optional[dict] = None):
         self.provider = provider or SimulatedHistoryProvider()
         self.months = months
+        # Registration status, joined on from wherever it was looked up.
+        #
+        # It is not in a returns feed and cannot be: the portal answers "what
+        # did they file" and "is this registration alive" with two different
+        # calls, and a GSP is no different. So a history from Mode A came back
+        # saying "active" for everybody, and a cancelled registration - which
+        # outranks every other signal in the action ladder, because credit
+        # claimed against one comes back with interest - was invisible.
+        #
+        # Applied here rather than inside each provider so all three sources
+        # get it from the same place and cannot disagree about a public fact.
+        self.statuses = {k.strip().upper(): v
+                         for k, v in (statuses or {}).items()}
 
     @property
     def source(self) -> str:
@@ -625,8 +669,15 @@ class SupplierHistoryService:
 
     def history_for(self, gstin: str, *,
                     ending: Optional[date] = None) -> FilingHistory:
-        return self.provider.history_for(gstin, months=self.months,
-                                         ending=ending)
+        history = self.provider.history_for(gstin, months=self.months,
+                                            ending=ending)
+        known = self.statuses.get(gstin.strip().upper())
+        if known:
+            # A looked-up status always wins. The alternative is a source's
+            # own default - "active", because a returns feed has nothing else
+            # to say - quietly overriding something a person actually checked.
+            history.registration_status = known
+        return history
 
     def as_dict(self) -> dict:
         return {"source": self.source, "label": self.label, "note": self.note,
