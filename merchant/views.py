@@ -1613,33 +1613,72 @@ def _short_rupees(paise: int) -> str:
     return f"Rs {rupees:,.0f}"
 
 
-def cash_curve(forecast: dict, height: int = 220) -> str:
+def _spline(points: list[tuple[float, float]]) -> str:
     """
-    Thirty days, readable and hoverable.
+    A smooth path through every point, that never draws a value nobody had.
 
-    ## What was wrong with the still version
+    Catmull-Rom converted to cubic bezier, with the control points CLAMPED to
+    the range of the two data points they sit between.
 
-    A tag pinned over the low point, colliding with the axis label beneath it,
-    and no way to ask any other day what it was worth. A cash curve is
-    thirty numbers; showing one of them and drawing the rest is most of a
-    chart.
+    The clamp is the whole reason this is written out rather than borrowed. An
+    unclamped spline overshoots at a sharp turn, so the cliff on the day
+    payroll lands would dip visibly below the balance that was actually
+    reached - a chart drawing a trough that did not happen, in a product whose
+    entire claim is that the arithmetic is exact. The midpoint-quadratic
+    smoothing most charts use has the opposite problem: it is safe from
+    overshoot but does not pass through the data at all, so the dot marking
+    the low point would sit off the line.
 
-    ## How it is interactive without a framework
+    This passes through every point and stays inside it.
+    """
+    if len(points) < 2:
+        return ""
+    out = [f"M{points[0][0]:.1f},{points[0][1]:.1f}"]
+    for i in range(len(points) - 1):
+        p0 = points[i - 1] if i else points[i]
+        p1, p2 = points[i], points[i + 1]
+        p3 = points[i + 2] if i + 2 < len(points) else p2
 
-    A readout bar above the plot, and one invisible hit column per day. Hover
-    a column and the bar says that day - its date, balance, what came in and
-    what went out - and a crosshair follows. Move away and it returns to the
-    low point, which is the day that matters when nobody is pointing at
-    another.
+        c1x, c1y = p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6
+        c2x, c2y = p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6
 
-    Thirty-odd lines of vanilla JS, the same idiom as the supplier drawer.
-    Every figure is rendered server-side into a data attribute; the browser
-    picks one to display and computes nothing. That is the same rule the
-    engine follows, applied to the front end.
+        low, high = min(p1[1], p2[1]), max(p1[1], p2[1])
+        c1y = max(low, min(high, c1y))
+        c2y = max(low, min(high, c2y))
+        out.append(f"C{c1x:.1f},{c1y:.1f} {c2x:.1f},{c2y:.1f} "
+                   f"{p2[0]:.1f},{p2[1]:.1f}")
+    return " ".join(out)
 
-    Without JavaScript the readout still shows the low point and the chart
-    still draws - the interaction adds to a complete answer rather than being
-    the only way to read one.
+
+def cash_curve(forecast: dict, height: int = 250) -> str:
+    """
+    Thirty days, with a tooltip that follows the cursor.
+
+    ## What the shape says
+
+    The fill sits between the line and the SAFE FLOOR rather than between the
+    line and the bottom of the chart, and it is clipped at the floor so it
+    changes colour where the balance crosses it. A day above the floor is
+    tinted calm; the stretch below is red. That is one glance rather than
+    reading an axis, and it is honest because the floor is a real threshold
+    rather than a decorative midpoint.
+
+    ## The interaction
+
+    A dark card follows the pointer, naming the day under it: balance, what
+    came in, what went out and what fell due. Dots mark every day, coloured by
+    which side of the floor they are on, so the data points are visible
+    without hovering at all.
+
+    ## Two things done in HTML rather than SVG, for the same reason
+
+    The plot stretches to whatever width the card is, using
+    preserveAspectRatio="none". Anything inside it stretches too - text turns
+    into a condensed typeface and a circle turns into an ellipse. So the dots,
+    the labels and the tooltip are absolutely positioned HTML at percentage
+    coordinates, and the only things in the SVG are the paths - which carry
+    vector-effect="non-scaling-stroke" so the line keeps an even weight when
+    the horizontal scale is stretched and the vertical is not.
     """
     positions = forecast.get("positions") or []
     if not positions:
@@ -1650,49 +1689,56 @@ def cash_curve(forecast: dict, height: int = 220) -> str:
 
     high = max(max(balances), floor)
     low = min(min(balances), floor)
-    top = high + (high - low) * 0.10
-    bottom = min(low, 0) - max(floor * 0.5, 1)
+    top = high + (high - low) * 0.12
+    bottom = min(low, 0) - max(floor * 0.5, (high - low) * 0.08, 1)
     span = (top - bottom) or 1
 
-    width, pad = 720, 6
+    width, pad = 720, 4
     step = (width - pad * 2) / max(1, len(positions) - 1)
 
     def pct(value: int) -> float:
         return (top - value) / span * 100
 
-    def y(value: int) -> float:
-        return pct(value) / 100 * height
+    def xy(i: int, value: int) -> tuple[float, float]:
+        return pad + i * step, pct(value) / 100 * height
 
-    points = " ".join(f"{pad + i * step:.1f},{y(b):.1f}"
-                      for i, b in enumerate(balances))
-    area = (f"{pad:.1f},{height:.1f} " + points
-            + f" {pad + (len(balances) - 1) * step:.1f},{height:.1f}")
+    line_points = [xy(i, b) for i, b in enumerate(balances)]
+    path = _spline(line_points)
+    floor_y = pct(floor) / 100 * height
 
-    floor_y = y(floor)
+    # The band between the line and the floor, closed along the floor so the
+    # clip can split it. Drawn twice, once per side.
+    band = (path + f" L{line_points[-1][0]:.1f},{floor_y:.1f}"
+            f" L{line_points[0][0]:.1f},{floor_y:.1f} Z")
+
     trough = forecast.get("trough") or {}
-    breached = (trough.get("shortfall") or 0) > 0
-    stroke = "var(--danger)" if breached else "var(--brand)"
     low_index = max(0, min(len(balances) - 1, trough.get("day", 1) - 1))
+    uid = f"c{abs(hash(str(positions[0]['date']) + str(len(positions)))) % 100000}"
 
-    # One invisible column per day. Rendered as HTML rather than SVG so the
-    # hover target is a real box at real pixel widths - an SVG rect under
-    # preserveAspectRatio="none" is stretched and its hit area with it.
-    columns = []
+    dots, columns = [], []
     for i, position in enumerate(positions):
+        x, _ = xy(i, position["closing"])
+        left = x / width * 100
+        under = position["closing"] < floor
         moved = [line.get("payee") or line.get("name", "")
                  for line in position["payout_lines"]
                  + position["recurring_lines"]]
+        dots.append(
+            f'<i class="curve-pt{" under" if under else ""}'
+            f'{" low" if i == low_index else ""}" '
+            f'style="left:{left:.3f}%;top:{pct(position["closing"]):.3f}%">'
+            f'</i>')
         columns.append(
             f'<i class="curve-hit" style="left:{i / len(positions) * 100:.3f}%;'
             f'width:{100 / len(positions):.3f}%"'
-            f' data-i="{i}"'
             f' data-day="{position["day"]}"'
             f' data-date="{esc(_day_words(position["date"]))}"'
             f' data-bal="{esc(position["closing_display"])}"'
+            f' data-under="{"1" if under else ""}"'
             f' data-in="{esc(rupees(position["receipts"]))}"'
             f' data-out="{esc(rupees(position["payouts"] + position["recurring"]))}"'
             f' data-what="{esc(", ".join(n for n in moved if n))}"'
-            f' data-x="{(pad + i * step) / width * 100:.3f}"'
+            f' data-x="{left:.3f}"'
             f' data-y="{pct(position["closing"]):.3f}"></i>')
 
     lines = []
@@ -1707,48 +1753,71 @@ def cash_curve(forecast: dict, height: int = 220) -> str:
                 f'<span>{esc(_short_rupees(int(value)))}</span></div>')
         value += step_paise
 
-    first, last = positions[0], positions[-1]
+    # A day label every five days, so the axis is readable without crowding.
+    ticks = []
+    for i, position in enumerate(positions):
+        if position["day"] == 1 or position["day"] % 5 == 0:
+            ticks.append(
+                f'<span style="left:{xy(i, 0)[0] / width * 100:.3f}%">'
+                f'{position["day"]}</span>')
+
     return f"""
 <div class="curve" data-low="{low_index}">
-  <div class="curve-read">
-    <div class="curve-read-when"><b data-read="date"></b>
-      <span data-read="day"></span></div>
-    <div class="curve-read-figs">
-      <span>balance <b data-read="bal"></b></span>
-      <span class="in">in <b data-read="in"></b></span>
-      <span class="out">out <b data-read="out"></b></span>
+  <div class="curve-frame">
+    <div class="curve-ylabel">Balance</div>
+    <div class="curve-plot" style="height:{height}px">
+      <svg viewBox="0 0 {width} {height}" preserveAspectRatio="none"
+           role="img" aria-label="Thirty day cash projection">
+        <defs>
+          <clipPath id="{uid}-over">
+            <rect x="0" y="0" width="{width}" height="{floor_y:.1f}"></rect>
+          </clipPath>
+          <clipPath id="{uid}-under">
+            <rect x="0" y="{floor_y:.1f}" width="{width}"
+              height="{max(0, height - floor_y):.1f}"></rect>
+          </clipPath>
+        </defs>
+        <path d="{band}" fill="var(--brand)" opacity="0.10"
+          clip-path="url(#{uid}-over)"></path>
+        <path d="{band}" fill="var(--danger)" opacity="0.16"
+          clip-path="url(#{uid}-under)"></path>
+        <path d="{path}" fill="none" stroke="var(--brand)" stroke-width="2.2"
+          stroke-linejoin="round" stroke-linecap="round"
+          vector-effect="non-scaling-stroke"
+          clip-path="url(#{uid}-over)"></path>
+        <path d="{path}" fill="none" stroke="var(--danger)" stroke-width="2.2"
+          stroke-linejoin="round" stroke-linecap="round"
+          vector-effect="non-scaling-stroke"
+          clip-path="url(#{uid}-under)"></path>
+      </svg>
+      {"".join(lines)}
+      <div class="curve-floor-line" style="top:{pct(floor):.1f}%">
+        <span>safe floor {esc(forecast.get("floor_display", ""))}</span></div>
+      <div class="curve-cross"></div>
+      {"".join(dots)}
+      {"".join(columns)}
+      <div class="curve-tip">
+        <div class="curve-tip-when"><b data-read="date"></b>
+          <span data-read="day"></span></div>
+        <div class="curve-tip-row"><span>Balance</span>
+          <b data-read="bal"></b></div>
+        <div class="curve-tip-row in"><span>Money in</span>
+          <b data-read="in"></b></div>
+        <div class="curve-tip-row out"><span>Money out</span>
+          <b data-read="out"></b></div>
+        <div class="curve-tip-what" data-read="what"></div>
+      </div>
     </div>
-    <div class="curve-read-what" data-read="what"></div>
   </div>
-  <div class="curve-plot" style="height:{height}px">
-    <svg viewBox="0 0 {width} {height}" preserveAspectRatio="none"
-         role="img" aria-label="Thirty day cash projection">
-      <rect x="0" y="{floor_y:.1f}" width="{width}"
-        height="{max(0, height - floor_y):.1f}" fill="var(--danger)"
-        opacity="0.10"></rect>
-      <polygon points="{area}" fill="var(--brand)" opacity="0.06"></polygon>
-      <polyline points="{points}" fill="none" stroke="{stroke}"
-        stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
-      </polyline>
-    </svg>
-    {"".join(lines)}
-    <div class="curve-floor-line" style="top:{pct(floor):.1f}%">
-      <span>safe floor {esc(forecast.get("floor_display", ""))}</span></div>
-    <div class="curve-cross"></div>
-    <div class="curve-dot" style="border-color:{stroke}"></div>
-    {"".join(columns)}
-  </div>
-  <div class="curve-axis">
-    <span>{esc(first["date"])}</span>
-    <span>{esc(last["date"])}</span>
-  </div>
+  <div class="curve-axis">{"".join(ticks)}</div>
+  <div class="curve-xlabel">Day of the next 30</div>
 </div>
 {CURVE_SCRIPT}"""
 
 
 # Vanilla, like the supplier drawer. Every figure is already in the DOM; this
-# picks which one to show and moves two absolutely positioned elements. It
-# computes nothing - the same rule the engine follows, applied to the browser.
+# picks which one to show and moves three absolutely positioned elements. It
+# computes nothing - the engine's rule, applied to the browser.
 CURVE_SCRIPT = """
 <script>
 (function () {
@@ -1756,7 +1825,7 @@ CURVE_SCRIPT = """
     var plot = curve.querySelector('.curve-plot');
     var hits = curve.querySelectorAll('.curve-hit');
     var cross = curve.querySelector('.curve-cross');
-    var dot = curve.querySelector('.curve-dot');
+    var tip = curve.querySelector('.curve-tip');
     if (!hits.length) { return; }
 
     function show(hit) {
@@ -1766,30 +1835,33 @@ CURVE_SCRIPT = """
         if (key === 'day') { value = value ? 'day ' + value : ''; }
         slot.textContent = value;
       });
-      var what = curve.querySelector('[data-read="what"]');
-      if (what) { what.style.visibility = what.textContent ? '' : 'hidden'; }
-      cross.style.left = hit.getAttribute('data-x') + '%';
-      dot.style.left = hit.getAttribute('data-x') + '%';
-      dot.style.top = hit.getAttribute('data-y') + '%';
-    }
+      var what = tip.querySelector('.curve-tip-what');
+      what.style.display = what.textContent ? '' : 'none';
+      tip.classList.toggle('under', hit.getAttribute('data-under') === '1');
 
-    var resting = hits[parseInt(curve.getAttribute('data-low'), 10) || 0];
-    show(resting);
-    curve.classList.add('resting');
+      var x = parseFloat(hit.getAttribute('data-x'));
+      cross.style.left = x + '%';
+      // Flip the card to the other side near the right edge, so it never
+      // hangs off the chart.
+      var flip = x > 62;
+      tip.classList.toggle('flip', flip);
+      tip.style.left = x + '%';
+      tip.style.top = Math.min(78, Math.max(6,
+        parseFloat(hit.getAttribute('data-y')))) + '%';
+    }
 
     hits.forEach(function (hit) {
       hit.addEventListener('mouseenter', function () {
-        curve.classList.remove('resting');
+        curve.classList.add('live');
         show(hit);
       });
       hit.addEventListener('focus', function () {
-        curve.classList.remove('resting');
+        curve.classList.add('live');
         show(hit);
       });
     });
     plot.addEventListener('mouseleave', function () {
-      curve.classList.add('resting');
-      show(resting);
+      curve.classList.remove('live');
     });
   });
 })();
@@ -2050,56 +2122,82 @@ def _cash_days(forecast: dict) -> str:
 
 COMPONENTS += """
 /* --- the thirty-day cash curve ----------------------------------------- */
-/* Drawn server-side from computed coordinates. Axis labels and hover targets
-   are HTML rather than SVG: the plot stretches to any width, and text or hit
-   areas inside it would stretch with it. */
-.curve { padding:0 0 12px }
-.curve-plot { position:relative; margin:0 18px }
+/* The plot stretches to the card's width with preserveAspectRatio="none", so
+   everything except the paths is absolutely positioned HTML - text inside a
+   non-uniformly scaled SVG turns condensed and a circle turns into an
+   ellipse. The paths carry vector-effect:non-scaling-stroke for the same
+   reason. */
+.curve { padding:6px 0 10px }
+.curve-frame { display:flex; align-items:stretch; gap:8px; margin:0 18px }
+.curve-ylabel { writing-mode:vertical-rl; transform:rotate(180deg);
+  align-self:center; font-size:10.4px; letter-spacing:.05em;
+  text-transform:uppercase; color:var(--faint) }
+/* A gutter for the axis labels. They used to sit at left:0 INSIDE the plot,
+   so the first day of the line ran straight through "Rs 8L". */
+.curve-plot { position:relative; flex:1; margin-left:46px }
 .curve-plot svg { width:100%; height:100%; display:block; position:absolute;
   inset:0 }
 
-/* The readout. Shows the low point at rest and whatever is hovered
-   otherwise, so the chart answers about any day rather than only the worst. */
-.curve-read { display:flex; align-items:baseline; gap:16px; flex-wrap:wrap;
-  padding:12px 18px 10px; min-height:22px }
-.curve-read-when b { font-size:13.4px; font-weight:600; letter-spacing:-.01em }
-.curve-read-when span { font-size:11.2px; color:var(--muted); margin-left:6px }
-.curve-read-figs { display:flex; gap:15px; font-size:11.6px;
-  color:var(--muted); margin-left:auto }
-.curve-read-figs b { color:var(--ink); font-weight:600;
-  font-variant-numeric:tabular-nums; margin-left:3px }
-.curve-read-figs .in b { color:var(--good) }
-.curve-read-figs .out b { color:var(--danger) }
-.curve-read-what { flex-basis:100%; font-size:11.2px; color:var(--faint);
-  margin-top:-4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-.curve.resting .curve-read-when b { color:var(--danger) }
-
 .curve-grid { position:absolute; left:0; right:0; height:0;
   border-top:1px solid var(--line-2); pointer-events:none }
-.curve-grid span { position:absolute; left:0; top:-8px; padding:0 5px 0 0;
-  background:var(--surface); font-size:10.2px; color:var(--faint);
+.curve-grid span { position:absolute; right:100%; top:-8px; width:44px;
+  padding-right:7px; text-align:right; font-size:10.2px; color:var(--faint);
   font-variant-numeric:tabular-nums }
 
 .curve-floor-line { position:absolute; left:0; right:0; height:0;
-  border-top:1px dashed var(--danger); opacity:.85; pointer-events:none }
+  border-top:1px dashed var(--danger); opacity:.9; pointer-events:none }
 .curve-floor-line span { position:absolute; right:0; top:-8px;
   padding:0 0 0 6px; background:var(--surface); font-size:10.2px;
   color:var(--danger); font-variant-numeric:tabular-nums }
 
-/* Crosshair and dot, moved by the script rather than redrawn. */
+/* A dot on every day, coloured by which side of the floor it is on - the
+   data points are visible without hovering at all. */
+.curve-pt { position:absolute; width:7px; height:7px; border-radius:50%;
+  background:var(--brand); transform:translate(-3.5px,-3.5px);
+  pointer-events:none; box-shadow:0 0 0 2px var(--surface) }
+.curve-pt.under { background:var(--danger) }
+.curve-pt.low { width:11px; height:11px; transform:translate(-5.5px,-5.5px);
+  background:var(--surface); border:3px solid var(--danger) }
+
 .curve-cross { position:absolute; top:0; bottom:0; width:1px;
-  background:var(--ink); opacity:.16; pointer-events:none;
-  transform:translateX(-.5px) }
-.curve-dot { position:absolute; width:9px; height:9px; border-radius:50%;
-  background:var(--surface); border:2px solid var(--brand);
-  transform:translate(-4.5px,-4.5px); pointer-events:none }
-.curve.resting .curve-cross { opacity:.3 }
+  background:var(--ink); opacity:0; pointer-events:none;
+  transform:translateX(-.5px); transition:opacity .12s }
+.curve.live .curve-cross { opacity:.22 }
 
-.curve-hit { position:absolute; top:0; bottom:0; display:block; cursor:crosshair }
-.curve-hit:hover { background:var(--ink); opacity:.03 }
+.curve-hit { position:absolute; top:0; bottom:0; display:block;
+  cursor:crosshair }
 
-.curve-axis { display:flex; justify-content:space-between; margin:9px 18px 0;
-  font-size:10.6px; color:var(--faint) }
+/* The card that follows the pointer. */
+.curve-tip { position:absolute; z-index:3; min-width:168px;
+  margin:-14px 0 0 16px; padding:11px 13px; border-radius:10px;
+  background:#151b2b; color:#fff; box-shadow:0 10px 28px rgba(15,23,42,.28);
+  pointer-events:none; opacity:0; transition:opacity .12s;
+  transform:translateY(-50%) }
+.curve.live .curve-tip { opacity:1 }
+.curve-tip.flip { margin-left:0; transform:translate(-100%,-50%);
+  margin-right:16px }
+.curve-tip.flip { left:auto }
+.curve-tip-when { padding-bottom:8px; margin-bottom:8px;
+  border-bottom:1px solid rgba(255,255,255,.14) }
+.curve-tip-when b { font-size:13px; font-weight:600 }
+.curve-tip-when span { font-size:11px; opacity:.6; margin-left:6px }
+.curve-tip-row { display:flex; justify-content:space-between; gap:18px;
+  font-size:11.6px; padding:2px 0 }
+.curve-tip-row span { opacity:.62 }
+.curve-tip-row b { font-weight:600; font-variant-numeric:tabular-nums }
+.curve-tip-row.in b { color:#4ade80 }
+.curve-tip-row.out b { color:#fb7185 }
+.curve-tip.under .curve-tip-row:first-of-type b { color:#fb7185 }
+.curve-tip-what { margin-top:8px; padding-top:8px;
+  border-top:1px solid rgba(255,255,255,.14); font-size:11px; opacity:.72;
+  max-width:230px; line-height:1.4 }
+
+.curve-axis { position:relative; height:15px; margin:8px 18px 0 76px;
+  font-size:10.4px; color:var(--faint) }
+.curve-axis span { position:absolute; transform:translateX(-50%);
+  font-variant-numeric:tabular-nums }
+.curve-xlabel { text-align:center; margin-top:4px; font-size:10.4px;
+  letter-spacing:.05em; text-transform:uppercase; color:var(--faint) }
 
 /* --- the verdict, before anything else --------------------------------- */
 /* A controller opening this wants three things in order: am I fine, when am

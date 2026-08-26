@@ -444,36 +444,74 @@ def test_the_chart_carries_its_own_scale(shop):
 
     assert page.count('class="curve-grid"') >= 3, "no vertical scale"
     assert "curve-floor-line" in page
-    # The readout names the low point at rest, and any day on hover.
-    assert 'class="curve-read"' in page
+    # And both axes are named, not left to be inferred.
+    assert "curve-ylabel" in page and "curve-xlabel" in page
     assert page.count('class="curve-hit"') == 30, "one hit column per day"
 
 
-def test_the_danger_band_has_height(shop):
+def test_the_area_below_the_floor_has_height(shop):
     """
     The floor used to sit on the bottom edge because the axis was forced to
-    zero, which made the danger band - the entire point of the chart - a line
-    one pixel tall.
+    zero, which made everything below it - the entire point of the chart - a
+    strip one pixel tall.
     """
     import re
 
     key, _state = _forecast(shop)
     page = shop.get(f"/agents/cash-forecaster?key={key}").text
-    band = re.search(r'<rect[^>]*fill="var\(--danger\)"[^>]*>', page).group(0)
-    height = float(re.search(r'height="([\d.]+)"', band).group(1))
-    assert height > 10, f"the danger band is {height}px tall"
+    clip = re.search(r'-under">\s*<rect[^>]*>', page).group(0)
+    height = float(re.search(r'height="([\d.]+)"', clip).group(1))
+    assert height > 10, f"the area below the floor is {height}px tall"
 
 
 def test_the_curve_is_drawn_and_the_danger_zone_marked(shop):
     key, _state = _forecast(shop)
     page = shop.get(f"/agents/cash-forecaster?key={key}").text
 
-    assert "<polyline" in page
     assert "var(--danger)" in page
     assert "safe floor" in page
-    # Thirty points on the line, one per day.
-    line = page.split('<polyline points="')[1].split('"')[0]
-    assert len(line.split()) == 30
+    # One dot per day, so the data points are visible without hovering.
+    assert page.count('class="curve-pt') == 30
+
+
+def test_the_line_passes_through_every_day(shop):
+    """
+    The spline is clamped so it goes through each point rather than near it.
+
+    An unclamped smoothing overshoots at a sharp turn, so the cliff on the day
+    payroll lands would dip below the balance actually reached - a chart
+    drawing a trough that did not happen, in a product whose whole claim is
+    that the arithmetic is exact.
+    """
+    from merchant.views import _spline
+
+    points = [(0.0, 10.0), (1.0, 10.0), (2.0, 0.0), (3.0, 10.0), (4.0, 10.0)]
+    path = _spline(points)
+
+    # Every data point appears as an endpoint of a segment.
+    for x, y in points[1:]:
+        assert f"{x:.1f},{y:.1f}" in path
+
+    # And no control point dips below the lowest data point.
+    import re
+
+    ys = [float(v) for v in re.findall(r"[-\d.]+,([-\d.]+)", path)]
+    assert max(ys) <= 10.0 + 0.001, "the spline overshoots past the data"
+
+
+def test_the_fill_changes_colour_at_the_floor(shop):
+    """
+    The band sits between the line and the SAFE FLOOR, clipped at it - so a
+    day above the floor is tinted calm and the stretch below is red, in one
+    glance rather than by reading an axis.
+    """
+    key, _state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+
+    assert "clipPath" in page
+    assert page.count("-over)") >= 2 and page.count("-under)") >= 2
+    # And the line keeps an even weight when the plot is stretched sideways.
+    assert page.count('vector-effect="non-scaling-stroke"') == 2
 
 
 def test_the_alert_names_the_date_and_the_shortfall(shop):
@@ -523,7 +561,7 @@ def test_uploaded_files_produce_the_same_shape_of_forecast(shop):
     assert payload["metadata"]["accuracy"] == {}
 
     page = shop.get(f"/agents/cash-forecaster/upload?key={key}").text
-    assert "<polyline" in page
+    assert 'class="curve-plot"' in page
 
 
 def test_payroll_uploaded_by_name_is_marked_unmovable(shop):
@@ -586,21 +624,21 @@ def test_an_unknown_run_is_a_404(shop):
     assert shop.get("/agents/cash-forecaster/nope.json").status_code == 404
 
 
-def test_only_the_line_turns_red_not_the_whole_month(shop):
+def test_the_calm_stretch_is_not_painted_as_a_crisis(shop):
     """
     Filling thirty days in danger colour because one of them is bad reads as
     "this whole month is a crisis" - untrue, and the fastest way to teach
-    somebody to ignore the colour.
+    somebody to ignore the colour. Only what is below the floor is red.
     """
     key, _state = _forecast(shop)
     page = shop.get(f"/agents/cash-forecaster?key={key}").text
-
     svg = page.split('<div class="curve-plot"')[1].split("</svg>")[0]
-    area = svg.split("<polygon")[1].split(">")[0]
-    line = svg.split("<polyline")[1].split(">")[0]
 
-    assert "var(--brand)" in area, "the area under the curve should stay calm"
-    assert "var(--danger)" in line, "the line itself marks the breach"
+    assert 'fill="var(--brand)"' in svg, "the calm stretch should stay calm"
+    assert 'fill="var(--danger)"' in svg, "the breach should be marked"
+    # Most days are above the floor, so most dots are the calm colour.
+    calm = page.count('class="curve-pt"') + page.count('class="curve-pt low"')
+    assert calm > page.count("curve-pt under")
 
 
 def test_the_axis_does_not_invent_negative_territory(shop):
@@ -648,7 +686,7 @@ def test_the_chart_answers_about_any_day_not_only_the_worst(shop):
     # front end.
     assert 'data-bal="Rs ' in page
     assert "data-in=" in page and "data-out=" in page
-    assert "computes nothing" in page or "curve-cross" in page
+    assert 'class="curve-tip"' in page
 
 
 def test_the_readout_falls_back_to_the_low_point(shop):
@@ -660,3 +698,18 @@ def test_the_readout_falls_back_to_the_low_point(shop):
 
     curve = page.split('<div class="curve"')[1]
     assert f'data-low="{low["day"] - 1}"' in curve
+    # The low point is drawn differently, so it is findable with the pointer
+    # nowhere near the chart.
+    assert 'class="curve-pt under low"' in page or 'curve-pt low' in page
+
+
+def test_the_axis_labels_do_not_sit_on_the_line(shop):
+    """
+    They used to be at left:0 inside the plot, so the first day of the curve
+    ran straight through "Rs 8L".
+    """
+    from merchant.views import CSS
+
+    assert "margin-left:46px" in CSS
+    label = CSS.split(".curve-grid span {")[1].split("}")[0]
+    assert "right:100%" in label, "the labels are back inside the plot"
