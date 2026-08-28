@@ -798,3 +798,241 @@ def test_nothing_is_shaded_when_everything_is_earned():
                         TODAY + timedelta(days=30), certain=True)])
     html = cash_curve(project_cash_flow(all_earned).as_dict())
     assert "curve-assumed" not in html
+
+
+# --- the agent can check itself now ---------------------------------------
+#
+# It used to be handed a list of movable payouts and asked to pick one, with
+# nothing able to tell whether the one it picked would work. These tools are
+# the difference between a classifier with a narration layer and an agent.
+
+def _tools(inputs=None):
+    from agent.treasury_tools import build_tools
+
+    inputs = inputs or generate(as_of=TODAY)[0]
+    return inputs, {t.name: t for t in build_tools(
+        inputs, project_cash_flow(inputs))}
+
+
+def _call(tools, name, **kw):
+    import json
+
+    return json.loads(tools[name].call(kw))
+
+
+def test_the_tools_are_all_read_only():
+    """
+    Guardrail 1 is enforced by never giving the agent a tool that can write,
+    not by asking it nicely in a prompt. what_if_delayed SIMULATES against a
+    copy; nothing it does survives the call.
+    """
+    inputs, tools = _tools()
+    assert set(tools) == {"what_if_delayed", "payout_detail", "movements_on"}
+
+    # Asserted as a PROPERTY, not by looking at the names. The first version
+    # of this test rejected any tool starting with "move" and failed on
+    # movements_on, which reads a day and changes nothing - a string check
+    # wearing a safety check's clothes.
+    before = ([(p.payout_id, p.due_on, p.amount) for p in inputs.payouts],
+              [(a.account_id, a.balance) for a in inputs.accounts],
+              [(r.reference, r.expected_on, r.amount) for r in inputs.receipts])
+
+    _call(tools, "what_if_delayed", payout_id="V-1042", days_later=7)
+    _call(tools, "payout_detail", payout_id="V-1042")
+    _call(tools, "movements_on", day=14)
+
+    after = ([(p.payout_id, p.due_on, p.amount) for p in inputs.payouts],
+             [(a.account_id, a.balance) for a in inputs.accounts],
+             [(r.reference, r.expected_on, r.amount) for r in inputs.receipts])
+    assert before == after, "a tool changed the merchant's data"
+
+
+def test_what_if_delayed_answers_the_question_the_engine_could_not():
+    """
+    The engine says 'Rs 4,05,000 could move and you are Rs 43,311 short'. It
+    cannot say whether moving any PARTICULAR one works. Now something can.
+    """
+    _inputs_, tools = _tools()
+
+    helps = _call(tools, "what_if_delayed", payout_id="V-1042", days_later=3)
+    assert helps["clears_the_floor"] is True
+    assert "clears the floor" in helps["verdict"]
+
+    useless = _call(tools, "what_if_delayed", payout_id="V-1051", days_later=3)
+    assert useless["clears_the_floor"] is False
+    assert "still short" in useless["verdict"]
+
+
+def test_it_refuses_to_model_delaying_a_salary():
+    """
+    That it is 'only a simulation' is not a defence. Its output becomes a
+    recommendation, and a recommendation to defer payroll is a recommendation
+    to default.
+    """
+    _inputs_, tools = _tools()
+    for pid in ("PAY-PAYROLL-08", "PAY-TDS-Q2"):
+        out = _call(tools, "what_if_delayed", payout_id=pid, days_later=5)
+        assert out["refused"] is True
+        assert "clears_the_floor" not in out
+
+
+def test_a_delay_is_capped_at_what_the_payout_allows():
+    _inputs_, tools = _tools()
+    out = _call(tools, "what_if_delayed", payout_id="V-1042", days_later=99)
+    assert out["capped"] is True
+    assert out["moved_by_days"] == out["furthest_it_can_move_days"]
+
+
+def test_an_unknown_payout_says_so_rather_than_guessing():
+    _inputs_, tools = _tools()
+    out = _call(tools, "what_if_delayed", payout_id="V-9999", days_later=3)
+    assert "error" in out
+    assert out["known_ids"]
+
+
+def test_simulating_does_not_change_the_real_forecast():
+    """
+    A tool that quietly rewrote the forecast it was asked about would make the
+    second question return a different answer from the first for no visible
+    reason.
+    """
+    inputs, tools = _tools()
+    before = project_cash_flow(inputs).trough.balance
+    for pid in ("V-1042", "V-1051"):
+        _call(tools, "what_if_delayed", payout_id=pid, days_later=7)
+    assert project_cash_flow(inputs).trough.balance == before
+
+
+def test_the_tool_catches_a_move_that_creates_a_new_shortfall():
+    """
+    The reason this beats a filter on the movable list.
+
+    A payout moved off the low point has to land somewhere, and it can push
+    a later day under instead. Only re-running the projection finds that.
+    """
+    from engine.treasury.records import (KIND_VENDOR, BankAccount,
+                                         ScheduledPayout, TreasuryInputs)
+
+    # Two tight days. Moving the first payout onto the second sinks it.
+    inputs = TreasuryInputs(
+        accounts=[BankAccount("acc", "Test", 2_00_000_00, TODAY)],
+        payouts=[
+            ScheduledPayout("V-A", "Vendor A", 90_000_00,
+                            TODAY + timedelta(days=4), KIND_VENDOR),
+            ScheduledPayout("V-B", "Vendor B", 90_000_00,
+                            TODAY + timedelta(days=6), KIND_VENDOR)],
+        as_of=TODAY)
+    _inputs_, tools = _tools(inputs)
+
+    moved = _call(tools, "what_if_delayed", payout_id="V-A", days_later=2)
+    assert moved["clears_the_floor"] is False
+    assert moved["low_point_after"]["day"] == 6
+
+
+def test_movements_on_opens_one_day():
+    _inputs_, tools = _tools()
+    out = _call(tools, "movements_on", day=14)
+    assert out["below_the_floor"] is True
+    assert out["out_detail"]
+    assert _call(tools, "movements_on", day=99)["error"]
+
+
+def test_payout_detail_says_why_something_cannot_move():
+    _inputs_, tools = _tools()
+    fixed = _call(tools, "payout_detail", payout_id="PAY-PAYROLL-08")
+    assert fixed["movable"] is False
+    assert fixed["why_fixed"]
+    assert _call(tools, "payout_detail", payout_id="V-1042")["movable"] is True
+
+
+def test_the_agent_still_answers_without_tools():
+    """
+    Tools are an addition to a complete answer, never a precondition for one.
+    Without inputs the agent behaves exactly as it did before they existed.
+    """
+    from agent.treasury_classifier import ClaudeTreasuryAgent
+
+    class Refuses:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**kw):
+                    assert kw["tools"] == [], "no inputs means no tools"
+                    raise ConnectionError("down")
+
+    forecast = project_cash_flow(generate(as_of=TODAY)[0])
+    verdict = ClaudeTreasuryAgent(client=Refuses()).judge(forecast)
+    assert verdict.action == forecast.action
+    assert verdict.tool_calls == []
+
+
+def test_what_it_checked_is_shown_to_the_merchant(shop):
+    """
+    An agent that checked three candidates and one that picked the first name
+    on a list produce identical prose. Only one deserves to be believed, so
+    the page has to be able to tell them apart.
+    """
+    import merchant.app as appmod
+
+    key, state = _forecast(shop)
+    payload = state["payload"]
+    payload["verdict"] = {
+        "action": payload["forecast"]["action"], "confidence": 0.9,
+        "reasoning": "Hold V-1042 for three days.",
+        "hold_payout_id": "V-1042", "hold_days": 3,
+        "tool_calls": ["what_if_delayed", "what_if_delayed", "payout_detail"],
+        "corrections": [], "errored": False,
+    }
+    with appmod._cash_lock:
+        appmod.CASH_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "Before deciding, it checked" in page
+    assert "simulated moving a payment" in page
+    assert "&times;2" in page
+
+
+def test_a_tool_run_reports_what_it_actually_cost():
+    """
+    Regression, and it was live in the settlement agent too.
+
+    Each message in a tool loop reports only its own turn. Reading usage off
+    the last one showed "2 input tokens" for a conversation that had run four
+    turns and re-sent the evidence every time - so the "what this run cost"
+    figure on the page, which exists precisely because somebody is paying for
+    it, was wrong for every run that used a tool.
+    """
+    from agent.treasury_classifier import ClaudeTreasuryAgent
+
+    from agent.treasury_classifier import TreasuryJudgment
+
+    def _judgment():
+        return TreasuryJudgment(exception_code="CASH_CRUNCH_WARNING",
+                                action="delay_payout", confidence=0.9,
+                                reasoning="Hold it.")
+
+    class Turn:
+        def __init__(self, i, o, last=False):
+            self.usage = type("U", (), {"input_tokens": i, "output_tokens": o,
+                                        "cache_read_input_tokens": 0})()
+            self.content = []
+            self.parsed_output = _judgment() if last else None
+
+    turns = [Turn(1000, 200), Turn(1200, 150), Turn(1400, 300, last=True)]
+
+    class Runner:
+        def __iter__(self):
+            return iter(turns)
+
+    class Client:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**_kw):
+                    return Runner()
+
+    forecast = project_cash_flow(generate(as_of=TODAY)[0])
+    verdict = ClaudeTreasuryAgent(client=Client()).judge(forecast)
+
+    assert verdict.input_tokens == 3600, "only the last turn was counted"
+    assert verdict.output_tokens == 650

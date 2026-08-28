@@ -109,7 +109,9 @@ def run(inputs: TreasuryInputs, *, days: int = DEFAULT_DAYS,
 
         agent = ClaudeTreasuryAgent()
 
-    out.verdict = agent.judge(out.forecast, business=business)
+    # The inputs go with the forecast so the agent can check a candidate
+    # against them instead of picking one off a list and hoping.
+    out.verdict = agent.judge(out.forecast, business=business, inputs=inputs)
     out.usage.add(out.verdict)
     if getattr(out.verdict, "error", None):
         out.failed_calls = 1

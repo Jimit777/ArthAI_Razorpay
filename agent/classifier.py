@@ -420,11 +420,17 @@ class ClaudeClassifier:
         verdict.model = self._model
         verdict.tool_calls = tool_calls
         verdict.latency_ms = int((time.monotonic() - started) * 1000)
-        usage = getattr(final, "usage", None)
-        if usage is not None:
-            verdict.input_tokens = getattr(usage, "input_tokens", 0) or 0
-            verdict.output_tokens = getattr(usage, "output_tokens", 0) or 0
-            verdict.cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        # The TOTAL across every turn, not the last one.
+        #
+        # These were accumulated above and then thrown away - the final
+        # assignment read `final.usage`, which is one turn of a conversation
+        # that may have run four. The comment forty lines up says exactly why
+        # that is wrong and the code below it did it anyway, so a tool-using
+        # audit under-reported what it cost on the page that tells a merchant
+        # what it cost.
+        verdict.input_tokens = totals["input"]
+        verdict.output_tokens = totals["output"]
+        verdict.cache_read_tokens = totals["cache_read"]
         return verdict
 
     def _failed(self, variance: Variance, message: str, started: float) -> Verdict:

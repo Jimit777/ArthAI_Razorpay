@@ -339,6 +339,44 @@ def _explain(out: Forecast, inputs: TreasuryInputs) -> None:
         out.action = ACT_DRAW_CREDIT_LINE
 
 
+def project_with(inputs: TreasuryInputs, *, move: Optional[dict] = None,
+                 days: int = DEFAULT_DAYS,
+                 floor: int = SAFE_FLOOR_PAISE) -> Forecast:
+    """
+    The same projection, with one or more payouts moved later.
+
+    Exists so a question like "what happens if I hold V-1042 for three days?"
+    can be ANSWERED rather than guessed at. The agent asks; this computes;
+    the agent reads the result. No arithmetic crosses the boundary.
+
+    The inputs are copied, never mutated. A tool that quietly rewrote the
+    forecast it was asked about would make the second question return a
+    different answer from the first for no visible reason.
+
+    Refuses to move anything that cannot move. Payroll and statutory dues
+    carry delay_days = 0 as a property of the record, and a what-if that
+    happily models delaying a salary would be modelling a default - the fact
+    that it is only a simulation is not a defence, because its output becomes
+    a recommendation.
+    """
+    from copy import replace
+
+    move = move or {}
+    shifted = []
+    for payout in inputs.payouts:
+        by = int(move.get(payout.payout_id, 0) or 0)
+        if by and payout.movable:
+            by = min(by, payout.delay_days)
+            shifted.append(replace(payout, due_on=payout.due_on + timedelta(days=by)))
+        else:
+            shifted.append(payout)
+
+    trial = TreasuryInputs(
+        accounts=list(inputs.accounts), receipts=list(inputs.receipts),
+        payouts=shifted, recurring=list(inputs.recurring), as_of=inputs.as_of)
+    return project_cash_flow(trial, days=days, floor=floor)
+
+
 def recommended_action(forecast: Forecast) -> str:
     """The action, from the figures alone. Kept so the agent cannot relax it."""
     return forecast.action

@@ -47,6 +47,10 @@ from engine.treasury.records import (ACT_CHASE_RECEIVABLES, ACT_DELAY_PAYOUT,
 MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "medium"
 MAX_TOKENS = 1_800
+# How many times round the tool loop before we stop. Generous enough to check
+# three or four candidate payouts, short enough that a model which starts
+# asking the same question repeatedly costs a few cents rather than a bill.
+MAX_ITERATIONS = 8
 
 ACTIONS = (ACT_NONE, ACT_WATCH, ACT_DELAY_PAYOUT, ACT_CHASE_RECEIVABLES,
            ACT_DRAW_CREDIT_LINE)
@@ -127,6 +131,10 @@ class TreasuryVerdict:
     hold_days: Optional[int] = None
     agent_action: str = ""
     goes_further: bool = False
+    # What it looked up before deciding. Shown to the merchant, because an
+    # agent that investigated and an agent that guessed produce identical
+    # prose and only one of them should be trusted.
+    tool_calls: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     invented_figures: list[str] = field(default_factory=list)
 
@@ -145,6 +153,7 @@ class TreasuryVerdict:
             "hold_days": self.hold_days,
             "agent_action": self.agent_action,
             "goes_further": self.goes_further,
+            "tool_calls": list(self.tool_calls),
             "corrections": list(self.corrections),
             "errored": bool(self.error),
         }
@@ -260,23 +269,56 @@ class ClaudeTreasuryAgent:
             self._client = None
             self._unavailable = str(exc)
 
-    def judge(self, forecast, business: str = "") -> TreasuryVerdict:
+    def judge(self, forecast, business: str = "",
+              inputs=None) -> TreasuryVerdict:
+        """
+        Judge one forecast, with tools when the inputs are available.
+
+        `inputs` is what the tools close over. Without it the agent still
+        works and still answers - it just cannot check anything, which is
+        what it did before the tools existed. Degrading to that rather than
+        refusing keeps the tools an addition to a complete answer.
+        """
+        from agent.treasury_tools import build_tools
+
         evidence = render(forecast, business=business)
         started = time.monotonic()
 
         if self._unavailable:
             return self._failed(forecast, self._unavailable, started)
 
+        tools = build_tools(inputs, forecast) if inputs is not None else []
+        called: list[str] = []
+        totals = {"input": 0, "output": 0, "cache_read": 0}
+
         try:
             runner = self._client.beta.messages.tool_runner(
                 model=self._model, max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT, tools=[],
+                system=SYSTEM_PROMPT, tools=tools,
                 messages=[{"role": "user", "content": evidence}],
                 output_format=TreasuryJudgment,
                 thinking={"type": "adaptive"},
                 output_config={"effort": self._effort},
+                max_iterations=MAX_ITERATIONS,
                 cache_control={"type": "ephemeral"})
-            response = runner.until_done()
+            # Stepping the runner rather than calling until_done, so the tool
+            # calls can be recorded as they happen - the same reason the
+            # settlement classifier does it.
+            response = None
+            for message in runner:
+                for block in getattr(message, "content", []) or []:
+                    if getattr(block, "type", "") == "tool_use":
+                        called.append(block.name)
+                # Each message reports only its own turn. Reading usage off
+                # the last one showed "2 input tokens" for a request that had
+                # actually run four turns and sent the evidence every time.
+                usage = getattr(message, "usage", None)
+                if usage is not None:
+                    totals["input"] += getattr(usage, "input_tokens", 0) or 0
+                    totals["output"] += getattr(usage, "output_tokens", 0) or 0
+                    totals["cache_read"] += getattr(
+                        usage, "cache_read_input_tokens", 0) or 0
+                response = message
         except Exception as exc:                            # noqa: BLE001
             # Broad, like every other agent here: the contract is that a
             # failed judgment degrades to the arithmetic, and that has to hold
@@ -290,14 +332,12 @@ class ClaudeTreasuryAgent:
                                 started)
 
         verdict = review(forecast, parsed, evidence)
+        verdict.tool_calls = called
         verdict.model = self._model
         verdict.latency_ms = int((time.monotonic() - started) * 1000)
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            verdict.input_tokens = getattr(usage, "input_tokens", 0) or 0
-            verdict.output_tokens = getattr(usage, "output_tokens", 0) or 0
-            verdict.cache_read_tokens = getattr(
-                usage, "cache_read_input_tokens", 0) or 0
+        verdict.input_tokens = totals["input"]
+        verdict.output_tokens = totals["output"]
+        verdict.cache_read_tokens = totals["cache_read"]
         return verdict
 
     def _failed(self, forecast, message: str, started: float

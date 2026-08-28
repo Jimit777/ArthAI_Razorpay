@@ -1567,6 +1567,13 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
 # table - a controller wants to see WHERE the dip is before they read what is
 # in it - so the curve leads, and everything under it explains that shape.
 
+# What each tool did, in words a merchant reads rather than a function name.
+TOOL_WORDS = {
+    "what_if_delayed": "simulated moving a payment",
+    "payout_detail": "looked up a payment",
+    "movements_on": "opened a day in the forecast",
+}
+
 CASH_TONE = {
     "CASH_HEALTHY": "good", "CASH_TIGHT": "warn",
     "CASH_CRUNCH_WARNING": "bad", "CASH_OVERDRAWN": "bad",
@@ -2028,6 +2035,26 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
                 + ' Nothing is moved for you &mdash; this is the proposal.'
                 + '</div>')
 
+    # What it looked up before deciding.
+    #
+    # Without this the page cannot tell a merchant apart an agent that checked
+    # three candidates from one that picked the first name on a list - the
+    # prose reads identically either way, and only one of them deserves to be
+    # believed.
+    looked_up = ""
+    calls = verdict.get("tool_calls") or []
+    if calls:
+        counted = {}
+        for name in calls:
+            counted[name] = counted.get(name, 0) + 1
+        checks = "".join(
+            f'<span class="checked">{esc(TOOL_WORDS.get(name, name))}'
+            + (f' &times;{n}' if n > 1 else '') + '</span>'
+            for name, n in counted.items())
+        looked_up = (
+            f'<div class="looked-up"><span class="looked-up-label">'
+            f'Before deciding, it checked</span>{checks}</div>')
+
     corrections = ""
     if verdict.get("corrections"):
         corrections = (
@@ -2088,6 +2115,7 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
     {esc(forecast["action_label"])}
   </div>
   {held}
+  {looked_up}
   {corrections}
 
   <details class="working" style="margin-top:13px">
@@ -2235,6 +2263,17 @@ COMPONENTS += """
   font-variant-numeric:tabular-nums }
 .curve-xlabel { text-align:center; margin-top:4px; font-size:10.4px;
   letter-spacing:.05em; text-transform:uppercase; color:var(--faint) }
+
+/* --- what the agent checked before deciding ---------------------------- */
+/* The difference between an agent that investigated and one that guessed is
+   invisible in the prose. It should not be invisible on the page. */
+.looked-up { display:flex; align-items:center; gap:7px; flex-wrap:wrap;
+  margin-top:11px; padding-top:11px; border-top:1px solid var(--line-2) }
+.looked-up-label { font-size:10.4px; letter-spacing:.06em;
+  text-transform:uppercase; color:var(--muted); font-weight:600 }
+.looked-up .checked { font-size:11.4px; color:var(--ink-2);
+  background:var(--raised); border:1px solid var(--line-2);
+  border-radius:20px; padding:3px 10px }
 
 /* --- the verdict, before anything else --------------------------------- */
 /* A controller opening this wants three things in order: am I fine, when am

@@ -178,6 +178,17 @@ def render(forecast, *, business: str = "") -> str:
             lines.append(
                 f"  {line['amount_display']} on {position.on} "
                 f"(day {position.day}) - {line['reference']}")
+        # The day's total, given rather than left to be worked out.
+        #
+        # Two receipts landing together is the shape of most relief, and the
+        # agent kept adding them up - which is arithmetic, so the guard threw
+        # the whole recommendation away and the merchant got the fallback
+        # text instead of good advice. The answer to a model wanting a number
+        # is to hand it the number, not to tighten the rule against deriving
+        # one.
+        if len(position.receipt_lines) > 1:
+            lines.append(
+                f"    (that day's total: {rules.rupees(position.receipts)})")
 
     lines += [
         "",
