@@ -1233,7 +1233,8 @@ class Ledger:
     def capture_payment(self, order_id: str, method: str,
                         card_network: Optional[str] = None,
                         card_type: Optional[str] = None,
-                        is_international: bool = False) -> str:
+                        is_international: bool = False,
+                        captured_at: Optional[int] = None) -> str:
         """
         Take the money. The gateway decides its own fee; we record what it did.
 
@@ -1241,6 +1242,18 @@ class Ledger:
         correct. That is the auditor's job and it happens after settlement,
         which is exactly the problem the product exists for - the merchant
         cannot see the error at the moment it is made.
+
+        `captured_at` exists for tests, and it is not a convenience.
+
+        Settlement is T+2 working days, and the detector raises
+        PERIOD_BOUNDARY when a sale and its settlement fall in different
+        months - correctly, because that is a real thing a merchant has to
+        reclassify. Tests that captured at "now" therefore passed for most of
+        a month and went red in its last few days, with no code change: on
+        28 August 2026 a same-day sale settles on 1 September.
+
+        A test asserting "this is CLEAN" has to control the date, or it is
+        asserting something about the calendar rather than about the auditor.
         """
         order = self.conn.execute(
             "SELECT * FROM live_orders WHERE order_id = ? AND business_id = ?",
@@ -1259,7 +1272,8 @@ class Ledger:
             (payment_id, self._scoped(), order_id, order["amount"], result.method,
              result.card_network, result.card_type, int(is_international),
              result.upi_reference, result.fee, result.tax,
-             str(self.behaviour()), int(time.time())))
+             str(self.behaviour()),
+             int(captured_at if captured_at is not None else time.time())))
         self.conn.execute("UPDATE live_orders SET status='paid' WHERE order_id = ?",
                           (order_id,))
         self.conn.commit()
@@ -1312,8 +1326,22 @@ class Ledger:
 
         settlement_id = _rzp_id(self._rng, "setl_")
         utr = _utr(self._rng)
+        # T+2 from the LAST payment in the batch, not from now.
+        #
+        # A settlement follows the payments it settles; it does not follow the
+        # moment somebody pressed the button. In the simulator those are
+        # minutes apart so it never showed - until a test pinned its capture
+        # dates and the settlement still landed two working days from today,
+        # in a different month, raising a PERIOD_BOUNDARY the test had no way
+        # to control.
+        #
+        # It also made the whole suite calendar-dependent: green for most of a
+        # month, red in the last few days, flipping mid-afternoon on 28 August
+        # 2026 with no code change.
+        latest = max((row["captured_at"] or 0) for row in pending)
         settled_at = int(add_working_days(
-            datetime.now(timezone.utc), SETTLEMENT_WORKING_DAYS).timestamp())
+            datetime.fromtimestamp(latest, timezone.utc),
+            SETTLEMENT_WORKING_DAYS).timestamp())
 
         records: list[Record] = []
         for row in pending:

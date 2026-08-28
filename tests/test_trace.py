@@ -12,6 +12,8 @@ import json
 import sys
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +27,10 @@ from merchant.trace import build  # noqa: E402
 from merchant.views import terminal  # noqa: E402
 
 
+# A capture date safely inside a month - see the note in the fixture.
+SALE_DAY = int(datetime(2026, 6, 10, 9, 0,
+                        tzinfo=timezone.utc).timestamp())
+
 @pytest.fixture
 def audited(tmp_path):
     boot = Ledger(tmp_path / "t.db")
@@ -33,8 +39,15 @@ def audited(tmp_path):
 
     led = Ledger(tmp_path / "t.db", business_id)
     led.set_behaviour(Behaviour.CARD_RATE_ON_UPI)
-    led.capture_payment(led.create_order(162_700, "Scarf"), "upi")
-    led.capture_payment(led.create_order(350_000, "Kurta"), "card", "visa", "credit")
+    # Pinned, safely inside a month. Settlement is T+2 working days, so a
+    # capture at "now" lands in the next month on the last few days of one -
+    # which raises a PERIOD_BOUNDARY on the otherwise-clean card payment,
+    # gives the batch a second variance for the agent, and makes this fixture
+    # produce a different number of verdicts depending on the date.
+    led.capture_payment(led.create_order(162_700, "Scarf"), "upi",
+                        captured_at=SALE_DAY)
+    led.capture_payment(led.create_order(350_000, "Kurta"), "card", "visa",
+                        "credit", captured_at=SALE_DAY)
 
     batch = led.build_settlement(led.rate_card())
     run_id = led.commit_settlement(batch)

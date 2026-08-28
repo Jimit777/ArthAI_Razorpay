@@ -89,6 +89,10 @@ class Forecast:
     overdraft_available: int = 0
     movable_near_trough: list = field(default_factory=list)
     movable_total: int = 0
+    # Movable, but falling after the low point - so moving them changes
+    # nothing about it. Carried separately so the agent can say so rather
+    # than appearing to have missed them.
+    movable_after_trough: list = field(default_factory=list)
     unmovable_near_trough: list = field(default_factory=list)
     receipts_after_trough: int = 0
     detail: str = ""
@@ -140,6 +144,7 @@ class Forecast:
             "closing_display": rules.rupees(self.closing_balance),
             "overdraft_available": self.overdraft_available,
             "movable_near_trough": list(self.movable_near_trough),
+            "movable_after_trough": list(self.movable_after_trough),
             "movable_total": self.movable_total,
             "movable_total_display": rules.rupees(self.movable_total),
             "unmovable_near_trough": list(self.unmovable_near_trough),
@@ -278,11 +283,23 @@ def _explain(out: Forecast, inputs: TreasuryInputs) -> None:
     for position in near:
         for line in position.payout_lines + position.recurring_lines:
             entry = {**line, "day": position.day, "date": str(position.on)}
-            if line.get("movable"):
+            if not line.get("movable"):
+                out.unmovable_near_trough.append(entry)
+                continue
+            # Only money not yet spent ON OR BEFORE the low point can raise
+            # it. A payout falling the day AFTER cannot help the day you run
+            # short, and offering it as help is worse than saying nothing:
+            # it is a specific instruction that reads as checked and
+            # accomplishes nothing when somebody acts on it.
+            #
+            # Both lists are kept. The agent needs to know these exist so it
+            # can say they would not help, rather than appearing not to have
+            # noticed them.
+            if position.day <= out.trough.day:
                 out.movable_near_trough.append(entry)
                 out.movable_total += line["amount"]
             else:
-                out.unmovable_near_trough.append(entry)
+                out.movable_after_trough.append(entry)
 
     out.receipts_after_trough = sum(
         p.receipts for p in out.positions if p.day > out.trough.day)

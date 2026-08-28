@@ -174,7 +174,15 @@ def unverified_figures(text: str, supplied: str) -> list[str]:
 
 
 def movable_ids(forecast) -> set:
-    """Every payout id the agent is allowed to name."""
+    """
+    Every payout id the agent is allowed to name.
+
+    Deliberately NOT everything movable. A payout falling after the low point
+    can be moved and will not raise it, so naming one is a specific
+    instruction that reads as checked and accomplishes nothing - which is
+    worse than saying nothing at all. Those live in movable_after_trough and
+    are shown to the agent as context, never as an answer.
+    """
     out = set()
     for row in forecast.movable_near_trough:
         out.add(row.get("payout_id") or f"recurring:{row.get('name')}")
@@ -195,8 +203,15 @@ def review(forecast, parsed: TreasuryJudgment,
     if held and held not in allowed:
         # A payout id nobody supplied is worse than an invented number: it
         # reads as specific, and a controller could act on it before noticing
-        # there is no such invoice.
+        # there is no such invoice. Same treatment for one that exists and
+        # would not help - a phone call that accomplishes nothing is still a
+        # phone call somebody made on our say-so.
+        after = {r.get("payout_id") or f"recurring:{r.get('name')}"
+                 for r in getattr(forecast, "movable_after_trough", [])}
         corrections.append(
+            f"the agent named {held}, which falls after the low point and "
+            f"would not raise it"
+            if held in after else
             f"the agent named a payout that is not in the movable list "
             f"({held})")
         held = None

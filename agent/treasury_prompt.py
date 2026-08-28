@@ -69,9 +69,15 @@ only a person or a well-briefed agent knows:
   a subscription or a cloud bill can often be moved, but stopping it may stop
   the business rather than merely annoy somebody.
 
-So name ONE payout to move, by its id, from the movable list you are given.
-Say how many days, and say what lands that makes it safe. If nothing movable
-is enough, say that instead and say what the controller should arrange.
+So name ONE payout to move, by its id, from the list of payouts that fall ON
+OR BEFORE the low point. Say how many days, and say what lands that makes it
+safe. If nothing movable is enough, say that instead and say what the
+controller should arrange.
+
+Some payouts are movable but fall AFTER the low point. Moving those changes
+nothing about it - you cannot fix the day you run short by deferring money you
+have not spent yet. They are listed so you can say they would not help, not so
+you can name one.
 
 ## Rules
 
@@ -135,6 +141,17 @@ def render(forecast, *, business: str = "") -> str:
             f"  TOTAL MOVABLE: {rules.rupees(forecast.movable_total)}")
     else:
         lines.append("  nothing around that date can be moved")
+
+    if forecast.movable_after_trough:
+        lines += ["",
+                  "MOVABLE, BUT FALLING AFTER THE LOW POINT - so moving these "
+                  "changes nothing about it:"]
+        for row in forecast.movable_after_trough:
+            ident = row.get("payout_id") or f"recurring:{row.get('name')}"
+            lines.append(
+                f"  [{ident}] {row.get('payee') or row.get('name', '?')} - "
+                f"{row['amount_display']} on {row['date']} "
+                f"(day {row['day']})")
 
     lines += ["", "WHAT FALLS DUE AROUND THE LOW POINT AND CANNOT BE MOVED:"]
     if forecast.unmovable_near_trough:

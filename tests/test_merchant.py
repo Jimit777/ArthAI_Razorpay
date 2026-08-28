@@ -14,6 +14,8 @@ the settlement lines. If that ever breaks, every number on the page is wrong.
 import sys
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -54,9 +56,25 @@ def client(tmp_path, monkeypatch):
     return TestClient(appmod.app)
 
 
-def _sale(led, paise, method="upi", network=None, card_type=None, intl=False):
+# A fixed capture date, safely inside a month.
+#
+# Settlement is T+2 working days and the detector raises PERIOD_BOUNDARY when
+# a sale and its settlement land in different months - correctly. Capturing at
+# "now" therefore made these tests assert something about today's date: they
+# were green for most of a month and went red in its last few days, and this
+# suite flipped mid-afternoon on 28 August 2026 with no code change, because
+# a sale that day settles on 1 September.
+#
+# A test that says "this is CLEAN" has to own the calendar, or it is testing
+# the calendar.
+SALE_DAY = int(datetime(2026, 6, 10, 9, 0, tzinfo=timezone.utc).timestamp())
+
+
+def _sale(led, paise, method="upi", network=None, card_type=None, intl=False,
+          when=SALE_DAY):
     order = led.create_order(paise, "test")
-    return led.capture_payment(order, method, network, card_type, intl)
+    return led.capture_payment(order, method, network, card_type, intl,
+                               captured_at=when)
 
 
 # --- the gateway does not know the answer -------------------------------
@@ -369,6 +387,7 @@ def test_the_page_says_it_has_no_answer_key(client):
     """
     _start(client)
     client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    _pin_capture_dates()
     run_id = client.post("/settle", follow_redirects=False
                          ).headers["location"].rsplit("/", 1)[-1]
     client.post(f"/audit/{run_id}", data={})
@@ -505,7 +524,8 @@ def test_each_business_negotiates_its_own_rates(tmp_path):
     from engine.detector import detect_batch
     for led in (la, lb):
         led.set_behaviour(Behaviour.CORRECT)
-        led.capture_payment(led.create_order(1_000_000, "TV"), "card", "visa", "credit")
+        led.capture_payment(led.create_order(1_000_000, "TV"), "card", "visa",
+                            "credit", captured_at=SALE_DAY)
 
     # the gateway charges 2.00% to both; only the chain is overpaying
     a_var = detect_batch(la.build_settlement(la.rate_card()))[0]
@@ -1255,13 +1275,43 @@ def test_the_hub_shows_planned_agents_without_pretending(client):
 
 # --- the settlement page reads like a decision, not a log ----------------
 
+def _pin_capture_dates():
+    """
+    Push every captured payment back to SALE_DAY.
+
+    /sale captures at "now" and settlement is T+2 working days, so on the last
+    few days of a month these sales settle into the next one - which raises a
+    correct PERIOD_BOUNDARY finding and quietly changes what every page-level
+    assertion sees. Tests about a page should not also be testing the
+    calendar.
+    """
+    import merchant.app as appmod
+
+    with appmod.ledger(None) as led:
+        led.conn.execute("UPDATE live_payments SET captured_at = ?", (SALE_DAY,))
+        led.conn.execute("UPDATE live_orders SET created_at = ?", (SALE_DAY,))
+        led.conn.commit()
+
+
 def _audited(client, behaviour="card_rate_on_upi"):
+    """
+    Two sales, settled and audited, through the real routes.
+
+    The capture dates are pushed back to SALE_DAY afterwards, because /sale
+    captures at "now" and settlement is T+2 working days - so on the last few
+    days of a month these sales settle into the next one and every assertion
+    about a CLEAN page fails on a calendar technicality. These tests are about
+    the page, not about today's date.
+    """
     import time
 
     _start(client)
     client.post("/settings/gateway", data={"behaviour": behaviour})
     client.post("/sale", data={"rupees": "9000.00", "instrument": "upi"})
     client.post("/sale", data={"rupees": "4500.00", "instrument": "visa_credit"})
+
+    _pin_capture_dates()
+
     run_id = client.post("/settle", follow_redirects=False
                          ).headers["location"].rsplit("/", 1)[-1]
     client.post(f"/audit/{run_id}", data={})
@@ -1358,3 +1408,42 @@ def test_clean_payments_are_counted_not_listed(client):
     page = client.get(f"/agents/settlement/run/{run_id}").text
     assert "Nothing was charged wrongly" in page
     assert "Needs review" not in page
+
+
+def test_a_settlement_follows_its_payments_not_the_clock(tmp_path):
+    """
+    Regression, and it took the whole suite red mid-afternoon.
+
+    settled_at was `now + T+2 working days` rather than T+2 from the last
+    payment in the batch. In the simulator those are minutes apart, so it
+    never showed - until 28 August 2026, when a same-day sale settled on
+    1 September, the detector correctly raised PERIOD_BOUNDARY on every
+    otherwise-clean payment, and eight tests that had passed that morning
+    failed that afternoon with no code change.
+
+    A settlement follows the payments it settles. It does not follow the
+    moment somebody pressed the button.
+    """
+    from datetime import datetime, timezone
+
+    from engine.expected_value import SETTLEMENT_WORKING_DAYS, add_working_days
+
+    led = Ledger(tmp_path / "t.db")
+    led.business_id = led.businesses.create("Meera's Boutique")
+    led.set_behaviour(Behaviour.CORRECT)
+
+    captured = int(datetime(2026, 6, 10, 9, 0, tzinfo=timezone.utc).timestamp())
+    led.capture_payment(led.create_order(350_000, "Scarf"), "upi",
+                        captured_at=captured)
+
+    batch = led.build_settlement(led.rate_card())
+    expected = int(add_working_days(
+        datetime.fromtimestamp(captured, timezone.utc),
+        SETTLEMENT_WORKING_DAYS).timestamp())
+    assert batch.records[0].settlement_lines[0].settled_at == expected
+
+    # And a June sale settling in June is clean, whatever today happens to be.
+    from engine.detector import detect_batch
+
+    assert detect_batch(batch)[0].exception_code == "CLEAN"
+    led.close()
