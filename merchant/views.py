@@ -1586,6 +1586,34 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
 # in it - so the curve leads, and everything under it explains that shape.
 
 # What each tool did, in words a merchant reads rather than a function name.
+RISK_TOOL_WORDS = {
+    "full_filing_history": "read their full filing history",
+    "statutory_clocks": "checked the Rule 37 / s.16(4) clocks",
+}
+
+
+def risk_tools_checked(calls: list) -> str:
+    """
+    What the risk agent looked up before deciding, on the supplier drawer.
+
+    A recommendation that read all thirty-six months and one that saw only
+    the twelve it was handed produce the same sentence. This is how a
+    merchant tells them apart.
+    """
+    if not calls:
+        return ""
+    counted = {}
+    for name in calls:
+        counted[name] = counted.get(name, 0) + 1
+    chips = "".join(
+        f'<span class="checked">{esc(RISK_TOOL_WORDS.get(name, name))}'
+        + (f' &times;{n}' if n > 1 else '') + '</span>'
+        for name, n in counted.items())
+    return (f'<div class="looked-up" style="margin-top:11px">'
+            f'<span class="looked-up-label">Before deciding, it checked'
+            f'</span>{chips}</div>')
+
+
 RECON_TOOL_WORDS = {
     "nearby_settlements": "searched for a settlement",
     "nearby_bank_credits": "searched for a credit",

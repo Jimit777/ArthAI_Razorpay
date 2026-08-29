@@ -1561,3 +1561,132 @@ def test_the_reconciliation_is_reachable_from_the_results(shop):
 
     # And the link goes somewhere that works.
     assert shop.get("/agents/input-credit/reconciliation").status_code == 200
+
+
+# --- the agent can drill past the twelve-month summary now -----------------
+#
+# render() hands the agent totals plus the last twelve periods. These tools
+# let it see the whole thirty-six-month history and this month's statutory
+# clocks before it writes the sentence explaining a supplier's record - the
+# same shape as the other two agents' tools, applied to this one's real gap.
+
+def test_full_filing_history_shows_more_than_the_summary():
+    from agent.risk_tools import build_tools
+
+    history = history_for("27AAAAA0000A1Z5")
+    tools = {t.name: t for t in build_tools(history=history)}
+    assert set(tools) == {"full_filing_history"}
+
+    out = json.loads(tools["full_filing_history"].call({}))
+    assert out["total_periods"] == len(history.months)
+    assert out["total_periods"] > 12, "not more than the summary already gave"
+
+
+def test_statutory_clocks_are_offered_only_when_there_are_invoices():
+    from agent.risk_tools import build_tools
+
+    assert build_tools(history=None, clocks={}) == []
+    assert build_tools(history=None, clocks=None) == []
+
+    clocks = {"rule_37_days_left": 12, "claim_days_left": 90, "invoices": [1]}
+    tools = {t.name: t for t in build_tools(clocks=clocks)}
+    assert set(tools) == {"statutory_clocks"}
+    assert json.loads(tools["statutory_clocks"].call({})) == clocks
+
+
+def test_both_tools_together_when_both_are_available():
+    from agent.risk_tools import build_tools
+
+    history = history_for("27AAAAA0000A1Z5")
+    clocks = {"rule_37_days_left": 5, "invoices": [1]}
+    tools = {t.name: t for t in build_tools(history=history, clocks=clocks)}
+    assert set(tools) == {"full_filing_history", "statutory_clocks"}
+
+
+def test_the_tools_are_read_only():
+    from agent.risk_tools import build_tools
+
+    history = history_for("27AAAAA0000A1Z5")
+    before = [(m.period, m.gstr1_filed, m.gstr3b_filed) for m in history.months]
+    tools = {t.name: t for t in build_tools(history=history,
+                                            clocks={"invoices": [1]})}
+    for t in tools.values():
+        t.call({})
+    after = [(m.period, m.gstr1_filed, m.gstr3b_filed) for m in history.months]
+    assert before == after
+
+
+def test_the_agent_still_answers_without_history_or_clocks():
+    """Tools are an addition to a complete answer, never a precondition."""
+    from agent.risk_agent import ClaudeRiskAgent
+
+    class Refuses:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**kw):
+                    assert kw["tools"] == [], "no history/clocks means no tools"
+                    raise ConnectionError("down")
+
+    prof = profile(history_for("27AAAAA0000A1Z5"))
+    verdict = ClaudeRiskAgent(client=Refuses()).judge(
+        prof, "Anand Textiles", 100_00, 10_00, [])
+    assert verdict.action == recommended_action(prof)
+    assert verdict.tool_calls == []
+
+
+def test_a_tool_run_reports_its_full_cost():
+    """
+    Same class of bug shipped twice already in this project: reading usage
+    off only the last turn of a multi-turn tool call.
+    """
+    from agent.risk_agent import ClaudeRiskAgent, RiskJudgment
+
+    def _judgment():
+        return RiskJudgment(pattern=PATTERN_CLEAN, action="safe_to_pay",
+                            headline="h", reasoning="r")
+
+    class Turn:
+        def __init__(self, i, o, last=False):
+            self.usage = type("U", (), {"input_tokens": i, "output_tokens": o,
+                                        "cache_read_input_tokens": 0})()
+            self.content = []
+            self.parsed_output = _judgment() if last else None
+
+    turns = [Turn(1500, 200), Turn(1700, 180, last=True)]
+
+    class Runner:
+        def __iter__(self):
+            return iter(turns)
+
+    class Client:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**_kw):
+                    return Runner()
+
+    prof = profile(history_for("27AAAAA0000A1Z5"))
+    verdict = ClaudeRiskAgent(client=Client()).judge(
+        prof, "Anand Textiles", 100_00, 10_00, [],
+        history=history_for("27AAAAA0000A1Z5"))
+    assert verdict.input_tokens == 3200
+    assert verdict.output_tokens == 380
+
+
+def test_what_it_checked_reaches_the_drawer(shop):
+    """A recommendation that read the full history and one that saw only the
+    summary produce the same sentence. The drawer has to tell them apart."""
+    import merchant.app as appmod
+
+    key, state = _analyse(shop)
+    payload = state["payload"]
+    payload["suppliers"][0]["tool_calls"] = [
+        "full_filing_history", "statutory_clocks"]
+    with appmod._risk_lock:
+        appmod.RISK_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/input-credit?key={key}").text
+    assert "Before deciding, it checked" in page
+    assert "read their full filing history" in page
+    assert "checked the Rule 37" in page

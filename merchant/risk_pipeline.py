@@ -80,6 +80,10 @@ class SupplierRisk:
     clocks: dict = field(default_factory=dict)
     corrections: list[str] = field(default_factory=list)
     errored: bool = False
+    # What it looked up before deciding. A recommendation that checked the
+    # full history and one that saw only the last twelve months read
+    # identically, and only one of them deserves to be believed.
+    tool_calls: list[str] = field(default_factory=list)
 
     @property
     def high_risk(self) -> bool:
@@ -237,7 +241,7 @@ def run(imported: ImportResult, *, use_agent: bool = True,
         rows.append(row)
         jobs.append((prof, group.supplier_name,
                      group.current_month_total_tax_exposure, at_risk,
-                     record.as_rows()[-RECENT_ROWS:]))
+                     record.as_rows()[-RECENT_ROWS:], record, row.clocks))
 
     # A provider that could not be reached collects its failures rather than
     # raising, so one unreachable supplier does not kill a run of fifty. They
@@ -281,6 +285,7 @@ def run(imported: ImportResult, *, use_agent: bool = True,
         row.reasoning = verdict.reasoning
         row.watch_for = verdict.watch_for
         row.corrections = list(verdict.corrections)
+        row.tool_calls = list(verdict.tool_calls)
         row.errored = bool(verdict.error)
         if verdict.error:
             out.failed_calls += 1

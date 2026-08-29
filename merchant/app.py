@@ -2702,6 +2702,7 @@ def _drawer(sup: dict, index: int, patterns: dict, actions: dict) -> str:
       more cautious than the rule, that is worth knowing.</p>'''
       if sup.get("goes_further") else ''}
     {f'<p style="margin:9px 0 0;font-size:12.4px;color:var(--warn)">Watch for: {views.esc(sup["watch_for"])}</p>' if sup.get("watch_for") else ''}
+    {views.risk_tools_checked(sup.get("tool_calls") or [])}
 
     <h3>Statutory clocks</h3>
     {_clocks(clocks)}

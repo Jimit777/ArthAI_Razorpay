@@ -46,6 +46,7 @@ MODEL = "claude-opus-5"
 MODELS = {"opus": "claude-opus-5", "sonnet": "claude-sonnet-5"}
 DEFAULT_EFFORT = "medium"
 MAX_TOKENS = 2_000
+MAX_ITERATIONS = 6
 MAX_WORKERS = 6
 
 PATTERNS = tuple(PATTERN_LABEL)
@@ -177,6 +178,10 @@ class RiskVerdict:
     # and "the agent would relax this" is not something to act on.
     agent_action: str = ""
     goes_further: bool = False
+    # What it looked up before deciding. Shown to the merchant, because a
+    # recommendation that checked the full history and one that saw only the
+    # last twelve months read identically.
+    tool_calls: list[str] = field(default_factory=list)
 
     corrections: list[str] = field(default_factory=list)
     invented_figures: list[str] = field(default_factory=list)
@@ -371,7 +376,20 @@ class ClaudeRiskAgent:
 
     def judge(self, profile: RiskProfile, supplier_name: str,
               exposure_paise: int, at_risk_paise: int,
-              recent_rows: list[dict]) -> RiskVerdict:
+              recent_rows: list[dict], history=None,
+              clocks: Optional[dict] = None) -> RiskVerdict:
+        """
+        Judge one supplier, with tools when the full history and this
+        month's statutory clocks are available.
+
+        `history` and `clocks` are what the tools close over. Without them
+        the agent still works and still answers - it just cannot drill past
+        the twelve-month summary, which is what it did before the tools
+        existed. Degrading to that keeps the tools an addition to a complete
+        answer rather than a precondition for one.
+        """
+        from agent.risk_tools import build_tools
+
         evidence = render(profile, supplier_name, exposure_paise,
                           at_risk_paise, recent_rows)
         started = time.monotonic()
@@ -380,20 +398,42 @@ class ClaudeRiskAgent:
         if blocked:
             return self._failed(profile, supplier_name, blocked, started)
 
+        tools = build_tools(history, clocks)
+        called: list[str] = []
+        totals = {"input": 0, "output": 0, "cache_read": 0}
+
         try:
             runner = self._client.beta.messages.tool_runner(
                 model=self._model,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
-                tools=[],
+                tools=tools,
                 messages=[{"role": "user", "content": evidence}],
                 output_format=RiskJudgment,
                 thinking={"type": "adaptive"},
                 output_config={"effort": self._effort},
-                # Identical prompt on every supplier, so the prefix caches.
+                max_iterations=MAX_ITERATIONS,
+                # Identical prompt AND identical tool schema on every
+                # supplier, so the prefix caches even with tools attached -
+                # what differs per supplier is the closure body, which is
+                # never part of what is sent.
                 cache_control={"type": "ephemeral"},
             )
-            response = runner.until_done()
+            response = None
+            for message in runner:
+                for block in getattr(message, "content", []) or []:
+                    if getattr(block, "type", "") == "tool_use":
+                        called.append(block.name)
+                # Each message reports only its own turn. Reading usage off
+                # the last one under-reports a multi-turn call - shipped
+                # twice already in this codebase before being caught.
+                usage = getattr(message, "usage", None)
+                if usage is not None:
+                    totals["input"] += getattr(usage, "input_tokens", 0) or 0
+                    totals["output"] += getattr(usage, "output_tokens", 0) or 0
+                    totals["cache_read"] += getattr(
+                        usage, "cache_read_input_tokens", 0) or 0
+                response = message
         except Exception as exc:                            # noqa: BLE001
             # Deliberately broad. The contract this class offers is that a
             # failed judgment degrades to the arithmetic, and that has to hold
@@ -414,14 +454,12 @@ class ClaudeRiskAgent:
                                 "model returned no structured output", started)
 
         verdict = review(profile, supplier_name, parsed, evidence)
+        verdict.tool_calls = called
         verdict.model = self._model
         verdict.latency_ms = int((time.monotonic() - started) * 1000)
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            verdict.input_tokens = getattr(usage, "input_tokens", 0) or 0
-            verdict.output_tokens = getattr(usage, "output_tokens", 0) or 0
-            verdict.cache_read_tokens = getattr(
-                usage, "cache_read_input_tokens", 0) or 0
+        verdict.input_tokens = totals["input"]
+        verdict.output_tokens = totals["output"]
+        verdict.cache_read_tokens = totals["cache_read"]
         return verdict
 
     def judge_all(self, jobs: list[tuple], on_each: Optional[Callable] = None
