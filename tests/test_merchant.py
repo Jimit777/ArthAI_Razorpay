@@ -780,6 +780,66 @@ def test_the_front_door_belongs_to_no_single_agent(client):
     assert "GST Input Credit Reconciler" in page
 
 
+# --- the four business-process flows --------------------------------------
+
+def test_every_flow_stage_names_a_real_agent():
+    """A typo'd agent_id in nav.FLOWS would silently drop a stage rather than
+    error - this is the test that would catch it."""
+    import merchant.app  # noqa: F401  - importing this registers the four
+                                        # live agents; without it catalog only
+                                        # knows about the planned ones.
+    from merchant import catalog, nav
+
+    known = {spec.id for spec in catalog.all_agents()}
+    for flow in nav.FLOWS:
+        for stage in flow.stages:
+            if stage.agent_id is not None:
+                assert stage.agent_id in known, (
+                    f"{flow.label}: {stage.label!r} names an unknown agent "
+                    f"{stage.agent_id!r}")
+
+
+def test_the_front_door_shows_all_four_categories_in_order(client):
+    _start(client)
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    client.post("/settle")
+
+    page = client.get("/").text
+    for label in ("Income Management", "Vendor Management",
+                  "Treasury Management", "GST Management"):
+        assert label in page
+
+    order = [page.index(label) for label in
+             ("Income Management", "Vendor Management",
+              "Treasury Management", "GST Management")]
+    assert order == sorted(order), "the categories are out of order"
+
+
+def test_the_front_door_shows_plumbing_stages_honestly(client):
+    """Sell and Pay are Razorpay's own plumbing - no agent claims them, and
+    the card says so rather than looking like a silent failure."""
+    _start(client)
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    client.post("/settle")
+
+    page = client.get("/").text
+    assert "Nothing to audit yet" in page
+    assert "Not a money-moving feature here" in page
+
+
+def test_the_new_gst_filing_stage_is_planned_not_faked(client):
+    """The fifth planned agent, added to fill the GST Management category -
+    same honesty bar as the other four: greyed, a reason, no CTA."""
+    _start(client)
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    client.post("/settle")
+
+    for page in (client.get("/").text, client.get("/agents").text):
+        assert "GST Output Tax Reconciler" in page
+        assert "Rule 88C" in page
+        assert 'href="/agents/gst-filing"' not in page
+
+
 def test_a_brand_new_business_is_told_what_to_do_next(client):
     """
     A screen of zeros is not neutral - it reads as broken, and it is the first
@@ -1269,8 +1329,19 @@ def test_the_hub_shows_planned_agents_without_pretending(client):
     _start(client)
     page = client.get("/agents").text
     assert "Coming soon" in page
-    assert "Running" in page
+    assert "Income Management" in page
     assert "cannot be switched on for anyone" in page
+
+
+def test_the_hub_carries_the_toggle_home_does_not(client):
+    """The control belongs on the hub, a settings-flavoured screen, not on
+    Home, which is a summary - same distinction the page's own docstring
+    draws."""
+    _start(client)
+    hub = client.get("/agents").text
+    home = client.get("/").text
+    assert 'action="/agents/settlement_audit/toggle"' in hub
+    assert 'action="/agents/settlement_audit/toggle"' not in home
 
 
 # --- the settlement page reads like a decision, not a log ----------------

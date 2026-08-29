@@ -927,16 +927,6 @@ def overview_page(user: User = Depends(current_user),
             'appear here instead.</p>',
             title="Needs your decision")
 
-    cards = []
-    for spec, route, state, agent_metrics in picture:
-        if not spec.is_live:
-            continue
-        cards.append(ui.agent_card(ui.AgentCardData(
-            name=spec.name, tagline=spec.tagline, state=state,
-            href=route.href if route else "#", metrics=agent_metrics,
-            cta="Open workspace" if state != ui.STATE_SETUP else "Set it up",
-            why_unbuilt=spec.why_unbuilt)))
-
     body = f"""
 <h1>{views.esc(shell["business"]["name"])}</h1>
 <p class="sub">Everything running across your books, and what is waiting on
@@ -944,9 +934,7 @@ def overview_page(user: User = Depends(current_user),
 
 {metrics}
 
-<div style="margin:22px 0 9px;font-size:11.5px;letter-spacing:.09em;
-  text-transform:uppercase;color:var(--muted);font-weight:600">Your agents</div>
-{ui.grid(cards)}
+{_flow_sections(picture)}
 
 <div style="margin-top:22px">{queue}</div>
 
@@ -4336,6 +4324,43 @@ def _agent_picture(led, ws) -> list:
     return out
 
 
+def _flow_sections(picture, with_controls: bool = False) -> str:
+    """
+    nav.FLOWS rendered as category rows - the same agents as _agent_picture,
+    cut by the business process they belong to rather than by whether they
+    happen to be live yet. Nothing here recomputes state or metrics; it only
+    arranges what _agent_picture already worked out.
+
+    `with_controls` adds the on/off toggle to live agent cards - on for the
+    hub, where switching an agent off is something a person does; off on
+    Home, which is a summary, not a settings page.
+    """
+    by_id = {spec.id: (spec, route, state, metrics)
+             for spec, route, state, metrics in picture}
+    out = []
+    for flow in nav.FLOWS:
+        cards = []
+        for stage in flow.stages:
+            if stage.agent_id is None:
+                cards.append(ui.plumbing_stage(stage.label, stage.note))
+                continue
+            spec, route, state, metrics = by_id[stage.agent_id]
+            control = ""
+            if with_controls and spec.is_live:
+                on = state != ui.STATE_OFF
+                control = (
+                    f'<form method="post" action="/agents/{spec.id}/toggle">'
+                    f'<button class="ghost small">'
+                    f'{"Turn off" if on else "Turn on"}</button></form>')
+            cards.append(ui.agent_card(ui.AgentCardData(
+                name=spec.name, tagline=spec.tagline, state=state,
+                href=route.href if route else "#", metrics=metrics,
+                cta="Open workspace" if state != ui.STATE_SETUP else "Set it up",
+                why_unbuilt=spec.why_unbuilt, control=control)))
+        out.append(ui.flow_section(flow.label, cards))
+    return "".join(out)
+
+
 @app.get("/agents", response_class=HTMLResponse)
 def agents_hub(ws: Workspace = Depends(required_workspace)):
     """
@@ -4349,39 +4374,16 @@ def agents_hub(ws: Workspace = Depends(required_workspace)):
         shell = _shell_for(led, ws)
         picture = _agent_picture(led, ws)
 
-    cards = []
-    for spec, route, state, metrics in picture:
-        control = ""
-        if spec.is_live:
-            on = state != ui.STATE_OFF
-            control = (
-                f'<form method="post" action="/agents/{spec.id}/toggle">'
-                f'<button class="ghost small">{"Turn off" if on else "Turn on"}'
-                f'</button></form>')
-        cards.append(ui.agent_card(ui.AgentCardData(
-            name=spec.name, tagline=spec.tagline, state=state,
-            href=route.href if route else "#", metrics=metrics,
-            cta="Open workspace" if state != ui.STATE_SETUP else "Set it up",
-            why_unbuilt=spec.why_unbuilt, control=control)))
-
     live = [p for p in picture if p[0].is_live]
     planned = [p for p in picture if not p[0].is_live]
-    live_cards = cards[:len(live)] if False else [
-        c for c, p in zip(cards, picture) if p[0].is_live]
-    planned_cards = [c for c, p in zip(cards, picture) if not p[0].is_live]
 
     body = f"""
 <h1>Agents</h1>
 <p class="sub">Each one audits a different thing somebody else calculated for
-   you. {len(live)} running, {len(planned)} on the way.</p>
+   you, grouped by the process it belongs to. {len(live)} running,
+   {len(planned)} on the way.</p>
 
-<div style="margin:20px 0 9px;font-size:11.5px;letter-spacing:.09em;
-  text-transform:uppercase;color:var(--muted);font-weight:600">Running</div>
-{ui.grid(live_cards)}
-
-<div style="margin:26px 0 9px;font-size:11.5px;letter-spacing:.09em;
-  text-transform:uppercase;color:var(--muted);font-weight:600">On the way</div>
-{ui.grid(planned_cards)}
+{_flow_sections(picture, with_controls=True)}
 
 <div class="card tint" style="margin-top:22px">
   <h2>Why these and not others</h2>

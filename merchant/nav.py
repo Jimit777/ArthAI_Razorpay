@@ -178,6 +178,53 @@ def route_for(agent_id: str) -> Optional[AgentRoute]:
     return AGENT_ROUTES.get(agent_id)
 
 
+# --- the business-process flows ---------------------------------------------
+#
+# A different cut through the same agents: not "what page are you on" but
+# "which real process is this part of". Sell and Pay have no agent at all -
+# they are Razorpay's own plumbing, already solved, which is exactly why the
+# gap this platform exists for starts one stage later. A stage with no
+# agent_id renders as a plain, honest placeholder rather than a claim.
+
+
+@dataclass(frozen=True)
+class FlowStage:
+    label: str                      # "Sell", "Settle", "Refund/Dispute", ...
+    agent_id: Optional[str] = None  # None = plumbing stage, no agent here
+    note: str = ""                  # shown only when agent_id is None
+
+
+@dataclass(frozen=True)
+class Flow:
+    key: str                        # "income" | "vendor" | "treasury" | "gst"
+    label: str                      # "Income Management"
+    stages: tuple[FlowStage, ...]
+
+
+FLOWS: tuple[Flow, ...] = (
+    Flow("income", "Income Management", (
+        FlowStage("Sell", note="Razorpay collects the payment. Nothing to "
+                   "audit yet - the gap starts at settlement."),
+        FlowStage("Settle", agent_id="settlement_audit"),
+        FlowStage("Refund/Dispute", agent_id="chargeback"),
+        FlowStage("Reconcile", agent_id="three_way_recon"),
+    )),
+    Flow("vendor", "Vendor Management", (
+        FlowStage("Purchase", agent_id="vendor_terms"),
+        FlowStage("Pay", note="Razorpay pays the vendor. Not a money-moving "
+                   "feature here - just where the relationship exits the "
+                   "platform."),
+        FlowStage("Claim GST Credit", agent_id="gst_itc"),
+    )),
+    Flow("treasury", "Treasury Management", (
+        FlowStage("Forward", agent_id="cash_forecaster"),
+    )),
+    Flow("gst", "GST Management", (
+        FlowStage("File", agent_id="gst_filing"),
+    )),
+)
+
+
 # --- where the old URLs went ----------------------------------------------
 #
 # Kept as redirects rather than deleted. Bookmarks, muscle memory and the test

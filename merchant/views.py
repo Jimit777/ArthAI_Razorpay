@@ -341,6 +341,23 @@ COMPONENTS += """
 .mini b { display:block; font-size:17px; font-weight:600; letter-spacing:-.02em;
   font-variant-numeric:tabular-nums }
 .mini span { font-size:11.3px; color:var(--muted) }
+
+/* --- category flows: home and the agents hub --------------------------- */
+.flow-section { margin:22px 0 26px }
+.flow-header { font-size:11.5px; letter-spacing:.09em; text-transform:uppercase;
+  color:var(--muted); font-weight:600; margin-bottom:9px }
+.track-scroll { overflow-x:auto; padding-bottom:4px; margin:0 -2px }
+.track { display:flex; align-items:stretch; gap:0; min-width:min-content }
+.track .card { flex:0 0 280px; width:280px }
+.chevron { flex:0 0 30px; display:flex; align-items:center; justify-content:center;
+  color:var(--faint); font-size:15px }
+.stage-card.plumbing { display:flex; flex-direction:column; justify-content:center;
+  gap:6px; border-style:dashed; background:var(--raised) }
+.stage-card-label { font-weight:600; font-size:13.5px; color:var(--ink-2) }
+.stage-note { margin:0; font-size:11.8px; color:var(--muted); line-height:1.5 }
+@media (max-width:640px) {
+  .track .card { flex-basis:220px; width:220px }
+}
 """
 
 COMPONENTS += """

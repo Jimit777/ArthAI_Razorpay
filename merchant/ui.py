@@ -241,3 +241,37 @@ def grid(cards: list[str], min_width: int = 300) -> str:
     return (f'<div style="display:grid;gap:13px;grid-template-columns:'
             f'repeat(auto-fill,minmax({min_width}px,1fr))">'
             f'{"".join(cards)}</div>')
+
+
+# --- business-process flows -------------------------------------------------
+#
+# The same agents, cut a different way: not a hub listing every agent once,
+# but the actual process a merchant thinks in, with an agent card - live or
+# planned - sitting at the stage it audits. See merchant/nav.py's FLOWS.
+
+def plumbing_stage(label: str, note: str) -> str:
+    """
+    A flow stage with no agent behind it - Sell, Pay.
+
+    Same slot in the row as an agent card, so the flow reads as one
+    continuous process, but it claims no capability: dashed border, a label
+    and a sentence, nothing that looks like a result.
+    """
+    return f"""
+<div class="card stage-card plumbing">
+  <div class="stage-card-label">{esc(label)}</div>
+  <p class="stage-note">{esc(note)}</p>
+</div>"""
+
+
+def flow_row(stage_cards: list[str]) -> str:
+    joined = '<span class="chevron">&rarr;</span>'.join(stage_cards)
+    return f'<div class="track-scroll"><div class="track">{joined}</div></div>'
+
+
+def flow_section(label: str, stage_cards: list[str]) -> str:
+    return f"""
+<div class="flow-section">
+  <div class="flow-header">{esc(label)}</div>
+  {flow_row(stage_cards)}
+</div>"""
