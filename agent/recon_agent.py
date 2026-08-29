@@ -57,6 +57,7 @@ from engine.recon.records import (ACTION_CHASE, ACTION_DISPUTE,
 MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "medium"
 MAX_TOKENS = 1_600
+MAX_ITERATIONS = 6
 MAX_WORKERS = 6
 
 ACTIONS = (ACTION_NONE, ACTION_CHASE, ACTION_DISPUTE, ACTION_WRITE_OFF,
@@ -192,6 +193,9 @@ class ReconVerdict:
     likeliest_cause: Optional[str] = None
     agent_action: str = ""
     goes_further: bool = False
+    # What it searched before deciding. Shown to the merchant, because a
+    # recommendation that looked and one that guessed read identically.
+    tool_calls: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     invented_figures: list[str] = field(default_factory=list)
 
@@ -332,7 +336,20 @@ class ClaudeReconAgent:
 
     _fatal: Optional[str] = None
 
-    def judge(self, row: ReconRow) -> ReconVerdict:
+    def judge(self, row: ReconRow, pool: Optional[list] = None
+              ) -> ReconVerdict:
+        """
+        Judge one exception, with a search tool when the other exceptions in
+        this run are available.
+
+        `pool` is every other unresolved row - the leftover pool the search
+        tools look through. Without it the agent still works and still
+        answers; it just cannot widen the search, which is what it did before
+        the tools existed. Degrading to that keeps the tools an addition to a
+        complete answer rather than a precondition for one.
+        """
+        from agent.recon_tools import build_tools
+
         evidence = render(row)
         started = time.monotonic()
 
@@ -340,16 +357,35 @@ class ClaudeReconAgent:
         if blocked:
             return self._failed(row, blocked, started)
 
+        tools = build_tools(pool, exclude=row) if pool is not None else []
+        called: list[str] = []
+        totals = {"input": 0, "output": 0, "cache_read": 0}
+
         try:
             runner = self._client.beta.messages.tool_runner(
                 model=self._model, max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT, tools=[],
+                system=SYSTEM_PROMPT, tools=tools,
                 messages=[{"role": "user", "content": evidence}],
                 output_format=ReconJudgment,
                 thinking={"type": "adaptive"},
                 output_config={"effort": self._effort},
+                max_iterations=MAX_ITERATIONS,
                 cache_control={"type": "ephemeral"})
-            response = runner.until_done()
+            response = None
+            for message in runner:
+                for block in getattr(message, "content", []) or []:
+                    if getattr(block, "type", "") == "tool_use":
+                        called.append(block.name)
+                # Each message reports only its own turn. Reading usage off
+                # the last one under-reports a multi-turn call - the exact
+                # bug this project shipped once already, in two other agents.
+                usage = getattr(message, "usage", None)
+                if usage is not None:
+                    totals["input"] += getattr(usage, "input_tokens", 0) or 0
+                    totals["output"] += getattr(usage, "output_tokens", 0) or 0
+                    totals["cache_read"] += getattr(
+                        usage, "cache_read_input_tokens", 0) or 0
+                response = message
         except Exception as exc:                            # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
             if failures.is_fatal(message):
@@ -362,14 +398,12 @@ class ClaudeReconAgent:
                                 started)
 
         verdict = review(row, parsed, evidence)
+        verdict.tool_calls = called
         verdict.model = self._model
         verdict.latency_ms = int((time.monotonic() - started) * 1000)
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            verdict.input_tokens = getattr(usage, "input_tokens", 0) or 0
-            verdict.output_tokens = getattr(usage, "output_tokens", 0) or 0
-            verdict.cache_read_tokens = getattr(
-                usage, "cache_read_input_tokens", 0) or 0
+        verdict.input_tokens = totals["input"]
+        verdict.output_tokens = totals["output"]
+        verdict.cache_read_tokens = totals["cache_read"]
         return verdict
 
     def judge_all(self, rows: list[ReconRow],
@@ -383,9 +417,11 @@ class ClaudeReconAgent:
         """
         from concurrent.futures import ThreadPoolExecutor
 
+        judge_one = lambda row: self.judge(row, pool=rows)  # noqa: E731
+
         out: list[ReconVerdict] = []
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            for verdict in pool.map(self.judge, rows):
+        with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            for verdict in executor.map(judge_one, rows):
                 out.append(verdict)
                 if on_each is not None:
                     on_each(verdict)

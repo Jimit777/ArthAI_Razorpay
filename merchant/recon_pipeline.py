@@ -180,6 +180,7 @@ def run(batch: ReconBatch, *, truth: Optional[dict] = None,
         row.action = verdict.action
         if verdict.headline:
             row.reasoning = verdict.reasoning
+        row.tool_calls = list(verdict.tool_calls)
         row.errored = bool(verdict.error)
         if verdict.error:
             out.failed_calls += 1

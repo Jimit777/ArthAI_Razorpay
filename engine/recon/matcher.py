@@ -111,6 +111,7 @@ def reconcile(batch: ReconBatch) -> tuple[list[ReconRow], MatchStats]:
             settlement = named[0]
 
         # --- pass 2: no reference, so amount and date have to carry it ------
+        tied: list = []
         if settlement is None:
             candidates = [
                 s for s in batch.settlements
@@ -125,13 +126,29 @@ def reconcile(batch: ReconBatch) -> tuple[list[ReconRow], MatchStats]:
             if len(candidates) == 1:
                 settlement = candidates[0]
                 stats.windowed += 1
+            elif len(candidates) > 1:
+                tied = candidates
 
         if settlement is None:
+            detail = (f"Billed {_r(invoice.amount)} and the gateway has no "
+                      f"settlement for it.")
+            if tied:
+                # Not the same claim. Something matched - more than one thing
+                # - and the merchant is owed the truth about why nothing was
+                # chosen, not a sentence that reads as though nothing exists.
+                detail = (
+                    f"Billed {_r(invoice.amount)}. {len(tied)} settlements "
+                    f"match on amount and date and none carries a reference, "
+                    f"so none was chosen automatically - a person has to say "
+                    f"which one this is.")
             rows.append(ReconRow(
                 finding=MISSING_IN_GATEWAY, invoice=invoice,
-                variance=invoice.amount,
-                detail=f"Billed {_r(invoice.amount)} and the gateway has no "
-                       f"settlement for it."))
+                variance=invoice.amount, detail=detail,
+                tied_candidates=[
+                    {"txn_id": s.txn_id, "gross_amount": s.gross_amount,
+                     "gross_amount_display": _r(s.gross_amount),
+                     "settlement_date": str(s.settlement_date)}
+                    for s in tied]))
             continue
 
         used_settlements.add(settlement.txn_id)

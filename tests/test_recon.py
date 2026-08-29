@@ -14,6 +14,7 @@ deterministic, because a match rate that changes between runs on identical
 data is worth nothing. What the agent does is explain the leftovers.
 """
 
+import json
 import sys
 import time
 from collections import Counter
@@ -785,3 +786,197 @@ def test_a_pull_without_an_account_is_refused(shop):
                          data={"year": "2026", "month": "07"},
                          follow_redirects=False)
     assert "error=" in response.headers["location"]
+
+
+# --- the agent can widen the search now -----------------------------------
+#
+# It used to see a page of evidence for one exception and nothing else. Two
+# widening searches let it check a hypothesis before recommending it, the
+# same shape as the cash forecaster's what_if_delayed.
+
+def test_two_settlements_tied_are_told_apart_from_zero_found():
+    """
+    THE bug this closes. The matcher correctly refuses to guess between two
+    equally-good candidates, and the old detail sentence said "the gateway
+    has no settlement for it" - which was false. Something matched; nothing
+    was chosen.
+    """
+    when = date(2026, 7, 1)
+    batch = ReconBatch(
+        invoices=[Invoice("INV-1", "Sunrise Retail", 500000, when)],
+        settlements=[
+            Settlement("pay_a", 500000, 11800, 488200, when, utr="U1"),
+            Settlement("pay_b", 500000, 11800, 488200, when, utr="U2")],
+        bank=[])
+
+    row = reconcile(batch)[0][0]
+    assert row.finding == MISSING_IN_GATEWAY
+    assert "has no settlement" not in row.detail
+    assert "2 settlements match" in row.detail
+    assert len(row.tied_candidates) == 2
+    assert {c["txn_id"] for c in row.tied_candidates} == {"pay_a", "pay_b"}
+
+
+def test_a_genuine_zero_still_says_nothing_exists():
+    """The other half - a real gap must not start reading as ambiguous."""
+    when = date(2026, 7, 1)
+    batch = ReconBatch(
+        invoices=[Invoice("INV-1", "Sunrise Retail", 500000, when)],
+        settlements=[], bank=[])
+    row = reconcile(batch)[0][0]
+    assert row.tied_candidates == []
+    assert "has no settlement" in row.detail
+
+
+def test_nearby_settlements_finds_what_the_matcher_would_not_auto_pick():
+    """
+    A settlement nine days out is too far for the automatic window and close
+    enough that a person investigating would want to see it.
+    """
+    from agent.recon_tools import build_tools
+
+    when = date(2026, 7, 1)
+    batch = ReconBatch(
+        invoices=[Invoice("INV-1", "Sunrise Retail", 500000, when)],
+        settlements=[Settlement("pay_far", 500000, 11800, 488200,
+                                when + timedelta(days=9))],
+        bank=[])
+    rows, _ = reconcile(batch)
+    row = rows[0]
+    assert row.finding == MISSING_IN_GATEWAY
+
+    tools = {t.name: t for t in build_tools(rows, exclude=row)}
+    out = json.loads(tools["nearby_settlements"].call(
+        {"around_amount_paise": 500000, "around_date": str(when)}))
+    assert out["count"] == 1
+    assert out["results"][0]["txn_id"] == "pay_far"
+    assert out["results"][0]["days_away"] == 9
+
+
+def test_the_search_tools_are_read_only():
+    """
+    No claim, no link, no write - a search that returns priced, dated
+    possibilities and nothing that could act on what it finds.
+    """
+    from agent.recon_tools import build_tools
+
+    batch, truth = generate(55)
+    rows, _stats = reconcile(batch)
+    tools = build_tools(rows)
+    names = {t.name for t in tools}
+    assert names == {"nearby_settlements", "nearby_bank_credits"}
+
+    before = [(r.finding, r.matched_by, r.detail) for r in rows]
+    for t in tools:
+        for row in rows[:3]:
+            if row.settlement:
+                t.call({"around_amount_paise": row.settlement.gross_amount,
+                       "around_date": str(row.settlement.settlement_date)})
+    after = [(r.finding, r.matched_by, r.detail) for r in rows]
+    assert before == after
+
+
+def test_results_are_sorted_by_closeness_not_by_order():
+    from agent.recon_tools import build_tools
+
+    when = date(2026, 7, 1)
+    batch = ReconBatch(
+        invoices=[Invoice("INV-1", "Sunrise", 500000, when)],
+        settlements=[
+            Settlement("pay_close", 501000, 0, 501000, when + timedelta(days=2)),
+            Settlement("pay_far", 520000, 0, 520000, when + timedelta(days=1)),
+        ], bank=[])
+    rows, _ = reconcile(batch)
+    tools = {t.name: t for t in build_tools(rows, exclude=rows[0])}
+    out = json.loads(tools["nearby_settlements"].call(
+        {"around_amount_paise": 500000, "around_date": str(when)}))
+    assert [r["txn_id"] for r in out["results"]] == ["pay_close", "pay_far"]
+
+
+def test_an_unparseable_date_is_refused_not_guessed():
+    from agent.recon_tools import build_tools
+
+    batch, _ = generate(55)
+    rows, _ = reconcile(batch)
+    tools = {t.name: t for t in build_tools(rows)}
+    out = json.loads(tools["nearby_bank_credits"].call(
+        {"around_amount_paise": 1000, "around_date": "not-a-date"}))
+    assert "error" in out
+
+
+def test_the_agent_still_answers_without_a_pool():
+    """Tools are an addition to a complete answer, never a precondition."""
+    from agent.recon_agent import ClaudeReconAgent
+
+    class Refuses:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**kw):
+                    assert kw["tools"] == [], "no pool means no tools"
+                    raise ConnectionError("down")
+
+    batch, _ = generate(55)
+    row = next(r for r in reconcile(batch)[0] if not r.resolved)
+    verdict = ClaudeReconAgent(client=Refuses()).judge(row)
+    assert verdict.action == recommended_action(row)
+    assert verdict.tool_calls == []
+
+
+def test_a_tool_run_reports_its_full_cost():
+    """
+    Same class of bug the cash forecaster and the settlement agent both had:
+    reading usage off only the last turn of a multi-turn call. Fixed here from
+    the start rather than shipped and found later.
+    """
+    from agent.recon_agent import ClaudeReconAgent, ReconJudgment
+
+    def _judgment():
+        return ReconJudgment(action="investigate", headline="h",
+                             reasoning="r")
+
+    class Turn:
+        def __init__(self, i, o, last=False):
+            self.usage = type("U", (), {"input_tokens": i, "output_tokens": o,
+                                        "cache_read_input_tokens": 0})()
+            self.content = []
+            self.parsed_output = _judgment() if last else None
+
+    turns = [Turn(2000, 100), Turn(2200, 150, last=True)]
+
+    class Runner:
+        def __iter__(self):
+            return iter(turns)
+
+    class Client:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**_kw):
+                    return Runner()
+
+    batch, _ = generate(55)
+    row = next(r for r in reconcile(batch)[0] if not r.resolved)
+    verdict = ClaudeReconAgent(client=Client()).judge(row, pool=[row])
+    assert verdict.input_tokens == 4200
+    assert verdict.output_tokens == 250
+
+
+def test_what_it_searched_reaches_the_row_and_the_payload(shop):
+    """
+    An agent that widened the search and one that guessed produce identical
+    prose. The page has to be able to tell them apart.
+    """
+    import merchant.app as appmod
+
+    key, state = _run(shop)
+    payload = state["payload"]
+    if payload["exception_list"]:
+        payload["exception_list"][0]["tool_calls"] = [
+            "nearby_settlements", "nearby_settlements"]
+        with appmod._recon_lock:
+            appmod.RECON_RUNS[key]["payload"] = payload
+
+        page = shop.get(f"/agents/three-way?key={key}").text
+        assert "searched for a settlement" in page
+        assert "&times;2" in page

@@ -1280,12 +1280,30 @@ def _recon_exception(row: dict, findings: dict, notes: dict,
 
     tone = RECON_ACTION_TONE.get(row["action"], "")
     suggested = row["action"]
+
+    # What it searched before recommending this. Kept as a tight inline chip
+    # row rather than the card treatment the cash forecaster uses - this is a
+    # table row, and it stays scannable at fifty exceptions or it fails at the
+    # thing an exception LIST is for.
+    calls = row.get("tool_calls") or []
+    checked = ""
+    if calls:
+        counted = {}
+        for name in calls:
+            counted[name] = counted.get(name, 0) + 1
+        chips = " ".join(
+            f'<span class="checked">{esc(RECON_TOOL_WORDS.get(n, n))}'
+            + (f' &times;{c}' if c > 1 else '') + '</span>'
+            for n, c in counted.items())
+        checked = f'<div class="looked-up" style="margin-top:6px">{chips}</div>'
+
     return f"""
       <tr>
         <td style="max-width:44ch">
           <div style="font-weight:560">{esc(row["detail"])}</div>
           <div style="color:var(--muted);font-size:11.3px;margin-top:3px">
             {esc(row["reasoning"] or notes.get(row["finding_type"], ""))}</div>
+          {checked}
           <div class="mono" style="color:var(--faint);font-size:10.5px;
             margin-top:3px">
             {esc(row["invoice_id"] or "no invoice")} &middot;
@@ -1568,6 +1586,11 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
 # in it - so the curve leads, and everything under it explains that shape.
 
 # What each tool did, in words a merchant reads rather than a function name.
+RECON_TOOL_WORDS = {
+    "nearby_settlements": "searched for a settlement",
+    "nearby_bank_credits": "searched for a credit",
+}
+
 TOOL_WORDS = {
     "what_if_delayed": "simulated moving a payment",
     "payout_detail": "looked up a payment",

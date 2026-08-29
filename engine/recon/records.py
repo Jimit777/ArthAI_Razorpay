@@ -156,12 +156,22 @@ class ReconRow:
     bank: Optional[BankCredit] = None
     variance: int = 0                   # paise at stake, signed
     matched_by: str = ""                # which pass resolved it
+    # Candidates the matcher found and correctly refused to pick between -
+    # same amount, same window, no reference to break the tie. Carried
+    # rather than discarded: "nothing matched" and "two things matched and
+    # neither could be chosen" are different findings needing different
+    # actions, and collapsing them into one made the second one report a
+    # sentence that was flatly untrue.
+    tied_candidates: list = field(default_factory=list)
     detail: str = ""                    # the arithmetic, in words
     # Filled by the agent, never by the matcher.
     reasoning: str = ""
     action: str = ""
     confidence: float = 0.0
     errored: bool = False
+    # What it searched before settling on this. An agent that widened the
+    # search and one that guessed produce identical prose.
+    tool_calls: list = field(default_factory=list)
 
     @property
     def resolved(self) -> bool:
@@ -187,9 +197,11 @@ class ReconRow:
             "variance": self.variance,
             "at_stake": self.at_stake,
             "matched_by": self.matched_by,
+            "tied_candidates": list(self.tied_candidates),
             "detail": self.detail,
             "reasoning": self.reasoning,
             "action": self.action,
+            "tool_calls": list(self.tool_calls),
             "action_label": ACTION_LABEL.get(self.action, self.action),
             "confidence": self.confidence,
             "resolved": self.resolved,
