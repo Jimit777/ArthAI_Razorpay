@@ -66,6 +66,8 @@ SHELL = """/* --- frame --------------------------------------------------------
 .rail nav { padding:2px 8px; overflow-y:auto; flex:1 }
 .group { font-size:10px; letter-spacing:.09em; text-transform:uppercase;
   color:var(--faint); padding:13px 7px 4px; font-weight:600 }
+.rail .flow-group { font-size:10px; color:var(--faint); padding:7px 8px 2px 30px;
+  font-weight:600; letter-spacing:.02em }
 .item { display:flex; align-items:center; gap:9px; padding:6px 8px;
   border-radius:6px; color:var(--ink-2); font-size:12.8px; margin-bottom:0 }
 .item:hover { background:var(--line-2) }
@@ -524,7 +526,7 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
     now lives in one small module so that disagreeing with it means editing a
     list rather than picking apart a frame.
     """
-    from merchant.nav import route_for, visible
+    from merchant.nav import FLOWS, route_for, visible
 
     def item(icon, label, href, key, tag="", cls=""):
         return (f'<a class="item {cls} {"on" if active == key else ""}" '
@@ -544,17 +546,26 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
                                tag))
         # The live agents hang under Agents as a shallow second level, so the
         # way into a workspace is one click from anywhere without every agent
-        # page becoming a root-level entry.
+        # page becoming a root-level entry. Grouped by business process
+        # (nav.FLOWS) rather than listed flat - the same regrouping Home and
+        # the Agents hub got, so the rail stops being the one place in the
+        # product still organised by agent instead of by the work a merchant
+        # actually thinks in.
         if label == "Workspace":
-            for spec in agents:
-                if not spec.is_live:
+            live_by_id = {spec.id: spec for spec in agents if spec.is_live}
+            for flow in FLOWS:
+                flow_specs = [live_by_id[stage.agent_id] for stage in flow.stages
+                             if stage.agent_id in live_by_id]
+                if not flow_specs:
                     continue
-                route = route_for(spec.id)
-                if route is None:
-                    continue
-                blocks.append(item(
-                    "·", spec.rail_label, route.href, f"agent:{spec.id}",
-                    "" if spec.id in enabled else "off", cls="sub-item"))
+                blocks.append(f'<div class="flow-group">{esc(flow.label)}</div>')
+                for spec in flow_specs:
+                    route = route_for(spec.id)
+                    if route is None:
+                        continue
+                    blocks.append(item(
+                        "·", spec.rail_label, route.href, f"agent:{spec.id}",
+                        "" if spec.id in enabled else "off", cls="sub-item"))
 
     return f"""
   <aside class="rail">

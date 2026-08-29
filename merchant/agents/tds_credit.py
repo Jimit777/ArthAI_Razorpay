@@ -126,6 +126,7 @@ def run_tds_reconciliation(ctx: AgentContext) -> None:
 TDS_CREDIT_TRACKER = register(AgentSpec(
     id="tds_credit",
     name="TDS Credit Tracker",
+    short_name="TDS credit",
     tagline="Checks that tax withheld from you actually reached the department.",
     question="Was TDS deducted from my payouts, and did it show up as my credit?",
     status="live",
