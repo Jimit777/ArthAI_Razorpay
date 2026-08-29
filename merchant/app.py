@@ -808,7 +808,14 @@ def overview_page(user: User = Depends(current_user),
     # A screen of zeros is not neutral. It reads as broken, and it is the first
     # impression every new business gets. Say what this screen will show once
     # there is data, and give exactly one next action.
-    if not runs:
+    #
+    # Gated on settlements alone until this line, which meant a business that
+    # had already run a cash forecast or a reconciliation - real work, with a
+    # real decision waiting - was told "nothing has been settled yet" and
+    # never saw it, because this screen only knew how to look for one agent.
+    _, _has_cash = _latest_cash_run(resolved)
+    _, _has_recon = _latest_recon_run(resolved)
+    if not runs and not _has_cash and not _has_recon:
         simulated = source["kind"] == str(SourceKind.SIMULATOR)
         steps = [
             ("done", "Business created",
@@ -981,6 +988,39 @@ def _open_decisions(led, ws) -> list:
                        f'{raised["action"].replace("_", " ")}',
                 "amount": raised["exposed_paise"] or 0,
                 "href": "/agents/input-credit",
+            })
+
+    # Cash forecast and three-way recon results live in the run-state dicts,
+    # not the database - see _latest_cash_run / _latest_recon_run. Without
+    # this the queue's claim to be "every agent, one list" was true of two
+    # agents out of four, which is a worse lie than having no queue at all.
+    cash_key, cash = _latest_cash_run(ws.business_id)
+    if cash:
+        forecast = (cash.get("payload") or {}).get("forecast") or {}
+        action = forecast.get("action", "none")
+        if action not in ("none", "watch"):
+            verdict = (cash.get("payload") or {}).get("verdict") or {}
+            trough = forecast.get("trough") or {}
+            out.append({
+                "agent": "Cash forecast",
+                "what": verdict.get("reasoning") or forecast.get("detail")
+                       or forecast.get("action_label", action),
+                "why": forecast.get("action_label", action).lower(),
+                "amount": trough.get("shortfall", 0),
+                "href": f"/agents/cash-forecaster?key={cash_key}",
+            })
+
+    recon_key, recon = _latest_recon_run(ws.business_id)
+    if recon:
+        for row in ((recon.get("payload") or {}).get("exception_list") or []):
+            out.append({
+                "agent": "Three-way recon",
+                "what": row.get("reasoning") or row.get("detail")
+                       or row.get("finding_label", ""),
+                "why": (row.get("action_label")
+                       or row.get("finding_label", "")).lower(),
+                "amount": row.get("at_stake", 0),
+                "href": f"/agents/three-way?key={recon_key}",
             })
 
     out.sort(key=lambda d: -d["amount"])
@@ -1703,6 +1743,20 @@ def _cash_state(key: str, business_id: str = "",
     return "", {}
 
 
+def _latest_cash_run(business_id: str) -> tuple[str, dict]:
+    """
+    This business's most recent completed forecast, whichever tab it came
+    from - for the home queue, which does not care which tab a merchant used,
+    only whether there is something in it they still need to decide.
+    """
+    with _cash_lock:
+        for found, state in reversed(list(CASH_RUNS.items())):
+            if (state.get("business_id") == business_id
+                    and state.get("state") == "done"):
+                return found, dict(state)
+    return "", {}
+
+
 def _pending_receipts(led, business_id: str) -> list:
     """
     Gateway money captured and not yet credited, as expected receipts.
@@ -1773,7 +1827,7 @@ def _run_cash(key: str, business_id: str, use_agent: bool,
 
         result = run_cash(inputs, use_agent=use_agent, planted=planted,
                           business=business, source=source,
-                          on_progress=progress)
+                          business_id=business_id, on_progress=progress)
         with _cash_lock:
             CASH_RUNS[key] = {"state": "done", "business_id": business_id,
                               "source": source, "phase": "done",
@@ -2027,7 +2081,17 @@ def _run_recon(key: str, business_id: str, use_agent: bool, n: int,
                     "missing. Upload your invoices, your settlement report "
                     "and your bank statement, then run again.")
         result = run_recon(batch, truth=truth, use_agent=use_agent,
+                           source=source, business_id=business_id,
                            on_progress=progress)
+
+        # Settlement and GST findings both survive a restart; recon's used to
+        # live only in RECON_RUNS above, which is fine for this page and not
+        # enough for the cash forecaster to check later - see
+        # merchant/cross_agent_tools.py's recon_status.
+        with ledger(business_id) as led:
+            run_id = led.commit_recon_run(source, len(result.rows))
+            led.record_recon_findings(run_id, result.rows)
+
         with _recon_lock:
             RECON_RUNS[key] = {"state": "done", "business_id": business_id,
                                "source": source, "phase": "done",
@@ -2065,6 +2129,17 @@ def _recon_state(key: str, business_id: str = "",
             if (state.get("business_id") == business_id
                     and state.get("state") == "done"
                     and state.get("source") == source):
+                return found, dict(state)
+    return "", {}
+
+
+def _latest_recon_run(business_id: str) -> tuple[str, dict]:
+    """This business's most recent completed reconciliation, whichever tab it
+    came from - same reasoning as _latest_cash_run."""
+    with _recon_lock:
+        for found, state in reversed(list(RECON_RUNS.items())):
+            if (state.get("business_id") == business_id
+                    and state.get("state") == "done"):
                 return found, dict(state)
     return "", {}
 
@@ -4035,6 +4110,7 @@ def itc_run_page(key: str, ws: Workspace = Depends(required_workspace)):
             run_id = latest["run_id"] if latest else None
 
         findings = led.itc_findings(run_id) if run_id else []
+        gateway_credit = led.gateway_fee_credit() if run_id else None
 
     running = state.get("state") == "running"
     if running or not findings:
@@ -4052,6 +4128,27 @@ def itc_run_page(key: str, ws: Workspace = Depends(required_workspace)):
     safe = claimed - at_risk
 
     cards = "".join(_finding_card(f) for f in action)
+
+    # The fourth cross-agent connection, and a different shape from the other
+    # three: not an agent asking another agent's findings about the same
+    # record, but a fact the settlement auditor already verified that the
+    # purchase register this page audits has never heard of. Razorpay is a
+    # supplier too - GST on its fee is input credit like any other - and
+    # nothing here surfaces it unless this card does. See
+    # Ledger.gateway_fee_credit().
+    gateway_credit_card = ""
+    if gateway_credit and gateway_credit["paise"]:
+        n = gateway_credit["count"]
+        gateway_credit_card = f"""
+<div class="card" style="border-left:3px solid var(--brand);margin-bottom:16px">
+  <h2 style="font-size:15px">Also claimable: GST paid to Razorpay</h2>
+  <p class="sub" style="margin:6px 0 0">Your settlement audit has verified
+     <b>{views.esc(gateway_credit["display"])}</b> of GST across {n} settled
+     payment{"" if n == 1 else "s"} as correctly charged &mdash; Razorpay is a
+     supplier too, and this is input credit like any other, but it never
+     appears in your purchase register.
+     <a href="/settlements">See your settlements &rarr;</a></p>
+</div>"""
 
     if action:
         section = (
@@ -4086,6 +4183,7 @@ def itc_run_page(key: str, ws: Workspace = Depends(required_workspace)):
   </div>
 </div>
 
+{gateway_credit_card}
 {section}
 
 <div class="card tint" style="margin-top:20px">
@@ -4169,6 +4267,22 @@ def _agent_state(led, ws, spec, source_kind) -> str:
         if led.filing_history_summary():
             return ui.STATE_ACTIVE if led.purchases(1) else ui.STATE_SETUP
         return ui.STATE_DEMO
+    # Cash forecast and three-way recon results live in the run-state dicts
+    # rather than the database (see _latest_cash_run / _latest_recon_run), so
+    # without this branch these two always fell through to STATE_SETUP - a
+    # card saying "set it up" for an agent a merchant had already run.
+    if spec.id == "cash_forecaster":
+        _key, cash = _latest_cash_run(ws.business_id)
+        if not cash:
+            return ui.STATE_SETUP
+        return (ui.STATE_DEMO if cash.get("source") == "demo"
+                else ui.STATE_ACTIVE)
+    if spec.id == "three_way_recon":
+        _key, recon = _latest_recon_run(ws.business_id)
+        if not recon:
+            return ui.STATE_SETUP
+        return (ui.STATE_DEMO if recon.get("source") == "demo"
+                else ui.STATE_ACTIVE)
     return ui.STATE_SETUP
 
 
@@ -4189,6 +4303,21 @@ def _agent_metrics(led, ws, spec) -> list:
         exposed = last["exposed_paise"] if last else 0
         return [(str(len(led.purchases(limit=5_000))), "invoices"),
                 (rupees(exposed), "credit at risk")]
+    if spec.id == "cash_forecaster":
+        _key, cash = _latest_cash_run(ws.business_id)
+        if not cash:
+            return []
+        forecast = (cash.get("payload") or {}).get("forecast") or {}
+        trough = forecast.get("trough") or {}
+        return [(forecast.get("finding_label", "—"), "latest forecast"),
+                (rupees(trough.get("shortfall", 0)), "shortfall at the low point")]
+    if spec.id == "three_way_recon":
+        _key, recon = _latest_recon_run(ws.business_id)
+        if not recon:
+            return []
+        metrics = (recon.get("payload") or {}).get("match_metrics") or {}
+        return [(f'{metrics.get("match_rate_percentage", 0)}%', "auto-reconciled"),
+                (rupees(metrics.get("at_stake", 0)), "at stake")]
     return []
 
 
@@ -5697,7 +5826,7 @@ SETTLEMENT_RECOMMEND = {
 }
 
 
-def _settlement_card(f, instrument: str) -> str:
+def _settlement_card(f, instrument: str, run_id: str) -> str:
     """One finding, laid out the way the input credit findings are."""
     import json as _json
 
@@ -5722,6 +5851,29 @@ def _settlement_card(f, instrument: str) -> str:
     confidence = ("arithmetic, not judgment"
                   if f["decided_by"] == "calculator"
                   else f'the agent at {(f["confidence"] or 0):.0%} confidence')
+
+    # A human's word on this, remembered so the agent can recall it the next
+    # time a similar case comes up rather than raising the same question
+    # twice. CLAUDE.md section 12 - this is the button that feeds it.
+    if f["human_reviewed"]:
+        resolve_block = ('<div class="held" style="background:var(--brand-wash);'
+                         'color:var(--brand-ink)">Reviewed &mdash; the agent '
+                         'will recall this the next time a similar case comes '
+                         'up</div>')
+    else:
+        resolve_block = f"""
+  <details class="working" style="border-top:0;padding-top:9px">
+    <summary>Mark this resolved</summary>
+    <form method="post" action="/agents/settlement/resolve"
+          style="margin-top:9px;display:flex;gap:8px;flex-wrap:wrap">
+      <input type="hidden" name="run_id" value="{views.esc(run_id)}">
+      <input type="hidden" name="payment_id" value="{views.esc(f["payment_id"])}">
+      <input type="hidden" name="exception_code" value="{views.esc(code)}">
+      <input type="text" name="resolution" required style="flex:1;min-width:220px"
+             placeholder="What did you decide? e.g. disputed with Razorpay, ticket #4471">
+      <button type="submit" class="btn small">Save</button>
+    </form>
+  </details>"""
 
     return f"""
 <div class="finding-card">
@@ -5752,6 +5904,7 @@ def _settlement_card(f, instrument: str) -> str:
   </div>
   {held}
   {dispute}
+  {resolve_block}
 
   <details class="working">
     <summary>Show the working</summary>
@@ -5777,7 +5930,7 @@ def _settlement_card(f, instrument: str) -> str:
 
 
 @app.get("/agents/settlement/run/{run_id}", response_class=HTMLResponse)
-def settlement_page(run_id: str, request: Request,
+def settlement_page(run_id: str, request: Request, error: str = "", ok: str = "",
                     ws: Workspace = Depends(required_workspace)):
     from merchant.ratelimit import client_address
 
@@ -5942,7 +6095,7 @@ def settlement_page(run_id: str, request: Request,
             upi_reference=row["upi_reference"]))
         return card["instruments"][key]["label"]
 
-    cards = [_settlement_card(f, _instrument(f["payment_id"]))
+    cards = [_settlement_card(f, _instrument(f["payment_id"]), run_id)
              for f in findings
              if f["exception_code"] not in {"CLEAN", "ROUNDING"}]
     quiet = len(findings) - len(cards)
@@ -6093,6 +6246,8 @@ def settlement_page(run_id: str, request: Request,
     if ties else "WARNING: these lines do not reconcile."}</p>
 </div>
 
+{f'<div class="banner warn"><span>{views.esc(error)}</span></div>' if error else ''}
+{f'<div class="banner brand"><span>{views.esc(ok)}</span></div>' if ok else ''}
 {control}
 {trace_panel}
 {results}
@@ -6106,6 +6261,58 @@ def settlement_page(run_id: str, request: Request,
      known.</p>
 </div>"""
     return views.page(f"Settlement {run_id}", body, "settlements", **shell)
+
+
+@app.post("/agents/settlement/resolve")
+async def resolve_settlement_finding(request: Request,
+                                     ws: Workspace = Depends(required_workspace)):
+    """
+    Record what a person decided about one settlement finding.
+
+    CLAUDE.md section 12: this is the one place resolution memory is
+    written. It does not dispute anything or touch a ledger - it is a note
+    to the agent, recalled read-only through similar_past_cases the next
+    time a finding with the same exception code comes up. Guardrail 1 still
+    holds: a human decided, this only remembers what they decided.
+    """
+    from urllib.parse import quote
+
+    form = await request.form()
+    run_id = str(form.get("run_id") or "")
+    payment_id = str(form.get("payment_id") or "")
+    exception_code = str(form.get("exception_code") or "")
+    resolution = str(form.get("resolution") or "").strip()
+
+    if not resolution:
+        return RedirectResponse(
+            f"/agents/settlement/run/{quote(run_id)}?error="
+            + quote("Say what you decided before saving it."),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        if not led.owns_run(run_id):
+            return HTMLResponse(views.error_page(
+                "Not this business's settlement",
+                "That settlement belongs to a different business.",
+                "Back", "/settlements"), status_code=404)
+
+        led.store.remember_resolution(exception_code, payment_id, resolution,
+                                      business_id=ws.business_id)
+        # human_reviewed is set only here, from an actual click - never by
+        # engine/ or agent/, which run with no human in the loop. See
+        # test_the_codebase_never_sets_human_reviewed.
+        led.conn.execute(
+            "UPDATE variances SET human_reviewed = 1"
+            " WHERE run_id = ? AND payment_id = ?", (run_id, payment_id))
+        led.conn.commit()
+        AccessLog(led.conn).record(
+            Action.RESOLVE_FINDING, user=ws.user, business_id=ws.business_id,
+            target=payment_id, detail=f"{exception_code}: {resolution}")
+
+    return RedirectResponse(
+        f"/agents/settlement/run/{quote(run_id)}?ok="
+        + quote("Saved. The agent will recall this next time a similar case "
+                "comes up."), status_code=303)
 
 
 # --- the platform, not a business ----------------------------------------

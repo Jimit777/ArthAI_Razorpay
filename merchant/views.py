@@ -1297,6 +1297,19 @@ def _recon_exception(row: dict, findings: dict, notes: dict,
             for n, c in counted.items())
         checked = f'<div class="looked-up" style="margin-top:6px">{chips}</div>'
 
+    # The cross-agent connection to the settlement auditor, made clickable.
+    # Before this, "the gateway has no settlement for this" and "the gateway
+    # already has this under dispute" read as the same finding - a merchant
+    # had no way to tell the two apart without opening the settlement audit
+    # by hand and searching for the payment themselves.
+    disputed = "".join(
+        f'<div style="margin-top:5px;font-size:11.3px;color:var(--danger)">'
+        f'Already under dispute in your settlement audit &mdash; '
+        f'<b>{esc(f["money_at_stake_display"])}</b> &middot; '
+        f'<a href="/agents/settlement/run/{esc(f["run_id"])}" '
+        f'style="color:var(--danger);font-weight:600">See it &rarr;</a></div>'
+        for f in (row.get("disputed_findings") or []))
+
     return f"""
       <tr>
         <td style="max-width:44ch">
@@ -1304,6 +1317,7 @@ def _recon_exception(row: dict, findings: dict, notes: dict,
           <div style="color:var(--muted);font-size:11.3px;margin-top:3px">
             {esc(row["reasoning"] or notes.get(row["finding_type"], ""))}</div>
           {checked}
+          {disputed}
           <div class="mono" style="color:var(--faint);font-size:10.5px;
             margin-top:3px">
             {esc(row["invoice_id"] or "no invoice")} &middot;
@@ -1617,12 +1631,16 @@ def risk_tools_checked(calls: list) -> str:
 RECON_TOOL_WORDS = {
     "nearby_settlements": "searched for a settlement",
     "nearby_bank_credits": "searched for a credit",
+    "settlement_status": "checked the settlement audit",
 }
 
 TOOL_WORDS = {
     "what_if_delayed": "simulated moving a payment",
     "payout_detail": "looked up a payment",
     "movements_on": "opened a day in the forecast",
+    "settlement_status": "checked the settlement audit for a dispute",
+    "at_risk_input_credit": "checked the GST reconciler for credit at risk",
+    "recon_status": "checked the three-way reconciliation",
 }
 
 CASH_TONE = {
@@ -2063,6 +2081,77 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
     verdict = payload.get("verdict") or {}
     trough = forecast.get("trough") or {}
 
+    # The one live cross-agent connection on this platform, made clickable
+    # rather than left as a sentence in the reasoning below. Before this, a
+    # merchant could read that a receipt was disputed and had no way to open
+    # the actual finding - the two agents talked to each other and the
+    # merchant was still cut out of the conversation. Computed here, ahead of
+    # the CASH_HEALTHY branch below, because a dispute is worth knowing about
+    # whether or not the month is otherwise short - a comfortable balance
+    # that includes disputed money is not as comfortable as it looks.
+    disputed = ""
+    receipts = verdict.get("disputed_receipts") or []
+    if receipts:
+        rows = "".join(
+            f'<div style="margin-top:{0 if i == 0 else 10}px">'
+            f'<b>{esc(r["payment_id"])}</b> is under an unresolved '
+            f'{esc(r["exception_code"].replace("_", " ").lower())} dispute '
+            f'&mdash; <b>{esc(r["money_at_stake_display"])}</b> at stake.'
+            f'<br><a href="/agents/settlement/run/{esc(r["run_id"])}" '
+            f'style="color:var(--danger);font-weight:600">'
+            f'See it in your settlement audit &rarr;</a></div>'
+            for i, r in enumerate(receipts))
+        disputed = (
+            f'<div class="draft" style="border-left:3px solid var(--danger)">'
+            f'<div style="font-weight:600;margin-bottom:2px">Before counting '
+            f'on this money: your settlement audit already found a problem'
+            f'</div>{rows}</div>')
+
+    # The third live cross-agent connection: this exact receipt already
+    # flagged by the three-way reconciler - never credited by the bank, or
+    # credited as a different amount. Grouped with `disputed` above rather
+    # than with the credit check below, because both are the same kind of
+    # question: is this specific piece of the curve actually real.
+    recon_flagged = ""
+    flags = verdict.get("recon_flagged") or []
+    if flags:
+        rows = "".join(
+            f'<div style="margin-top:{0 if i == 0 else 10}px">'
+            f'<b>{esc(r["payment_id"])}</b> was flagged by your three-way '
+            f'reconciliation as '
+            f'{esc(r["finding"].replace("_", " ").lower())} '
+            f'&mdash; <b>{esc(r["at_stake_display"])}</b> at stake.'
+            f'<br><a href="/agents/three-way" '
+            f'style="color:var(--danger);font-weight:600">'
+            f'See it in your reconciliation &rarr;</a></div>'
+            for i, r in enumerate(flags))
+        recon_flagged = (
+            f'<div class="draft" style="border-left:3px solid var(--danger)">'
+            f'<div style="font-weight:600;margin-bottom:2px">Before counting '
+            f'on this money: your three-way reconciliation already flagged '
+            f'it</div>{rows}</div>')
+
+    # The second live cross-agent connection: claimed input tax credit the
+    # GST reconciler found should not have been claimed. Unlike a disputed
+    # receipt this is not money the curve is counting as arriving - it is a
+    # standing liability sitting outside the thirty days entirely, which is
+    # exactly why a balance that looks fine can still be wrong.
+    at_risk_credit = ""
+    credit = verdict.get("at_risk_credit") or {}
+    if credit.get("at_risk_paise"):
+        n = credit.get("count", 0)
+        at_risk_credit = (
+            f'<div class="draft" style="border-left:3px solid var(--warn)">'
+            f'<div style="font-weight:600;margin-bottom:2px">Outside this '
+            f'curve: {esc(credit.get("at_risk_display", ""))} of claimed '
+            f'input credit may have to be repaid</div>'
+            f'<div>{n} claim{"" if n == 1 else "s"} your GST reconciler '
+            f'found blocked, past deadline, or claimed twice &mdash; left '
+            f'unfixed this becomes a demand with interest, not a forecast '
+            f'line.<br><a href="/agents/input-credit/reconciliation" '
+            f'style="color:var(--warn);font-weight:600">See it in your '
+            f'input credit reconciliation &rarr;</a></div></div>')
+
     if forecast["finding_type"] == "CASH_HEALTHY":
         return f"""
 <div class="finding-card">
@@ -2074,6 +2163,9 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
     {badge(forecast["finding_label"], "good")}
   </div>
   <p class="finding-card-why">{esc(forecast["detail"])}</p>
+  {disputed}
+  {recon_flagged}
+  {at_risk_credit}
 </div>"""
 
     held = ""
@@ -2166,6 +2258,9 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
     {esc(forecast["action_label"])}
   </div>
   {held}
+  {disputed}
+  {recon_flagged}
+  {at_risk_credit}
   {looked_up}
   {corrections}
 

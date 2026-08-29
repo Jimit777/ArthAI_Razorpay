@@ -328,13 +328,22 @@ class ClaudeClassifier:
 
     def __init__(self, batch, client=None, model: str = MODEL,
                  effort: str = DEFAULT_EFFORT,
-                 max_iterations: int = MAX_ITERATIONS):
+                 max_iterations: int = MAX_ITERATIONS,
+                 memory: Optional[list] = None):
+        """
+        `memory` is CLAUDE.md section 12's resolution memory: past cases a
+        human has already confirmed. A caller with a database - the live
+        merchant app - passes `led.store.resolutions()` here. A caller
+        without one - a script, a test - gets the old behaviour: the JSON
+        file at agent/tools.py's MEMORY_PATH, which nothing has ever
+        written, so this stays a no-op wherever it always was one.
+        """
         import anthropic
 
         from agent.tools import load_memory
 
         self._client = client if client is not None else anthropic.Anthropic()
-        memory = load_memory()
+        memory = load_memory() if memory is None else memory
         self._tools = build_tools(batch, batch.rate_card, memory)
         self._system = system_prompt(has_memory=bool(memory))
         self._model = model

@@ -205,6 +205,43 @@ CREATE TABLE IF NOT EXISTS business_itc_runs (
   created_at  INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS business_recon_runs (
+  run_id      TEXT PRIMARY KEY,
+  business_id TEXT NOT NULL,
+  source      TEXT,
+  n_records   INTEGER,
+  created_at  INTEGER
+);
+
+-- What the three-way join could not resolve, one row per exception. Matched
+-- lines are not stored here - the only question anything downstream ever
+-- asks is "did the reconciler flag this payment", never "was it ever clean".
+--
+-- This did not exist until the cash forecaster needed to ask the
+-- reconciler whether a receipt it is counting on was ever flagged.
+-- Settlement and GST findings both survive a restart already; recon's
+-- lived only in the run-state dict, which is fine for a page a person is
+-- looking at and not enough for another agent to check later.
+CREATE TABLE IF NOT EXISTS recon_findings (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id       TEXT,
+  business_id  TEXT NOT NULL,
+  invoice_id   TEXT,
+  txn_id       TEXT,
+  utr_number   TEXT,
+  finding      TEXT,
+  variance     INTEGER,
+  at_stake     INTEGER,
+  action       TEXT,
+  reasoning    TEXT,
+  detail       TEXT,
+  created_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_recon_findings_run ON recon_findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_recon_findings_txn
+  ON recon_findings(business_id, txn_id);
+
 CREATE INDEX IF NOT EXISTS idx_purchases_biz ON live_purchases(business_id);
 CREATE INDEX IF NOT EXISTS idx_gstr2b_biz    ON live_gstr2b(business_id);
 
@@ -332,6 +369,13 @@ class Ledger:
 
         _add_column(self.store.conn, "supplier_filing_history",
                     "gstr3b_known", "INTEGER DEFAULT 1")
+        # Resolution memory predates business scoping - CLAUDE.md section 12
+        # was written when this was a single-business tool. Without this
+        # column one merchant's confirmed resolution could be recalled for
+        # another merchant's variance with the same exception code, which is
+        # exactly the leak this platform's scoping exists to prevent.
+        _add_column(self.store.conn, "resolution_memory",
+                    "business_id", "TEXT DEFAULT ''")
         self.store.conn.commit()
         from merchant.businesses import Businesses
 
@@ -452,6 +496,57 @@ class Ledger:
     def latest_itc_run(self):
         return self.conn.execute(
             "SELECT * FROM business_itc_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
+
+    def commit_recon_run(self, source: str, n_records: int) -> str:
+        """
+        Register one reconciliation run, so its findings have somewhere to
+        attach to. Called whether or not there is anything to store - a
+        clean run still needs a run_id on record, the same way a settlement
+        with zero findings still gets a row in `runs`.
+        """
+        import time
+
+        run_id = f"recon_{secrets.token_hex(6)}"
+        self.conn.execute(
+            "INSERT INTO business_recon_runs (run_id, business_id, source,"
+            " n_records, created_at) VALUES (?,?,?,?,?)",
+            (run_id, self._scoped(), source, n_records, int(time.time())))
+        self.conn.commit()
+        return run_id
+
+    def record_recon_findings(self, run_id: str, rows) -> None:
+        """
+        Store the exceptions one three-way run left over - not the matched
+        lines, which nothing downstream ever needs to ask about again.
+
+        `rows` are ReconRow objects; only the unresolved ones are written.
+        """
+        import time
+
+        now = int(time.time())
+        business_id = self._scoped()
+        to_write = [
+            (run_id, business_id,
+             row.invoice.invoice_id if row.invoice else None,
+             row.settlement.txn_id if row.settlement else None,
+             row.bank.utr_number if row.bank else None,
+             row.finding, row.variance, row.at_stake, row.action,
+             row.reasoning, row.detail, now)
+            for row in rows if not row.resolved]
+        if not to_write:
+            return
+        self.conn.executemany(
+            "INSERT INTO recon_findings (run_id, business_id, invoice_id,"
+            " txn_id, utr_number, finding, variance, at_stake, action,"
+            " reasoning, detail, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", to_write)
+        self.conn.commit()
+
+    def latest_recon_run(self):
+        return self.conn.execute(
+            "SELECT * FROM business_recon_runs WHERE business_id = ?"
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (self._scoped(),)).fetchone()
 
@@ -1408,6 +1503,40 @@ class Ledger:
         return self.conn.execute(
             "SELECT 1 FROM business_runs WHERE run_id = ? AND business_id = ?",
             (run_id, self._scoped())).fetchone() is not None
+
+    def gateway_fee_credit(self) -> dict:
+        """
+        GST this business has paid to Razorpay on gateway fees, verified
+        correct by the settlement audit - the fourth cross-agent connection,
+        and a different shape from the other three.
+
+        The other three are an agent, mid-judgment, asking another agent's
+        findings about the SAME record. There is no equivalent "same record"
+        here: a purchase from a supplier and a payment from a customer share
+        nothing to look up by id. What connects them is a fact, not a
+        lookup - Razorpay is itself a supplier, GST charged on its fee is
+        input credit exactly like GST paid to anyone else, and nothing in
+        the purchase register the GST reconciler audits has ever heard of
+        it. Surfacing a fact needs no judgment, so this is a calculator-only
+        query, not a tool an agent calls.
+
+        Scoped to CLEAN and ROUNDING findings only - the same "safe to
+        claim" standard the ITC page already applies to everything else on
+        it. A fee under dispute carries a disputed tax figure on top of it;
+        claiming credit on a number that might still change is exactly the
+        mistake claiming credit exists to avoid.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(v.actual_tax), 0) paise"
+            " FROM variances v JOIN business_runs br ON br.run_id = v.run_id"
+            " WHERE br.business_id = ?"
+            " AND v.exception_code IN ('CLEAN', 'ROUNDING')",
+            (self._scoped(),)).fetchone()
+
+        from engine.gst import rules
+
+        return {"paise": row["paise"], "display": rules.rupees(row["paise"]),
+                "count": row["n"]}
 
     def load_batch(self, run_id: str, rate_card: dict) -> Optional[Batch]:
         """

@@ -119,7 +119,8 @@ class ReconResult:
 
 
 def run(batch: ReconBatch, *, truth: Optional[dict] = None,
-        use_agent: bool = True, agent=None,
+        use_agent: bool = True, agent=None, source: str = "demo",
+        business_id: str = "",
         on_progress: Optional[Callable[..., None]] = None) -> ReconResult:
     """Join the three sources, then ask the agent about what is left."""
     def say(**kw):
@@ -167,7 +168,31 @@ def run(batch: ReconBatch, *, truth: Optional[dict] = None,
         say(phase=f"Explained {done['n']} of {len(exceptions)}",
             done=done["n"], total=len(exceptions))
 
-    verdicts = {v.key: v for v in agent.judge_all(exceptions, on_each=each)}
+    # The cross-agent settlement check only makes sense over real, connected
+    # data - a demo run's txn_ids were generated fresh for that scenario and
+    # were never audited by anything. See cross_agent_tools.build_tools().
+    #
+    # A factory rather than one pre-built tool: judge_all runs several rows
+    # in parallel, and each row needs its OWN accumulator so one payment's
+    # dispute cannot end up attached to a different row's verdict.
+    #
+    # settlement_status only - at_risk_input_credit is the treasury agent's
+    # connection to the GST reconciler and has nothing to do with explaining
+    # a three-way gap, so it is filtered out rather than offered unused.
+    extra_tools_factory = None
+    if source != "demo" and business_id:
+        from merchant.cross_agent_tools import build_tools as cross_agent_tools
+
+        def _extra_tools_factory():
+            found: list = []
+            tools = [t for t in cross_agent_tools(business_id, found=found)
+                    if t.name == "settlement_status"]
+            return tools, found
+
+        extra_tools_factory = _extra_tools_factory
+
+    verdicts = {v.key: v for v in agent.judge_all(
+        exceptions, on_each=each, extra_tools_factory=extra_tools_factory)}
     for verdict in verdicts.values():
         out.usage.add(verdict)
 
@@ -181,6 +206,7 @@ def run(batch: ReconBatch, *, truth: Optional[dict] = None,
         if verdict.headline:
             row.reasoning = verdict.reasoning
         row.tool_calls = list(verdict.tool_calls)
+        row.disputed_findings = list(verdict.disputed_findings)
         row.errored = bool(verdict.error)
         if verdict.error:
             out.failed_calls += 1

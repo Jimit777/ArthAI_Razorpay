@@ -73,6 +73,7 @@ class Action(StrEnum):
     ARCHIVE_BUSINESS = "archive_business"
     DELETE_BUSINESS = "delete_business"
     RUN_BENCHMARK = "run_benchmark"
+    RESOLVE_FINDING = "resolve_finding"
 
 
 ACTION_LABEL = {
@@ -88,6 +89,7 @@ ACTION_LABEL = {
     Action.ARCHIVE_BUSINESS: "Archived or restored a business",
     Action.DELETE_BUSINESS: "Deleted a business",
     Action.RUN_BENCHMARK: "Ran the accuracy benchmark",
+    Action.RESOLVE_FINDING: "Marked a settlement finding resolved",
 }
 
 

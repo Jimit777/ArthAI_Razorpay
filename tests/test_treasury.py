@@ -992,6 +992,141 @@ def test_what_it_checked_is_shown_to_the_merchant(shop):
     assert "&times;2" in page
 
 
+def test_a_disputed_receipt_becomes_a_clickable_link(shop):
+    """
+    The one live cross-agent connection, made visible rather than left as a
+    sentence buried in the agent's prose. A merchant reading this page should
+    be able to open the actual settlement finding, not just be told about it.
+    """
+    import merchant.app as appmod
+
+    key, state = _forecast(shop)
+    payload = state["payload"]
+    payload["verdict"] = {
+        "action": payload["forecast"]["action"], "confidence": 0.9,
+        "reasoning": "Do not count on the relief receipt.",
+        "hold_payout_id": None, "hold_days": None,
+        "tool_calls": ["settlement_status"], "corrections": [], "errored": False,
+        "disputed_receipts": [{
+            "payment_id": "pay_9K3fL2xQ1z", "run_id": "run_abcd1234",
+            "exception_code": "ZERO_MDR_VIOLATION", "money_at_stake": 200000,
+            "money_at_stake_display": "Rs 2,000.00",
+        }],
+    }
+    with appmod._cash_lock:
+        appmod.CASH_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "pay_9K3fL2xQ1z" in page
+    assert "zero mdr violation" in page
+    assert "Rs 2,000.00" in page
+    assert 'href="/agents/settlement/run/run_abcd1234"' in page
+    assert "your settlement audit already found a problem" in page
+
+
+def test_no_dispute_means_no_extra_banner(shop):
+    """The common case - nothing to link to, nothing extra shown."""
+    key, _state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "your settlement audit already found a problem" not in page
+
+
+def test_at_risk_credit_becomes_a_clickable_link(shop):
+    """
+    The second live cross-agent connection: claimed GST input credit at risk
+    of being clawed back, surfaced the same way the disputed receipt is -
+    a link into the agent that actually found it, not a sentence about it.
+    """
+    import merchant.app as appmod
+
+    key, state = _forecast(shop)
+    payload = state["payload"]
+    payload["verdict"] = {
+        "action": payload["forecast"]["action"], "confidence": 0.9,
+        "reasoning": "Watch the claimed credit at risk this quarter.",
+        "hold_payout_id": None, "hold_days": None,
+        "tool_calls": ["at_risk_input_credit"], "corrections": [],
+        "errored": False,
+        "at_risk_credit": {"at_risk_paise": 500000,
+                           "at_risk_display": "Rs 5,000.00", "count": 2},
+    }
+    with appmod._cash_lock:
+        appmod.CASH_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "Rs 5,000.00" in page
+    assert "2 claims" in page
+    assert 'href="/agents/input-credit/reconciliation"' in page
+    assert "may have to be repaid" in page
+
+
+def test_no_at_risk_credit_means_no_extra_banner(shop):
+    key, _state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "may have to be repaid" not in page
+
+
+def test_a_healthy_month_still_shows_at_risk_credit(shop):
+    """A comfortable balance that includes money owed back is not as
+    comfortable as it looks - this has to survive the CASH_HEALTHY branch,
+    which returns early and does not otherwise look at the verdict at all."""
+    import merchant.app as appmod
+
+    key, state = _forecast(shop)
+    payload = state["payload"]
+    payload["forecast"]["finding_type"] = "CASH_HEALTHY"
+    payload["verdict"] = {
+        "action": "none", "confidence": 0.9, "reasoning": "Comfortable.",
+        "hold_payout_id": None, "hold_days": None, "tool_calls": [],
+        "corrections": [], "errored": False,
+        "at_risk_credit": {"at_risk_paise": 500000,
+                           "at_risk_display": "Rs 5,000.00", "count": 1},
+    }
+    with appmod._cash_lock:
+        appmod.CASH_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "may have to be repaid" in page
+
+
+def test_a_recon_flag_becomes_a_clickable_link(shop):
+    """
+    The third live cross-agent connection: a receipt this forecast is
+    counting on that the three-way reconciler already flagged as never
+    credited - same treatment as the other two connections.
+    """
+    import merchant.app as appmod
+
+    key, state = _forecast(shop)
+    payload = state["payload"]
+    payload["verdict"] = {
+        "action": payload["forecast"]["action"], "confidence": 0.9,
+        "reasoning": "Do not count on the flagged receipt.",
+        "hold_payout_id": None, "hold_days": None,
+        "tool_calls": ["recon_status"], "corrections": [], "errored": False,
+        "recon_flagged": [{
+            "payment_id": "pay_9K3fL2xQ1z", "run_id": "recon_abcd1234",
+            "finding": "MISSING_IN_BANK", "at_stake": 488200,
+            "at_stake_display": "Rs 4,882.00",
+        }],
+    }
+    with appmod._cash_lock:
+        appmod.CASH_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "pay_9K3fL2xQ1z" in page
+    assert "missing in bank" in page
+    assert "Rs 4,882.00" in page
+    assert 'href="/agents/three-way"' in page
+    assert "your three-way reconciliation already flagged it" in page
+
+
+def test_no_recon_flag_means_no_extra_banner(shop):
+    key, _state = _forecast(shop)
+    page = shop.get(f"/agents/cash-forecaster?key={key}").text
+    assert "your three-way reconciliation already flagged it" not in page
+
+
 def test_a_tool_run_reports_what_it_actually_cost():
     """
     Regression, and it was live in the settlement agent too.
@@ -1024,6 +1159,9 @@ def test_a_tool_run_reports_what_it_actually_cost():
         def __iter__(self):
             return iter(turns)
 
+        def generate_tool_call_response(self):
+            return None
+
     class Client:
         class beta:
             class messages:
@@ -1036,3 +1174,367 @@ def test_a_tool_run_reports_what_it_actually_cost():
 
     assert verdict.input_tokens == 3600, "only the last turn was counted"
     assert verdict.output_tokens == 650
+
+
+def test_extra_tools_reach_the_model_alongside_the_built_in_ones():
+    """
+    The cross-agent settlement lookup is built outside this module (it needs
+    database access this layer deliberately does not have - see
+    merchant/cross_agent_tools.py) and handed in as `extra_tools`. Confirm it
+    actually reaches the tool_runner call rather than being dropped.
+    """
+    from agent.treasury_classifier import ClaudeTreasuryAgent
+
+    seen = {}
+
+    class Captures:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**kw):
+                    seen["tools"] = kw["tools"]
+                    raise ConnectionError("down")
+
+    def fake_settlement_status():
+        pass
+    fake_settlement_status.name = "settlement_status"
+
+    forecast = project_cash_flow(generate(as_of=TODAY)[0])
+    ClaudeTreasuryAgent(client=Captures()).judge(
+        forecast, extra_tools=[fake_settlement_status])
+
+    names = [getattr(t, "name", t) for t in seen["tools"]]
+    assert "settlement_status" in names
+
+
+def test_a_demo_run_never_gets_the_cross_agent_tool():
+    """
+    A demo forecast's payment ids were generated fresh for that scenario -
+    nothing in the settlement tables has ever heard of them. Offering the
+    tool there would only ever answer "nothing found", which is an artifact
+    of the demo data, not a checked fact. See cross_agent_tools.build_tools().
+    """
+    seen = {}
+
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            seen["extra_tools"] = extra_tools
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, planted = generate(as_of=TODAY)
+    run(inputs, agent=FakeAgent(), source="demo", business_id="biz_1",
+        planted=planted)
+
+    assert seen["extra_tools"] == []
+
+
+def test_a_connected_run_is_offered_the_cross_agent_tool():
+    seen = {}
+
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            seen["extra_tools"] = extra_tools
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    run(inputs, agent=FakeAgent(), source="connected", business_id="biz_1")
+
+    names = {t.name for t in seen["extra_tools"]}
+    assert names == {"settlement_status", "at_risk_input_credit",
+                     "recon_status"}
+
+
+def test_a_connected_run_with_no_business_gets_no_extra_tool():
+    """Belt and braces: the tool needs a business to scope its query to, and
+    without one the pipeline should not try to build it at all."""
+    seen = {}
+
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            seen["extra_tools"] = extra_tools
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    run(inputs, agent=FakeAgent(), source="connected", business_id="")
+
+    assert seen["extra_tools"] == []
+
+
+def test_a_figure_from_a_tool_is_not_flagged_as_invented():
+    """
+    Same fix as the settlement agent's classifier.py, and the same reason:
+    the cross-agent tool can tell the model a relief receipt is under dispute
+    for a specific rupee figure, and that figure was computed by our own
+    Python - not made up. Checking the model's reasoning only against the
+    static evidence text would flag it as invented and throw the whole
+    recommendation away, exactly as it did live before this fix.
+    """
+    from agent.treasury_classifier import ClaudeTreasuryAgent, TreasuryJudgment
+
+    tool_json = ('{"payment_id": "pay_x", "at_risk":'
+                ' {"paise": 200000, "display": "Rs 2,000.00"}}')
+
+    def _judgment():
+        return TreasuryJudgment(
+            exception_code="CASH_CRUNCH_WARNING", action="delay_payout",
+            confidence=0.9, hold_payout_id="V-1042", hold_days=4,
+            reasoning="Hold V-1042. One relief receipt is under dispute for "
+                      "Rs 2,000.00, so do not count on all of it arriving.")
+
+    class ToolUseBlock:
+        type = "tool_use"
+        name = "settlement_status"
+
+    class Turn:
+        def __init__(self, content=None, last=False):
+            self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 10,
+                                        "cache_read_input_tokens": 0})()
+            self.content = content or []
+            self.parsed_output = _judgment() if last else None
+
+    turns = [Turn([ToolUseBlock()]), Turn([], last=True)]
+
+    class Runner:
+        def __init__(self):
+            self._served = False
+
+        def __iter__(self):
+            return iter(turns)
+
+        def generate_tool_call_response(self):
+            if not self._served:
+                self._served = True
+                return {"content": [{"type": "tool_result",
+                                    "content": tool_json}]}
+            return None
+
+    class Client:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**_kw):
+                    return Runner()
+
+    forecast = project_cash_flow(generate(as_of=TODAY)[0])
+    verdict = ClaudeTreasuryAgent(client=Client()).judge(forecast)
+
+    assert verdict.corrections == [], (
+        "a figure the tool supplied was wrongly treated as invented")
+    assert "under dispute" in verdict.reasoning
+
+
+def test_a_found_dispute_is_attached_to_the_verdict(tmp_path, monkeypatch):
+    """
+    The whole reason the `found` accumulator exists: after judge() calls the
+    tool and returns, the pipeline has to read back what it found and attach
+    it to the verdict, or the merchant never sees a link to the actual
+    settlement finding - only a sentence in the agent's prose, which is where
+    this connection stood before it was made clickable.
+    """
+    import json as _json
+
+    import merchant.cross_agent_tools as cat
+    from merchant.ledger import Ledger
+
+    db = tmp_path / "found.db"
+    monkeypatch.setattr(cat, "DB", str(db))
+
+    bootstrap = Ledger(db)
+    business_id = bootstrap.businesses.create("Test Co")
+    bootstrap.close()
+
+    led = Ledger(db, business_id)
+    led.conn.execute(
+        "INSERT INTO business_runs (run_id, business_id, created_at)"
+        " VALUES ('run_disputed', ?, 0)", (business_id,))
+    led.conn.execute(
+        "INSERT INTO variances (payment_id, run_id, expected_fee, actual_fee,"
+        " expected_tax, actual_tax, delta, money_at_stake, exception_code,"
+        " confidence, reasoning, rule_cited, action, human_reviewed,"
+        " queued_for_human, created_at)"
+        " VALUES ('pay_relied_on', 'run_disputed', 0, 6100, 0, 1098, 7198,"
+        " 200000, 'ZERO_MDR_VIOLATION', 0.9, 'network MDR on UPI',"
+        " 'PSS Act s.10A', 'dispute', 0, 0, 0)")
+    led.conn.commit()
+    led.close()
+
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            for tool in extra_tools:
+                if tool.name == "settlement_status":
+                    tool.call({"payment_id": "pay_relied_on"})
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    result = run(inputs, agent=FakeAgent(), source="connected",
+                 business_id=business_id)
+
+    receipts = result.verdict.disputed_receipts
+    assert len(receipts) == 1
+    assert receipts[0]["payment_id"] == "pay_relied_on"
+    assert receipts[0]["run_id"] == "run_disputed"
+    assert receipts[0]["money_at_stake"] == 200000
+
+    # And it round-trips into the payload the page actually reads.
+    payload = _json.loads(_json.dumps(result.as_dict()))
+    assert payload["verdict"]["disputed_receipts"][0]["run_id"] == "run_disputed"
+
+
+def test_found_at_risk_credit_is_attached_to_the_verdict(tmp_path, monkeypatch):
+    """Same wiring, the other cross-agent connection: claimed input credit
+    the GST reconciler found should not have been claimed."""
+    import json as _json
+
+    import merchant.cross_agent_tools as cat
+    from merchant.ledger import Ledger
+
+    db = tmp_path / "found_credit.db"
+    monkeypatch.setattr(cat, "DB", str(db))
+
+    bootstrap = Ledger(db)
+    business_id = bootstrap.businesses.create("Test Co")
+    bootstrap.close()
+
+    led = Ledger(db, business_id)
+    led.conn.execute(
+        "INSERT INTO business_itc_runs (run_id, business_id, period,"
+        " n_invoices, created_at) VALUES ('itc_run', ?, '2026-08', 1, 0)",
+        (business_id,))
+    led.conn.execute(
+        "INSERT INTO itc_findings (run_id, business_id, invoice_id,"
+        " supplier_name, supplier_gstin, invoice_number, invoice_date,"
+        " taxable_value, cgst, sgst, igst, claimed_tax, available_tax, delta,"
+        " tolerance, exception_code, action, confidence, reasoning,"
+        " rule_cited, decided_by, money_at_stake, queued_for_human,"
+        " claim_deadline, days_to_deadline, created_at)"
+        " VALUES ('itc_run', ?, 'inv_1', 'Sundaram Packaging',"
+        " '29ABCDE1234F1Z5', 'INV-1001', '2026-08-01', 5000, 0, 0, 5000,"
+        " 5000, 5000, 0, 0, 'BLOCKED_CREDIT', 'do_not_claim', 0.9,"
+        " 'blocked credit', 's.17(5)', 'calculator', 5000, 0,"
+        " '2026-11-30', 30, 0)", (business_id,))
+    led.conn.commit()
+    led.close()
+
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            for tool in extra_tools:
+                if tool.name == "at_risk_input_credit":
+                    tool.call({})
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    result = run(inputs, agent=FakeAgent(), source="connected",
+                 business_id=business_id)
+
+    assert result.verdict.at_risk_credit["at_risk_paise"] == 5000
+    assert result.verdict.at_risk_credit["count"] == 1
+
+    payload = _json.loads(_json.dumps(result.as_dict()))
+    assert payload["verdict"]["at_risk_credit"]["at_risk_paise"] == 5000
+
+
+def test_no_tool_call_leaves_at_risk_credit_empty():
+    """The common case - the agent never called the tool, or found nothing.
+    An empty dict, not a missing key, so the page can check it uniformly."""
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    result = run(inputs, agent=FakeAgent(), source="demo")
+    assert result.verdict.at_risk_credit == {}
+
+
+def test_found_recon_flag_is_attached_to_the_verdict(tmp_path, monkeypatch):
+    """Third cross-agent connection: a receipt this run is counting on that
+    the three-way reconciler already flagged as never credited."""
+    import json as _json
+
+    import merchant.cross_agent_tools as cat
+    from merchant.ledger import Ledger
+
+    db = tmp_path / "found_recon.db"
+    monkeypatch.setattr(cat, "DB", str(db))
+
+    bootstrap = Ledger(db)
+    business_id = bootstrap.businesses.create("Test Co")
+    bootstrap.close()
+
+    led = Ledger(db, business_id)
+    led.conn.execute(
+        "INSERT INTO business_recon_runs (run_id, business_id, source,"
+        " n_records, created_at) VALUES ('recon_run', ?, 'connected', 1, 0)",
+        (business_id,))
+    led.conn.execute(
+        "INSERT INTO recon_findings (run_id, business_id, invoice_id,"
+        " txn_id, utr_number, finding, variance, at_stake, action,"
+        " reasoning, detail, created_at)"
+        " VALUES ('recon_run', ?, 'INV-9001', 'pay_relied_on', NULL,"
+        " 'MISSING_IN_BANK', 488200, 488200, 'chase',"
+        " 'The gateway settled this and the bank has no record of it.',"
+        " 'Settled Rs 4,882.00, no matching credit.', 0)", (business_id,))
+    led.conn.commit()
+    led.close()
+
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            for tool in extra_tools:
+                if tool.name == "recon_status":
+                    tool.call({"payment_id": "pay_relied_on"})
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    result = run(inputs, agent=FakeAgent(), source="connected",
+                 business_id=business_id)
+
+    flags = result.verdict.recon_flagged
+    assert len(flags) == 1
+    assert flags[0]["payment_id"] == "pay_relied_on"
+    assert flags[0]["run_id"] == "recon_run"
+    assert flags[0]["finding"] == "MISSING_IN_BANK"
+    assert flags[0]["at_stake"] == 488200
+
+    payload = _json.loads(_json.dumps(result.as_dict()))
+    assert payload["verdict"]["recon_flagged"][0]["run_id"] == "recon_run"
+
+
+def test_no_recon_tool_call_leaves_recon_flagged_empty():
+    class FakeAgent:
+        def judge(self, forecast, business="", inputs=None, extra_tools=None):
+            from agent.treasury_classifier import TreasuryVerdict
+
+            return TreasuryVerdict(exception_code=forecast.finding,
+                                   action=forecast.action, confidence=0.9,
+                                   reasoning="ok")
+
+    inputs, _ = generate(as_of=TODAY)
+    result = run(inputs, agent=FakeAgent(), source="demo")
+    assert result.verdict.recon_flagged == []

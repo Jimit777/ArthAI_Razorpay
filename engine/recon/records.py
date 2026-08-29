@@ -172,6 +172,10 @@ class ReconRow:
     # What it searched before settling on this. An agent that widened the
     # search and one that guessed produce identical prose.
     tool_calls: list = field(default_factory=list)
+    # What the settlement auditor already knew about this exact payment, if
+    # the agent checked - the cross-agent connection. Empty unless this run
+    # was over real, connected data; see merchant/cross_agent_tools.py.
+    disputed_findings: list = field(default_factory=list)
 
     @property
     def resolved(self) -> bool:
@@ -202,6 +206,7 @@ class ReconRow:
             "reasoning": self.reasoning,
             "action": self.action,
             "tool_calls": list(self.tool_calls),
+            "disputed_findings": list(self.disputed_findings),
             "action_label": ACTION_LABEL.get(self.action, self.action),
             "confidence": self.confidence,
             "resolved": self.resolved,

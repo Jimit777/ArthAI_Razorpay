@@ -558,6 +558,35 @@ def test_the_prompt_describes_only_the_tools_that_exist():
     assert "similar_past_cases" in system_prompt(has_memory=True)
 
 
+def test_a_classifier_given_memory_offers_the_tool(audited):
+    """
+    The merchant app passes `led.store.resolutions(...)` here - real rows
+    from a real database, not the JSON file at agent/tools.py's MEMORY_PATH,
+    which has never existed. This is the wiring that makes that reach the
+    model at all.
+    """
+    b, _, _ = audited
+    cases = [{"exception_code": "ZERO_MDR_VIOLATION", "resolution": "credited back"}]
+
+    classifier = ClaudeClassifier(b, client=_Exploding(), memory=cases)
+    names = {t.to_dict()["name"] for t in classifier._tools}
+    assert "similar_past_cases" in names
+
+
+def test_a_classifier_with_no_memory_argument_falls_back_to_the_file():
+    """
+    Every caller that predates this - the CLI benchmark, the tests above -
+    passes no `memory` at all and must keep working exactly as before:
+    reading the (nonexistent) JSON file, which is an empty list.
+    """
+    from generator.synthetic import generate_batch
+
+    batch, _ = generate_batch(12)
+    classifier = ClaudeClassifier(batch, client=_Exploding())
+    names = {t.to_dict()["name"] for t in classifier._tools}
+    assert "similar_past_cases" not in names
+
+
 def test_both_prompt_variants_are_still_byte_stable():
     """Whichever variant is in use, the cached prefix must not move."""
     assert system_prompt(False) == system_prompt(False)

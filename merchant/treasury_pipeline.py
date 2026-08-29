@@ -69,7 +69,7 @@ class TreasuryResult:
 
 def run(inputs: TreasuryInputs, *, days: int = DEFAULT_DAYS,
         floor: int = SAFE_FLOOR_PAISE, use_agent: bool = True, agent=None,
-        business: str = "", source: str = "demo",
+        business: str = "", source: str = "demo", business_id: str = "",
         planted: Optional[dict] = None,
         on_progress: Optional[Callable[..., None]] = None) -> TreasuryResult:
     """Project the curve, then ask what to do about the low point."""
@@ -111,7 +111,30 @@ def run(inputs: TreasuryInputs, *, days: int = DEFAULT_DAYS,
 
     # The inputs go with the forecast so the agent can check a candidate
     # against them instead of picking one off a list and hoping.
-    out.verdict = agent.judge(out.forecast, business=business, inputs=inputs)
+    #
+    # The cross-agent tools only make sense for a real business - a demo
+    # forecast's payment ids and business_id are generated fresh for that
+    # scenario and were never audited by anything. See
+    # cross_agent_tools.build_tools().
+    extra_tools = []
+    disputed_receipts: list = []
+    at_risk_credit_found: list = []
+    recon_flagged: list = []
+    if source != "demo" and business_id:
+        from merchant.cross_agent_tools import build_tools as cross_agent_tools
+
+        extra_tools = cross_agent_tools(business_id, found=disputed_receipts,
+                                        credit_found=at_risk_credit_found,
+                                        recon_found=recon_flagged)
+
+    out.verdict = agent.judge(out.forecast, business=business, inputs=inputs,
+                              extra_tools=extra_tools)
+    # All three are populated as a side effect of judge() calling the tools
+    # above - read back now that the call is done, not threaded through
+    # judge()'s own return value, so this stays the merchant layer's business.
+    out.verdict.disputed_receipts = disputed_receipts
+    out.verdict.at_risk_credit = at_risk_credit_found[-1] if at_risk_credit_found else {}
+    out.verdict.recon_flagged = recon_flagged
     out.usage.add(out.verdict)
     if getattr(out.verdict, "error", None):
         out.failed_calls = 1

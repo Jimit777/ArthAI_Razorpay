@@ -176,11 +176,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_run ON audit_log(run_id);
 
 -- CLAUDE.md section 12. Survives across runs on purpose - that is the point.
+--
+-- business_id defaults to '' rather than being required: this table is used
+-- unscoped by the original single-business command-line tool (merchant/ask.py,
+-- merchant/benchmark.py), where there is only ever one business and nothing to
+-- scope against. The multi-tenant merchant app always passes a real one - see
+-- merchant/ledger.py's migration for a database that predates this column.
 CREATE TABLE IF NOT EXISTS resolution_memory (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   exception_code TEXT,
   payment_id     TEXT,
   resolution     TEXT,
+  business_id    TEXT DEFAULT '',
   resolved_at    INTEGER
 );
 """
@@ -353,13 +360,27 @@ class Store:
         c.commit()
 
     def remember_resolution(self, exception_code: str, payment_id: str,
-                            resolution: str) -> None:
-        """Record how a human actually resolved a finding. CLAUDE.md section 12."""
+                            resolution: str, business_id: str = "") -> None:
+        """
+        Record how a human actually resolved a finding. CLAUDE.md section 12.
+
+        `business_id` defaults to '' for the original single-business tool,
+        where there is nothing to scope against. The multi-tenant merchant
+        app always passes the real one, so one merchant's resolution is never
+        recalled for another's variance - see `resolutions()`.
+        """
         self.conn.execute(
             "INSERT INTO resolution_memory (exception_code, payment_id,"
-            " resolution, resolved_at) VALUES (?,?,?,?)",
-            (exception_code, payment_id, resolution, int(time.time())))
+            " resolution, business_id, resolved_at) VALUES (?,?,?,?,?)",
+            (exception_code, payment_id, resolution, business_id,
+             int(time.time())))
         self.conn.commit()
+
+    # human_reviewed is deliberately not settable from here - see
+    # test_the_codebase_never_sets_human_reviewed. The engine and agent
+    # layers run with no human in the loop, so the capability to flip that
+    # column does not exist in either. It lives only in merchant/app.py's
+    # /agents/settlement/resolve route, which runs from an actual click.
 
     # --- reading ---------------------------------------------------------
 
@@ -390,13 +411,31 @@ class Store:
             "SELECT * FROM audit_log WHERE run_id = ? ORDER BY decided_at",
             (run_id,)).fetchall()
 
-    def resolutions(self, exception_code: Optional[str] = None) -> list[sqlite3.Row]:
+    def resolutions(self, exception_code: Optional[str] = None,
+                    business_id: Optional[str] = None) -> list[sqlite3.Row]:
+        """
+        Past resolutions, optionally narrowed to one exception code and/or
+        one business.
+
+        `business_id=None` (the default) means "don't filter" - which is
+        correct for the original single-business tool, where every row
+        already belongs to the only business there is. A multi-tenant caller
+        MUST pass its actual business_id, or it will recall another
+        merchant's resolutions - see merchant/agents/settlement.py, the one
+        caller that matters here, which always does.
+        """
+        clauses, params = [], []
         if exception_code:
-            return self.conn.execute(
-                "SELECT * FROM resolution_memory WHERE exception_code = ?"
-                " ORDER BY resolved_at DESC", (exception_code,)).fetchall()
-        return self.conn.execute(
-            "SELECT * FROM resolution_memory ORDER BY resolved_at DESC").fetchall()
+            clauses.append("exception_code = ?")
+            params.append(exception_code)
+        if business_id is not None:
+            clauses.append("business_id = ?")
+            params.append(business_id)
+        sql = "SELECT * FROM resolution_memory"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY resolved_at DESC"
+        return self.conn.execute(sql, params).fetchall()
 
     def totals(self, run_id: str) -> dict:
         """The numbers the dashboard puts at the top of the page."""

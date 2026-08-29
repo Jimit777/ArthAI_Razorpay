@@ -277,6 +277,47 @@ def test_resolutions_survive_across_runs(tmp_path):
     later.close()
 
 
+def test_resolutions_scoped_to_one_business_do_not_leak(tmp_path):
+    """
+    The multi-tenant merchant app always passes business_id. Without this,
+    one merchant's confirmed resolution note - which can name their own
+    accountant, ticket numbers, anything - would be recalled for a different
+    merchant's variance carrying the same exception code.
+    """
+    store = Store(tmp_path / "memory.db")
+    store.remember_resolution("ZERO_MDR_VIOLATION", "pay_a",
+                              "confirmed with Priya, our accountant",
+                              business_id="biz_a")
+    store.remember_resolution("ZERO_MDR_VIOLATION", "pay_b",
+                              "this is our monthly AMC", business_id="biz_b")
+
+    a_only = store.resolutions("ZERO_MDR_VIOLATION", business_id="biz_a")
+    assert len(a_only) == 1
+    assert a_only[0]["payment_id"] == "pay_a"
+
+    b_only = store.resolutions("ZERO_MDR_VIOLATION", business_id="biz_b")
+    assert len(b_only) == 1
+    assert b_only[0]["payment_id"] == "pay_b"
+
+    nobody = store.resolutions("ZERO_MDR_VIOLATION", business_id="biz_c")
+    assert nobody == []
+
+    # business_id=None (the default) is the original single-business tool's
+    # behaviour: no filter, because there is nothing to filter against.
+    everyone = store.resolutions("ZERO_MDR_VIOLATION")
+    assert len(everyone) == 2
+    store.close()
+
+
+def test_an_unscoped_resolution_defaults_to_the_empty_business(tmp_path):
+    """The CLI tool never passes business_id - it should not have to."""
+    store = Store(tmp_path / "memory.db")
+    store.remember_resolution("ZERO_MDR_VIOLATION", "pay_x", "noted")
+    row = store.resolutions("ZERO_MDR_VIOLATION")[0]
+    assert row["business_id"] == ""
+    store.close()
+
+
 def test_run_ids_are_unique_even_in_the_same_millisecond():
     """
     A bare millisecond timestamp collided the first time two runs were saved in

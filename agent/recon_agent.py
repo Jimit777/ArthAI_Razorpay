@@ -198,6 +198,12 @@ class ReconVerdict:
     tool_calls: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     invented_figures: list[str] = field(default_factory=list)
+    # What the settlement auditor already knew about this exact payment, if
+    # settlement_status was offered and found an open dispute - the same
+    # cross-agent connection the cash forecaster uses, reused here so a
+    # "missing" settlement is not raised as an alarm when the auditor already
+    # has it flagged. See merchant/cross_agent_tools.py.
+    disputed_findings: list = field(default_factory=list)
 
     model: str = MODEL
     input_tokens: int = 0
@@ -280,10 +286,20 @@ def render(row: ReconRow) -> str:
     return "\n".join(parts)
 
 
-def review(row: ReconRow, parsed: ReconJudgment, evidence: str) -> ReconVerdict:
-    """Check the model against the arithmetic, and correct it where it drifts."""
+def review(row: ReconRow, parsed: ReconJudgment, evidence: str,
+          tool_output: str = "") -> ReconVerdict:
+    """
+    Check the model against the arithmetic, and correct it where it drifts.
+
+    Tool output counts as evidence, same reason and same fix as the other two
+    agents that got this wrong first: settlement_status can hand back a
+    figure - a disputed amount - that never appeared in the rendered
+    evidence, because it came from a different agent's own findings. Checking
+    only the static evidence text would flag that figure as invented and
+    throw away a correct answer for using its tools properly.
+    """
     corrections: list[str] = []
-    invented = unverified_figures(parsed.reasoning, evidence)
+    invented = unverified_figures(parsed.reasoning, evidence + "\n" + tool_output)
     if invented:
         corrections.append(
             "the explanation carried figures from nowhere: "
@@ -336,7 +352,8 @@ class ClaudeReconAgent:
 
     _fatal: Optional[str] = None
 
-    def judge(self, row: ReconRow, pool: Optional[list] = None
+    def judge(self, row: ReconRow, pool: Optional[list] = None,
+              extra_tools_factory: Optional[Callable[[], tuple]] = None
               ) -> ReconVerdict:
         """
         Judge one exception, with a search tool when the other exceptions in
@@ -347,6 +364,14 @@ class ClaudeReconAgent:
         answers; it just cannot widen the search, which is what it did before
         the tools existed. Degrading to that keeps the tools an addition to a
         complete answer rather than a precondition for one.
+
+        `extra_tools_factory`, called fresh for every row rather than passed
+        as a ready-built list, so each row's own accumulator only ever
+        collects what THAT row's call found - `judge_all` runs several rows
+        in parallel, and sharing one accumulator across them would mix one
+        payment's dispute into another row's verdict. Returns
+        (tools, found) - see merchant/cross_agent_tools.py, built by the
+        merchant layer since agent/ never imports it.
         """
         from agent.recon_tools import build_tools
 
@@ -357,8 +382,13 @@ class ClaudeReconAgent:
         if blocked:
             return self._failed(row, blocked, started)
 
-        tools = build_tools(pool, exclude=row) if pool is not None else []
+        extra_tools, disputed_found = (
+            extra_tools_factory() if extra_tools_factory is not None
+            else ([], []))
+        tools = (build_tools(pool, exclude=row) if pool is not None
+                 else []) + extra_tools
         called: list[str] = []
+        tool_output: list[str] = []
         totals = {"input": 0, "output": 0, "cache_read": 0}
 
         try:
@@ -376,6 +406,15 @@ class ClaudeReconAgent:
                 for block in getattr(message, "content", []) or []:
                     if getattr(block, "type", "") == "tool_use":
                         called.append(block.name)
+                # Capture what the tools handed back, so the figure check can
+                # tell a number a tool supplied from one the model made up.
+                tool_response = runner.generate_tool_call_response()
+                if tool_response is not None:
+                    for block in tool_response["content"]:
+                        content = (block.get("content")
+                                  if isinstance(block, dict) else None)
+                        if isinstance(content, str):
+                            tool_output.append(content)
                 # Each message reports only its own turn. Reading usage off
                 # the last one under-reports a multi-turn call - the exact
                 # bug this project shipped once already, in two other agents.
@@ -397,8 +436,9 @@ class ClaudeReconAgent:
             return self._failed(row, "model returned no structured output",
                                 started)
 
-        verdict = review(row, parsed, evidence)
+        verdict = review(row, parsed, evidence, "\n".join(tool_output))
         verdict.tool_calls = called
+        verdict.disputed_findings = disputed_found
         verdict.model = self._model
         verdict.latency_ms = int((time.monotonic() - started) * 1000)
         verdict.input_tokens = totals["input"]
@@ -406,8 +446,9 @@ class ClaudeReconAgent:
         verdict.cache_read_tokens = totals["cache_read"]
         return verdict
 
-    def judge_all(self, rows: list[ReconRow],
-                  on_each: Optional[Callable] = None) -> list[ReconVerdict]:
+    def judge_all(self, rows: list[ReconRow], on_each: Optional[Callable] = None,
+                  extra_tools_factory: Optional[Callable[[], tuple]] = None
+                  ) -> list[ReconVerdict]:
         """
         Several at a time, one exception per call.
 
@@ -417,7 +458,8 @@ class ClaudeReconAgent:
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        judge_one = lambda row: self.judge(row, pool=rows)  # noqa: E731
+        judge_one = lambda row: self.judge(  # noqa: E731
+            row, pool=rows, extra_tools_factory=extra_tools_factory)
 
         out: list[ReconVerdict] = []
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:

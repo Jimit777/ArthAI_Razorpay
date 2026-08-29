@@ -137,6 +137,21 @@ class TreasuryVerdict:
     tool_calls: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
     invented_figures: list[str] = field(default_factory=list)
+    # What the cross-agent settlement check actually found, not just that it
+    # ran. Set by merchant/treasury_pipeline.py after judge() returns, from
+    # the accumulator it hands to cross_agent_tools.build_tools - the reason
+    # the merchant sees a link to the finding, not only a sentence about it.
+    disputed_receipts: list = field(default_factory=list)
+    # Same idea, for the GST cross-check: claimed input credit this run found
+    # is at risk of being clawed back. A standing liability rather than a
+    # per-receipt fact, so it is one aggregate dict, empty when nothing was
+    # found or the tool was never offered.
+    at_risk_credit: dict = field(default_factory=dict)
+    # Same idea again, for the three-way reconciler: a receipt this run is
+    # counting on that the reconciler already flagged as never credited, or
+    # credited as a different amount - a stronger signal than a fee dispute
+    # that the money in the forecast is not actually coming.
+    recon_flagged: list = field(default_factory=list)
 
     model: str = MODEL
     input_tokens: int = 0
@@ -155,6 +170,9 @@ class TreasuryVerdict:
             "goes_further": self.goes_further,
             "tool_calls": list(self.tool_calls),
             "corrections": list(self.corrections),
+            "disputed_receipts": list(self.disputed_receipts),
+            "at_risk_credit": dict(self.at_risk_credit),
+            "recon_flagged": list(self.recon_flagged),
             "errored": bool(self.error),
         }
 
@@ -199,10 +217,18 @@ def movable_ids(forecast) -> set:
 
 
 def review(forecast, parsed: TreasuryJudgment,
-           evidence: str) -> TreasuryVerdict:
-    """Check the model against the arithmetic, and correct it where it drifts."""
+           evidence: str, tool_output: str = "") -> TreasuryVerdict:
+    """Check the model against the arithmetic, and correct it where it drifts.
+
+    Tool output counts as evidence, same reason it does in the settlement
+    agent: the cross-agent lookup can tell the model a relief receipt is
+    under dispute for a specific figure, and that figure was computed by our
+    Python, not invented. Checking only the static evidence text punished the
+    model for using the tool correctly and threw away the whole point of
+    asking it.
+    """
     corrections: list[str] = []
-    invented = unverified_figures(parsed.reasoning, evidence)
+    invented = unverified_figures(parsed.reasoning, evidence + "\n" + tool_output)
     if invented:
         corrections.append("the advice carried figures from nowhere: "
                            + ", ".join(invented[:4]))
@@ -270,14 +296,20 @@ class ClaudeTreasuryAgent:
             self._unavailable = str(exc)
 
     def judge(self, forecast, business: str = "",
-              inputs=None) -> TreasuryVerdict:
+              inputs=None, extra_tools=None) -> TreasuryVerdict:
         """
         Judge one forecast, with tools when the inputs are available.
 
-        `inputs` is what the tools close over. Without it the agent still
-        works and still answers - it just cannot check anything, which is
-        what it did before the tools existed. Degrading to that rather than
-        refusing keeps the tools an addition to a complete answer.
+        `inputs` is what the built-in tools close over. Without it the
+        agent still works and still answers - it just cannot check
+        anything, which is what it did before the tools existed. Degrading
+        to that rather than refusing keeps the tools an addition to a
+        complete answer.
+
+        `extra_tools` is how a caller outside this module hands the agent
+        one more thing it can check - the cross-agent settlement lookup,
+        currently, built in merchant/cross_agent_tools.py because it needs
+        database access this layer deliberately does not have.
         """
         from agent.treasury_tools import build_tools
 
@@ -288,7 +320,9 @@ class ClaudeTreasuryAgent:
             return self._failed(forecast, self._unavailable, started)
 
         tools = build_tools(inputs, forecast) if inputs is not None else []
+        tools = tools + list(extra_tools or [])
         called: list[str] = []
+        tool_output: list[str] = []
         totals = {"input": 0, "output": 0, "cache_read": 0}
 
         try:
@@ -309,6 +343,15 @@ class ClaudeTreasuryAgent:
                 for block in getattr(message, "content", []) or []:
                     if getattr(block, "type", "") == "tool_use":
                         called.append(block.name)
+                # Capture what the tools handed back, so the figure check can
+                # tell a number the tool supplied from one the model made up.
+                tool_response = runner.generate_tool_call_response()
+                if tool_response is not None:
+                    for block in tool_response["content"]:
+                        content = (block.get("content")
+                                  if isinstance(block, dict) else None)
+                        if isinstance(content, str):
+                            tool_output.append(content)
                 # Each message reports only its own turn. Reading usage off
                 # the last one showed "2 input tokens" for a request that had
                 # actually run four turns and sent the evidence every time.
@@ -331,7 +374,7 @@ class ClaudeTreasuryAgent:
             return self._failed(forecast, "model returned no structured output",
                                 started)
 
-        verdict = review(forecast, parsed, evidence)
+        verdict = review(forecast, parsed, evidence, "\n".join(tool_output))
         verdict.tool_calls = called
         verdict.model = self._model
         verdict.latency_ms = int((time.monotonic() - started) * 1000)

@@ -76,7 +76,14 @@ def run_settlement_audit(ctx: AgentContext) -> None:
             ctx.progress(phase=f"{len(open_ones)} record(s) need judgment "
                                f"- asking the agent")
             try:
-                classifier = ClaudeClassifier(batch)
+                # What THIS business's own past resolutions say. Scoped by
+                # business_id, or a busy merchant's confirmed note could be
+                # recalled for someone else's variance with the same code -
+                # confirmed once on /agents/settlement/resolve, recalled
+                # here on every audit after. CLAUDE.md section 12.
+                memory = [dict(row) for row in
+                         led.store.resolutions(business_id=ctx.business_id)]
+                classifier = ClaudeClassifier(batch, memory=memory)
             except Exception as exc:                        # noqa: BLE001
                 # No credentials, or no network. The rules still work and a
                 # partial audit beats a blank page in front of an audience.

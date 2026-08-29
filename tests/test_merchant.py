@@ -1027,7 +1027,7 @@ def test_each_verdict_streams_as_it_lands(led):
     run_id = led.commit_settlement(led.build_settlement(led.rate_card()))
 
     class _Fake:
-        def __init__(self, batch):
+        def __init__(self, batch, memory=None):
             pass
 
         def classify(self, variance, on_event=None):
@@ -1384,6 +1384,99 @@ def test_the_page_shows_the_words_and_keeps_the_code_for_support(client):
     assert 'title="UNEXPLAINED"' in page
 
 
+# --- resolution memory, end to end ----------------------------------------
+#
+# CLAUDE.md section 12. The store-level round trip is tested in test_store.py;
+# what matters here is that a human clicking something in the actual app is
+# the only way any of it gets written, and that it stays inside one business.
+
+def test_resolving_a_finding_marks_it_reviewed_and_remembers_it(client):
+    """
+    _audited's two sales produce two variance rows - one CLEAN (the card
+    sale, untouched by the planted behaviour) and one exception (the UPI
+    sale). Without the exception_code filter this was flaky: an unordered
+    SELECT can return either row, and resolving the CLEAN one - which the
+    page never renders a card for - left "Reviewed" nowhere to be found.
+    """
+    import merchant.app as appmod
+
+    run_id = _audited(client)
+    with appmod.ledger(None) as led:
+        biz = led.businesses.all()[0]["business_id"]
+        found = led.conn.execute(
+            "SELECT payment_id, exception_code, human_reviewed FROM variances"
+            " WHERE run_id = ? AND exception_code NOT IN ('CLEAN', 'ROUNDING')",
+            (run_id,)).fetchone()
+    assert found is not None, "the planted behaviour produced no exception"
+    assert found["human_reviewed"] == 0
+
+    page = client.get(f"/agents/settlement/run/{run_id}").text
+    assert 'action="/agents/settlement/resolve"' in page
+    assert "Mark this resolved" in page
+
+    resp = client.post("/agents/settlement/resolve", data={
+        "run_id": run_id, "payment_id": found["payment_id"],
+        "exception_code": found["exception_code"],
+        "resolution": "Disputed with Razorpay, ticket #4471"},
+        follow_redirects=False)
+    assert resp.status_code == 303
+    assert "Saved" in resp.headers["location"]
+
+    with appmod.ledger(None) as led:
+        row = led.conn.execute(
+            "SELECT human_reviewed FROM variances WHERE run_id = ? AND"
+            " payment_id = ?", (run_id, found["payment_id"])).fetchone()
+        assert row["human_reviewed"] == 1
+
+        remembered = led.store.resolutions(
+            found["exception_code"], business_id=biz)
+        assert len(remembered) == 1
+        assert remembered[0]["payment_id"] == found["payment_id"]
+        assert "ticket #4471" in remembered[0]["resolution"]
+
+    after = client.get(f"/agents/settlement/run/{run_id}").text
+    assert "Reviewed" in after
+    assert "Mark this resolved" not in after
+
+
+def test_resolving_without_a_reason_is_refused(client):
+    """A blank note is not a resolution - there is nothing for the agent to
+    recall from it."""
+    import merchant.app as appmod
+
+    run_id = _audited(client)
+    with appmod.ledger(None) as led:
+        found = led.conn.execute(
+            "SELECT payment_id, exception_code FROM variances"
+            " WHERE run_id = ? AND exception_code NOT IN ('CLEAN', 'ROUNDING')",
+            (run_id,)).fetchone()
+    assert found is not None, "the planted behaviour produced no exception"
+
+    resp = client.post("/agents/settlement/resolve", data={
+        "run_id": run_id, "payment_id": found["payment_id"],
+        "exception_code": found["exception_code"], "resolution": "   "},
+        follow_redirects=False)
+    assert resp.status_code == 303
+    assert "error=" in resp.headers["location"]
+
+    with appmod.ledger(None) as led:
+        row = led.conn.execute(
+            "SELECT human_reviewed FROM variances WHERE run_id = ? AND"
+            " payment_id = ?", (run_id, found["payment_id"])).fetchone()
+        assert row["human_reviewed"] == 0
+        assert led.store.resolutions(found["exception_code"]) == []
+
+
+def test_a_business_cannot_resolve_another_businesss_finding(client):
+    run_id = _audited(client)
+
+    _start(client, "Second Shop")          # switches the cookie
+    resp = client.post("/agents/settlement/resolve", data={
+        "run_id": run_id, "payment_id": "pay_whatever",
+        "exception_code": "UNEXPLAINED", "resolution": "not yours"})
+    assert resp.status_code == 404
+
+
 def test_every_finding_recommends_something(client):
     run_id = _audited(client)
     page = client.get(f"/agents/settlement/run/{run_id}").text
@@ -1447,3 +1540,180 @@ def test_a_settlement_follows_its_payments_not_the_clock(tmp_path):
 
     assert detect_batch(batch)[0].exception_code == "CLEAN"
     led.close()
+
+
+# --- the home queue, every live agent --------------------------------------
+#
+# _open_decisions used to read from two of the four live agents. Cash forecast
+# and three-way recon results live in a run-state dict rather than the
+# database, so the home queue - and the agent cards above it - silently
+# treated them as if they had never been run. See _latest_cash_run,
+# _latest_recon_run in merchant/app.py.
+
+def _forecast(client, source="demo"):
+    """Run a demo cash forecast with no agent, wait for it, return its key."""
+    import time as _time
+
+    key = client.post("/agents/cash-forecaster/run", data={"source": source},
+                      follow_redirects=False).headers["location"].split("key=")[-1]
+    for _ in range(80):
+        r = client.get(f"/agents/cash-forecaster/{key}.json")
+        if r.json().get("state") != "running":
+            break
+        _time.sleep(0.1)
+    return key
+
+
+def _reconciled(client, source="demo"):
+    """Run a demo three-way reconciliation with no agent, wait, return its key."""
+    import time as _time
+
+    key = client.post("/agents/three-way/run", data={"source": source},
+                      follow_redirects=False).headers["location"].split("key=")[-1]
+    for _ in range(80):
+        r = client.get(f"/agents/three-way/{key}.json")
+        if r.json().get("state") != "running":
+            break
+        _time.sleep(0.1)
+    return key
+
+
+def test_a_forecast_that_needs_a_decision_reaches_the_home_queue(client):
+    """
+    The planted demo scenario is built to need a decision (CASH_CRUNCH_WARNING,
+    coverable by delaying a payout) - CLAUDE.md's own ground truth. If this
+    never reaches the queue, the queue's claim to cover every agent is false.
+    """
+    _start(client)
+    _forecast(client)
+
+    page = client.get("/").text
+    assert "Cash forecast" in page
+    assert "Needs your decision" in page
+
+
+def test_a_healthy_forecast_does_not_clutter_the_queue(client):
+    """ACT_NONE and ACT_WATCH mean nothing to decide - same taxonomy discipline
+    as every other agent here: most of the codes mean 'do nothing', and the
+    queue has to honour that or it trains people to ignore it."""
+    from engine.treasury.records import ACT_NONE
+
+    import merchant.app as appmod
+
+    _start(client)
+    key = _forecast(client)
+    with appmod._cash_lock:
+        appmod.CASH_RUNS[key]["payload"]["forecast"]["action"] = ACT_NONE
+
+    assert "Cash forecast" not in client.get("/").text
+
+
+def test_a_reconciliation_with_exceptions_reaches_the_home_queue(client):
+    _start(client)
+    _reconciled(client)
+
+    page = client.get("/").text
+    assert "Three-way recon" in page
+    assert "Needs your decision" in page
+
+
+def test_the_agent_cards_stop_lying_about_setup_needed(client):
+    """
+    Same bug, one layer up: _agent_state fell through to STATE_SETUP for these
+    two agents regardless of whether they had ever run, so the card said "Set
+    it up" for an agent that had already produced a real recommendation.
+    """
+    _start(client)
+    _forecast(client)
+    _reconciled(client)
+
+    page = client.get("/").text
+    assert "auto-reconciled" in page
+    assert "shortfall at the low point" in page
+
+
+def test_an_unrun_agent_still_says_set_it_up(client):
+    """No regression for the common case: a business that has never touched
+    these two agents should see exactly what it saw before."""
+    _start(client, "Untouched Co")
+    page = client.get("/").text
+    assert "shortfall at the low point" not in page
+    assert "auto-reconciled" not in page
+
+
+def test_a_business_cannot_see_another_businesss_forecast_in_the_queue(client):
+    _start(client, "First Shop")
+    _forecast(client)
+
+    _start(client, "Second Shop")          # switches the cookie
+    page = client.get("/").text
+    assert "Cash forecast" not in page
+
+
+# --- gateway_fee_credit: GST paid to Razorpay, surfaced as claimable -------
+#
+# The fourth cross-agent connection, and a different shape from the other
+# three: not an agent asking another agent's findings about the same record,
+# but a fact the settlement auditor already verified that the GST reconciler's
+# purchase register has never heard of. See Ledger.gateway_fee_credit().
+
+def _plant_variance(led, business_id, payment_id, run_id="run_1", **overrides):
+    row = {
+        "exception_code": "CLEAN", "actual_tax": 1800, "created_at": 0,
+    }
+    row.update(overrides)
+    led.conn.execute(
+        "INSERT OR IGNORE INTO business_runs (run_id, business_id, created_at)"
+        " VALUES (?,?,0)", (run_id, business_id))
+    led.conn.execute(
+        "INSERT INTO variances (payment_id, run_id, expected_fee, actual_fee,"
+        " expected_tax, actual_tax, delta, money_at_stake, exception_code,"
+        " confidence, reasoning, action, human_reviewed, queued_for_human,"
+        " created_at) VALUES (?,?,0,0,0,?,0,0,?,1.0,'ok','dismiss',0,0,?)",
+        (payment_id, run_id, row["actual_tax"], row["exception_code"],
+         row["created_at"]))
+    led.conn.commit()
+
+
+def test_gateway_fee_credit_sums_clean_and_rounding_tax(led):
+    _plant_variance(led, led.business_id, "pay_1", exception_code="CLEAN",
+                    actual_tax=1800)
+    _plant_variance(led, led.business_id, "pay_2", exception_code="ROUNDING",
+                    actual_tax=3600)
+
+    result = led.gateway_fee_credit()
+
+    assert result["paise"] == 5400
+    assert result["count"] == 2
+
+
+def test_gateway_fee_credit_excludes_disputed_fees(led):
+    """A fee under dispute carries a disputed tax figure on top of it -
+    claiming credit on a number that might still change is exactly the
+    mistake claiming credit exists to avoid."""
+    _plant_variance(led, led.business_id, "pay_1", exception_code="CLEAN",
+                    actual_tax=1800)
+    _plant_variance(led, led.business_id, "pay_2",
+                    exception_code="ZERO_MDR_VIOLATION", actual_tax=9999)
+
+    result = led.gateway_fee_credit()
+
+    assert result["paise"] == 1800
+    assert result["count"] == 1
+
+
+def test_gateway_fee_credit_with_no_settlements_is_zero(led):
+    result = led.gateway_fee_credit()
+    assert result["paise"] == 0
+    assert result["count"] == 0
+
+
+def test_gateway_fee_credit_is_scoped_to_one_business(led, tmp_path):
+    other_id = led.businesses.create("Someone Else")
+    _plant_variance(led, other_id, "pay_other", run_id="run_other",
+                    actual_tax=50000)
+
+    result = led.gateway_fee_credit()
+
+    assert result["paise"] == 0, (
+        "another business's gateway fee GST leaked through")

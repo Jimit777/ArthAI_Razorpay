@@ -338,7 +338,7 @@ def test_the_agent_is_only_asked_about_exceptions():
     asked = []
 
     class Counting:
-        def judge_all(self, rows, on_each=None):
+        def judge_all(self, rows, on_each=None, extra_tools_factory=None):
             asked.extend(rows)
             return []
 
@@ -948,6 +948,9 @@ def test_a_tool_run_reports_its_full_cost():
         def __iter__(self):
             return iter(turns)
 
+        def generate_tool_call_response(self):
+            return None
+
     class Client:
         class beta:
             class messages:
@@ -960,6 +963,268 @@ def test_a_tool_run_reports_its_full_cost():
     verdict = ClaudeReconAgent(client=Client()).judge(row, pool=[row])
     assert verdict.input_tokens == 4200
     assert verdict.output_tokens == 250
+
+
+# --- the settlement cross-check --------------------------------------------
+
+def test_extra_tools_reach_the_model_alongside_the_search_tools():
+    """
+    settlement_status is built outside this module (it needs database access
+    this layer deliberately does not have - see merchant/cross_agent_tools.py)
+    and handed in through a factory. Confirm it actually reaches the
+    tool_runner call rather than being dropped.
+    """
+    from agent.recon_agent import ClaudeReconAgent
+
+    seen = {}
+
+    class Captures:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**kw):
+                    seen["tools"] = kw["tools"]
+                    raise ConnectionError("down")
+
+    def fake_settlement_status():
+        pass
+    fake_settlement_status.name = "settlement_status"
+
+    def factory():
+        return [fake_settlement_status], []
+
+    batch, _ = generate(55)
+    row = next(r for r in reconcile(batch)[0] if not r.resolved)
+    ClaudeReconAgent(client=Captures()).judge(
+        row, extra_tools_factory=factory)
+
+    names = [getattr(t, "name", t) for t in seen["tools"]]
+    assert "settlement_status" in names
+
+
+def test_the_factory_is_called_fresh_for_every_row():
+    """
+    judge_all runs several rows in parallel. If they shared one accumulator,
+    one payment's dispute could end up attached to a different row's verdict
+    - the exact bug a per-row factory exists to prevent.
+    """
+    from agent.recon_agent import ClaudeReconAgent
+
+    calls = []
+
+    class Refuses:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**_kw):
+                    raise ConnectionError("down")
+
+    def factory():
+        calls.append(object())
+        return [], []
+
+    batch, _ = generate(55)
+    rows = [r for r in reconcile(batch)[0] if not r.resolved][:3]
+    ClaudeReconAgent(client=Refuses()).judge_all(
+        rows, extra_tools_factory=factory)
+
+    assert len(calls) == len(rows)
+
+
+def test_a_disputed_finding_is_recorded_and_not_flagged_as_invented():
+    """
+    Two things at once, same as the treasury regression: the tool's finding
+    reaches the verdict for the UI to link to, AND a figure the tool supplied
+    is not wrongly treated as a number the model invented - checking only the
+    static evidence text would flag it, exactly as it did live before this
+    fix.
+    """
+    from agent.recon_agent import ClaudeReconAgent, ReconJudgment, recommended_action
+
+    tool_json = ('{"payment_id": "pay_x", "audited": true,'
+                ' "has_unresolved_dispute": true,'
+                ' "at_risk": {"paise": 500000, "display": "Rs 5,000.00"}}')
+
+    def _judgment(row):
+        return ReconJudgment(
+            action=recommended_action(row), headline="Already flagged elsewhere",
+            reasoning="The settlement auditor already has this payment "
+                      "under an open dispute worth Rs 5,000.00, so this is "
+                      "not a new problem.")
+
+    class ToolUseBlock:
+        type = "tool_use"
+        name = "settlement_status"
+
+    batch, _ = generate(55)
+    row = next(r for r in reconcile(batch)[0] if not r.resolved)
+
+    class Turn:
+        def __init__(self, content=None, last=False):
+            self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 10,
+                                        "cache_read_input_tokens": 0})()
+            self.content = content or []
+            self.parsed_output = _judgment(row) if last else None
+
+    turns = [Turn([ToolUseBlock()]), Turn([], last=True)]
+
+    class Runner:
+        def __init__(self):
+            self._served = False
+
+        def __iter__(self):
+            return iter(turns)
+
+        def generate_tool_call_response(self):
+            if not self._served:
+                self._served = True
+                return {"content": [{"type": "tool_result",
+                                    "content": tool_json}]}
+            return None
+
+    class Client:
+        class beta:
+            class messages:
+                @staticmethod
+                def tool_runner(**_kw):
+                    return Runner()
+
+    def factory():
+        return [], [{"payment_id": "pay_x", "run_id": "run_abc",
+                     "exception_code": "ZERO_MDR_VIOLATION",
+                     "money_at_stake": 500000,
+                     "money_at_stake_display": "Rs 5,000.00"}]
+
+    verdict = ClaudeReconAgent(client=Client()).judge(
+        row, extra_tools_factory=factory)
+
+    assert verdict.corrections == [], (
+        "a figure the tool supplied was wrongly treated as invented")
+    assert len(verdict.disputed_findings) == 1
+    assert verdict.disputed_findings[0]["run_id"] == "run_abc"
+
+
+def _fake_recon_agent(seen):
+    """A stand-in agent whose judge_all just records what it was given -
+    for pipeline-level tests that only care about the wiring, not the
+    model's judgment."""
+    from agent.recon_agent import ReconVerdict, _key
+
+    class FakeAgent:
+        def judge_all(self, rows, on_each=None, extra_tools_factory=None):
+            seen["extra_tools_factory"] = extra_tools_factory
+            out = []
+            for row in rows:
+                out.append(ReconVerdict(key=_key(row), action=row.action,
+                                        headline="", reasoning=row.detail))
+            return out
+
+    return FakeAgent()
+
+
+def test_a_demo_run_never_gets_the_cross_agent_tool():
+    """
+    A demo run's txn_ids were generated fresh for that scenario - nothing in
+    the settlement tables has ever heard of them. See
+    cross_agent_tools.build_tools().
+    """
+    seen = {}
+    batch, _ = generate(55)
+    run(batch, use_agent=True, agent=_fake_recon_agent(seen),
+       source="demo", business_id="biz_1")
+    assert seen["extra_tools_factory"] is None
+
+
+def test_a_connected_run_is_offered_the_cross_agent_tool():
+    seen = {}
+    batch, _ = generate(55)
+    run(batch, use_agent=True, agent=_fake_recon_agent(seen),
+       source="connected", business_id="biz_1")
+
+    factory = seen["extra_tools_factory"]
+    assert factory is not None
+    tools, found = factory()
+    assert {t.name for t in tools} == {"settlement_status"}
+    assert found == []
+
+
+def test_a_connected_run_with_no_business_gets_no_extra_tool():
+    seen = {}
+    batch, _ = generate(55)
+    run(batch, use_agent=True, agent=_fake_recon_agent(seen),
+       source="connected", business_id="")
+    assert seen["extra_tools_factory"] is None
+
+
+def test_disputed_findings_are_attached_to_the_row(tmp_path, monkeypatch):
+    """
+    The whole reason the factory exists: after judge_all() calls the tool and
+    returns, the pipeline has to read back what each row's own call found and
+    attach it to that row - or the merchant never sees a link to the actual
+    settlement finding, only a sentence in the agent's prose.
+    """
+    import merchant.cross_agent_tools as cat
+    from agent.recon_agent import ReconVerdict, _key
+    from merchant.ledger import Ledger
+
+    db = tmp_path / "recon_found.db"
+    monkeypatch.setattr(cat, "DB", str(db))
+
+    bootstrap = Ledger(db)
+    business_id = bootstrap.businesses.create("Test Co")
+    bootstrap.close()
+
+    batch, _ = generate(55)
+    rows, _stats = reconcile(batch)
+    exceptions = [r for r in rows if not r.resolved]
+    probe = exceptions[0]
+    payment_id = probe.settlement.txn_id if probe.settlement else "pay_none"
+
+    led = Ledger(db, business_id)
+    led.conn.execute(
+        "INSERT INTO business_runs (run_id, business_id, created_at)"
+        " VALUES ('run_recon_x', ?, 0)", (business_id,))
+    led.conn.execute(
+        "INSERT INTO variances (payment_id, run_id, expected_fee, actual_fee,"
+        " expected_tax, actual_tax, delta, money_at_stake, exception_code,"
+        " confidence, reasoning, rule_cited, action, human_reviewed,"
+        " queued_for_human, created_at)"
+        " VALUES (?,'run_recon_x',0,0,0,0,0,300000,'ZERO_MDR_VIOLATION',0.9,"
+        " 'network MDR on UPI','PSS Act s.10A','dispute',0,0,0)",
+        (payment_id,))
+    led.conn.commit()
+    led.close()
+
+    class RealToolAgent:
+        """Actually calls the offered tool, without a live model."""
+        def judge_all(self, rows, on_each=None, extra_tools_factory=None):
+            out = []
+            for row in rows:
+                row_payment_id = (row.settlement.txn_id if row.settlement
+                                  else None)
+                if row_payment_id == payment_id and extra_tools_factory is not None:
+                    tools, found = extra_tools_factory()
+                    tools[0].call({"payment_id": payment_id})
+                    out.append(ReconVerdict(key=_key(row), action=row.action,
+                                            headline="", reasoning=row.detail,
+                                            disputed_findings=found))
+                else:
+                    out.append(ReconVerdict(key=_key(row), action=row.action,
+                                            headline="", reasoning=row.detail))
+            return out
+
+    result = run(batch, use_agent=True, agent=RealToolAgent(),
+                source="connected", business_id=business_id)
+
+    found_row = next(r for r in result.exceptions
+                     if r.settlement and r.settlement.txn_id == payment_id)
+    assert len(found_row.disputed_findings) == 1
+    assert found_row.disputed_findings[0]["run_id"] == "run_recon_x"
+
+    payload = result.as_dict()
+    matching = [r for r in payload["exception_list"]
+               if r["txn_id"] == payment_id]
+    assert matching[0]["disputed_findings"][0]["run_id"] == "run_recon_x"
 
 
 def test_what_it_searched_reaches_the_row_and_the_payload(shop):
@@ -980,3 +1245,141 @@ def test_what_it_searched_reaches_the_row_and_the_payload(shop):
         page = shop.get(f"/agents/three-way?key={key}").text
         assert "searched for a settlement" in page
         assert "&times;2" in page
+
+
+def test_a_disputed_finding_becomes_a_clickable_link(shop):
+    """
+    The third live cross-agent connection: before saying a settlement line
+    is missing or wrong, the reconciler can point at the settlement audit's
+    own explanation for it - surfaced as a link, same treatment as the
+    other two connections.
+    """
+    import merchant.app as appmod
+
+    key, state = _run(shop)
+    payload = state["payload"]
+    if not payload["exception_list"]:
+        pytest.skip("this generated batch produced no exceptions to attach to")
+
+    payload["exception_list"][0]["disputed_findings"] = [{
+        "payment_id": "pay_9K3fL2xQ1z", "run_id": "run_abcd1234",
+        "exception_code": "ZERO_MDR_VIOLATION", "money_at_stake": 500000,
+        "money_at_stake_display": "Rs 5,000.00",
+    }]
+    with appmod._recon_lock:
+        appmod.RECON_RUNS[key]["payload"] = payload
+
+    page = shop.get(f"/agents/three-way?key={key}").text
+    assert "Already under dispute in your settlement audit" in page
+    assert "Rs 5,000.00" in page
+    assert 'href="/agents/settlement/run/run_abcd1234"' in page
+
+
+def test_no_disputed_finding_means_no_extra_note(shop):
+    key, state = _run(shop)
+    page = shop.get(f"/agents/three-way?key={key}").text
+    assert "Already under dispute in your settlement audit" not in page
+
+
+# --- persisting findings, so the cash forecaster can check them later -----
+#
+# Settlement and GST findings both survive a restart already. Recon's used to
+# live only in the run-state dict - fine for the page a person is looking at,
+# not enough for a different agent to check later. See
+# merchant/cross_agent_tools.py's recon_status and Ledger.record_recon_findings.
+
+def test_recon_findings_persist_across_a_restart(tmp_path):
+    from merchant.ledger import Ledger
+
+    bootstrap = Ledger(tmp_path / "recon_store.db")
+    business_id = bootstrap.businesses.create("Test Boutique")
+    bootstrap.close()
+
+    led = Ledger(tmp_path / "recon_store.db", business_id)
+    batch, _truth = generate(55)
+    rows, _stats = reconcile(batch)
+    exception_count = len([r for r in rows if not r.resolved])
+
+    run_id = led.commit_recon_run("connected", len(rows))
+    led.record_recon_findings(run_id, rows)
+    led.close()
+
+    later = Ledger(tmp_path / "recon_store.db", business_id)
+    latest = later.latest_recon_run()
+    assert latest is not None
+    assert latest["run_id"] == run_id
+
+    stored = later.conn.execute(
+        "SELECT * FROM recon_findings WHERE run_id = ?", (run_id,)).fetchall()
+    assert len(stored) == exception_count
+    later.close()
+
+
+def test_matched_lines_are_not_stored(tmp_path):
+    """Nothing downstream ever needs to ask 'was this payment ever clean' -
+    only whether the reconciler flagged it."""
+    from merchant.ledger import Ledger
+
+    bootstrap = Ledger(tmp_path / "recon_store2.db")
+    business_id = bootstrap.businesses.create("Test Boutique")
+    bootstrap.close()
+
+    led = Ledger(tmp_path / "recon_store2.db", business_id)
+    batch, _truth = generate(55)
+    rows, _stats = reconcile(batch)
+    matched_txn_ids = {r.settlement.txn_id for r in rows
+                       if r.resolved and r.settlement}
+
+    run_id = led.commit_recon_run("connected", len(rows))
+    led.record_recon_findings(run_id, rows)
+
+    stored_txn_ids = {r["txn_id"] for r in led.conn.execute(
+        "SELECT txn_id FROM recon_findings WHERE run_id = ?", (run_id,))}
+    assert not (stored_txn_ids & matched_txn_ids), \
+        "a matched line was stored as though it were an exception"
+    led.close()
+
+
+def test_recon_findings_are_scoped_to_one_business(tmp_path):
+    from merchant.ledger import Ledger
+
+    db = tmp_path / "recon_store3.db"
+    bootstrap = Ledger(db)
+    a = bootstrap.businesses.create("A Co")
+    b = bootstrap.businesses.create("B Co")
+    bootstrap.close()
+
+    batch, _truth = generate(55)
+    rows, _stats = reconcile(batch)
+
+    la = Ledger(db, a)
+    run_id = la.commit_recon_run("connected", len(rows))
+    la.record_recon_findings(run_id, rows)
+    la.close()
+
+    lb = Ledger(db, b)
+    assert lb.latest_recon_run() is None
+    seen = lb.conn.execute(
+        "SELECT COUNT(*) n FROM recon_findings WHERE business_id = ?",
+        (b,)).fetchone()["n"]
+    assert seen == 0
+    lb.close()
+
+
+def test_a_reconciliation_stores_what_it_concluded(shop):
+    """End to end, through the real route: a run over connected data leaves
+    a queryable record, not just an entry in the in-memory run dict."""
+    import merchant.app as appmod
+
+    key, state = _run(shop)
+    n_exceptions = len(state["payload"]["exception_list"])
+
+    with appmod.ledger(None) as led:
+        biz = led.businesses.all()[0]["business_id"]
+        led.business_id = biz
+        latest = led.latest_recon_run()
+        assert latest is not None
+        stored = led.conn.execute(
+            "SELECT COUNT(*) n FROM recon_findings WHERE run_id = ?",
+            (latest["run_id"],)).fetchone()["n"]
+    assert stored == n_exceptions

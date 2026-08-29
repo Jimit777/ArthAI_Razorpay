@@ -617,3 +617,55 @@ def test_a_legacy_single_value_still_reads(shop):
         led.conn.commit()
         assert [str(b) for b in led.businesses.supplier_behaviours(biz)] \
             == ["wrong_gstin"]
+
+
+def _sold_and_audited(client, timeout=30):
+    """A settlement, audited with the deterministic rate card alone, so its
+    GST figures exist for gateway_fee_credit to find - no agent, no cost."""
+    import time as _time
+
+    import merchant.app as appmod
+
+    client.post("/settings/gateway", data={"behaviour": "correct"})
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+
+    with appmod.ledger() as led:
+        led.conn.execute("UPDATE live_payments SET captured_at = 1749547200")
+        led.conn.execute("UPDATE live_orders SET created_at = 1749547200")
+        led.conn.commit()
+
+    run_id = client.post("/settle", follow_redirects=False
+                         ).headers["location"].rsplit("/", 1)[-1]
+    client.post(f"/audit/{run_id}", data={})
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        if client.get(f"/audit/{run_id}/status").json().get("state") != "running":
+            return run_id
+        _time.sleep(0.05)
+    raise AssertionError("the settlement audit never finished")
+
+
+def test_gateway_fee_credit_appears_on_the_reconciliation_page(shop):
+    """
+    The fourth cross-agent connection: a fact the settlement auditor already
+    verified, surfaced on the page whose purchase register has never heard
+    of it.
+    """
+    _sold_and_audited(shop)
+    _buy(shop, "Anand Textiles")
+    key, _state = _reconcile(shop)
+
+    page = shop.get(f"/itc/{key}").text
+    assert "Also claimable: GST paid to Razorpay" in page
+    assert "correctly charged" in page
+    assert 'href="/settlements"' in page
+
+
+def test_no_settlement_means_no_gateway_fee_credit_card(shop):
+    """The common case for a business that has only ever run the GST agent -
+    nothing to claim from a settlement audit that has never run."""
+    _buy(shop, "Anand Textiles")
+    key, _state = _reconcile(shop)
+
+    page = shop.get(f"/itc/{key}").text
+    assert "Also claimable: GST paid to Razorpay" not in page
