@@ -169,6 +169,13 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             AgentTab("With API", "connected",
                      "settlements pulled; balances still yours to supply"),
         )),
+    "tds_credit": AgentRoute(
+        agent_id="tds_credit", slug="tds-credit",
+        tabs=(
+            AgentTab("Demo Mode", "",
+                     "a generated deduction history with a rate-cut error "
+                     "planted"),
+        )),
 }
 
 SLUG_TO_AGENT = {r.slug: r for r in AGENT_ROUTES.values()}
@@ -208,6 +215,7 @@ FLOWS: tuple[Flow, ...] = (
         FlowStage("Settle", agent_id="settlement_audit"),
         FlowStage("Refund/Dispute", agent_id="chargeback"),
         FlowStage("Reconcile", agent_id="three_way_recon"),
+        FlowStage("Report", agent_id="tds_credit"),
     )),
     Flow("vendor", "Vendor Management", (
         FlowStage("Purchase", agent_id="vendor_terms"),

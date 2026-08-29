@@ -347,6 +347,86 @@ CREATE TABLE IF NOT EXISTS itc_findings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_itc_findings_run ON itc_findings(run_id);
+
+-- --- TDS credit tracking --------------------------------------------------
+--
+-- Two more sources that share nothing with settlement or ITC but the
+-- business they belong to: what Razorpay's own settlement report says it
+-- withheld, and what the merchant's own government tax-credit statement
+-- (Form 26AS before 1 April 2026, Form 168 after) shows as credited.
+--
+-- The join key is payment_id - unlike ITC's cross-entity GSTIN+invoice-
+-- number match, both sides here trace to the same Razorpay payment on the
+-- same merchant's own PAN. A REAL Form 26AS/168 carries no such reference
+-- (see engine/tds/generator.py's docstring); keeping payment_id is a
+-- deliberate simplification for an exact, measurable demo.
+
+CREATE TABLE IF NOT EXISTS live_tds_deductions (
+  deduction_id    TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL,
+  payment_id      TEXT,
+  gross_amount    INTEGER,
+  section_code    TEXT,
+  rate_bps        INTEGER,
+  amount          INTEGER,
+  deducted_at     TEXT,
+  recorded_at     INTEGER,
+  reconciled_run  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS live_tds_credits (
+  credit_id       TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL,
+  payment_id      TEXT,
+  form            TEXT,
+  code_shown      TEXT,
+  amount          INTEGER,
+  credited_period TEXT,
+  posted_at       TEXT,
+  recorded_at     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS business_tds_runs (
+  run_id       TEXT PRIMARY KEY,
+  business_id  TEXT NOT NULL,
+  period       TEXT,
+  n_deductions INTEGER,
+  created_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS tds_findings (
+  id                 INTEGER PRIMARY KEY,
+  run_id             TEXT,
+  business_id        TEXT NOT NULL,
+  payment_id         TEXT,
+  deducted_at        TEXT,
+  deducted_amount    INTEGER,
+  deducted_rate_bps  INTEGER,
+  deducted_code      TEXT,
+  credited_amount    INTEGER,
+  credited_code      TEXT,
+  credited_form      TEXT,
+  credited_period    TEXT,
+  expected_rate_bps  INTEGER,
+  expected_code      TEXT,
+  expected_form      TEXT,
+  delta              INTEGER,
+  tolerance          INTEGER,
+  exception_code     TEXT,
+  action             TEXT,
+  confidence         REAL,
+  reasoning          TEXT,
+  rule_cited         TEXT,
+  decided_by         TEXT,
+  money_at_stake     INTEGER,
+  queued_for_human   INTEGER,
+  evidence           TEXT,          -- JSON: the signals, for "show the working"
+  created_at         INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_tds_deductions_biz ON live_tds_deductions(business_id);
+CREATE INDEX IF NOT EXISTS idx_tds_credits_biz    ON live_tds_credits(business_id);
+CREATE INDEX IF NOT EXISTS idx_tds_findings_run    ON tds_findings(run_id);
 """
 
 
@@ -496,6 +576,167 @@ class Ledger:
     def latest_itc_run(self):
         return self.conn.execute(
             "SELECT * FROM business_itc_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
+
+    # --- TDS credit tracking -----------------------------------------------
+
+    def seed_tds_demo(self, n: int = 60, seed: Optional[int] = None) -> int:
+        """
+        Generate a demo deduction history and credit statement, in one call.
+
+        Demo Mode is the only way this agent gets data in v1 - see
+        engine/tds/generator.py's docstring on why a real Form 26AS/168
+        cannot be joined by payment_id, which is what a future Upload tab
+        will have to solve. Every behaviour the generator can plant is
+        planted here every time, same as the other agents' demo seeding.
+        """
+        import time
+
+        from engine.tds.generator import generate_batch
+
+        business_id = self._scoped()
+        kwargs = {"n": n}
+        if seed is not None:
+            kwargs["seed"] = seed
+        batch, _truth = generate_batch(**kwargs)
+        now = int(time.time())
+
+        self.conn.executemany(
+            "INSERT INTO live_tds_deductions (deduction_id, business_id,"
+            " payment_id, gross_amount, section_code, rate_bps, amount,"
+            " deducted_at, recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            [(f"tds_{secrets.token_hex(6)}", business_id, d.payment_id,
+              d.gross_amount, d.section_code, d.rate_bps, d.amount,
+              str(d.deducted_at), now) for d in batch.deductions])
+        self.conn.executemany(
+            "INSERT INTO live_tds_credits (credit_id, business_id,"
+            " payment_id, form, code_shown, amount, credited_period,"
+            " posted_at, recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            [(f"cr_{secrets.token_hex(6)}", business_id, c.payment_id,
+              c.form, c.code_shown, c.amount, c.credited_period,
+              str(c.posted_at), now) for c in batch.credits])
+        self.conn.commit()
+        return len(batch.deductions)
+
+    def unreconciled_tds_deductions(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_tds_deductions WHERE business_id = ?"
+            " AND reconciled_run IS NULL ORDER BY recorded_at",
+            (self._scoped(),)).fetchall()
+
+    def build_tds_batch(self, only_unreconciled: bool = True):
+        """
+        Assemble the merchant's real deductions and credit lines into the
+        shape engine/tds already takes, mirroring build_itc_batch.
+        """
+        from engine.tds.generator import CreditEntry, Deduction, TdsBatch
+
+        rows = (self.unreconciled_tds_deductions() if only_unreconciled
+               else self.conn.execute(
+                   "SELECT * FROM live_tds_deductions WHERE business_id = ?"
+                   " ORDER BY recorded_at", (self._scoped(),)).fetchall())
+        if not rows:
+            return None
+
+        deductions = [Deduction(
+            payment_id=r["payment_id"], gross_amount=r["gross_amount"],
+            section_code=r["section_code"], rate_bps=r["rate_bps"],
+            amount=r["amount"], deducted_at=date.fromisoformat(r["deducted_at"])
+        ) for r in rows]
+
+        credit_rows = self.conn.execute(
+            "SELECT * FROM live_tds_credits WHERE business_id = ?",
+            (self._scoped(),)).fetchall()
+        credits = [CreditEntry(
+            payment_id=c["payment_id"], form=c["form"],
+            code_shown=c["code_shown"], amount=c["amount"],
+            credited_period=c["credited_period"],
+            posted_at=date.fromisoformat(c["posted_at"])
+        ) for c in credit_rows]
+
+        return TdsBatch(deductions=deductions, credits=credits,
+                        as_of=date.today())
+
+    def commit_tds_run(self, batch, period: str = "") -> str:
+        import time
+
+        from merchant.suppliers import current_period
+
+        run_id = f"tds_run_{secrets.token_hex(6)}"
+        business_id = self._scoped()
+        self.conn.execute(
+            "INSERT INTO business_tds_runs (run_id, business_id, period,"
+            " n_deductions, created_at) VALUES (?,?,?,?,?)",
+            (run_id, business_id, period or current_period(),
+             len(batch.deductions), int(time.time())))
+        self.conn.executemany(
+            "UPDATE live_tds_deductions SET reconciled_run = ?"
+            " WHERE payment_id = ? AND business_id = ?",
+            [(run_id, d.payment_id, business_id) for d in batch.deductions])
+        self.conn.commit()
+        return run_id
+
+    def record_tds_findings(self, run_id: str, variances, decisions,
+                            verdicts=None) -> None:
+        import json
+        import time
+
+        by_id = {v.payment_id: v for v in variances}
+        verdict_by_id = {v.payment_id: v for v in (verdicts or [])}
+        now = int(time.time())
+        rows = []
+
+        for decision in decisions:
+            variance = by_id.get(decision.payment_id)
+            if variance is None:
+                continue
+            verdict = verdict_by_id.get(decision.payment_id)
+            evidence = json.dumps([{
+                "kind": s.kind, "detail": s.detail, "rule": s.rule,
+                "source": s.source, "amount_paise": s.amount_paise,
+            } for s in variance.signals])
+            rows.append((
+                run_id, self._scoped(), variance.payment_id,
+                str(variance.deducted_at), variance.deducted_amount,
+                variance.deducted_rate_bps, variance.deducted_code,
+                variance.credited_amount, variance.credited_code,
+                variance.credited_form, variance.credited_period,
+                variance.expected_rate_bps, variance.expected_code,
+                variance.expected_form, variance.delta, variance.tolerance,
+                decision.exception_code, decision.action, decision.confidence,
+                (verdict.reasoning if verdict else variance.reasoning) or "",
+                (verdict.rule_cited if verdict else variance.rule_cited) or "",
+                decision.decided_by, decision.money_at_stake,
+                int(decision.queued_for_human), evidence, now))
+
+        self.conn.executemany(
+            "INSERT INTO tds_findings (run_id, business_id, payment_id,"
+            " deducted_at, deducted_amount, deducted_rate_bps, deducted_code,"
+            " credited_amount, credited_code, credited_form, credited_period,"
+            " expected_rate_bps, expected_code, expected_form, delta,"
+            " tolerance, exception_code, action, confidence, reasoning,"
+            " rule_cited, decided_by, money_at_stake, queued_for_human,"
+            " evidence, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows)
+        self.conn.commit()
+
+    def tds_findings(self, run_id: str, needing_action: bool = False) -> list:
+        from engine.tds.taxonomy import NO_ACTION
+
+        sql = "SELECT * FROM tds_findings WHERE business_id = ? AND run_id = ?"
+        params = [self._scoped(), run_id]
+        if needing_action:
+            quiet = ",".join("?" * len(NO_ACTION))
+            sql += f" AND exception_code NOT IN ({quiet})"
+            params += [str(c) for c in NO_ACTION]
+        return self.conn.execute(
+            sql + " ORDER BY money_at_stake DESC", params).fetchall()
+
+    def latest_tds_run(self):
+        return self.conn.execute(
+            "SELECT * FROM business_tds_runs WHERE business_id = ?"
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (self._scoped(),)).fetchone()
 

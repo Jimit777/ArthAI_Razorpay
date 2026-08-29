@@ -10,12 +10,13 @@ across Indian merchant finance, which is why this is a platform and not a tool.
 
 ## Honesty rule for this file
 
-Two agents are LIVE. The rest are declared with `status="planned"` and
+Five agents are LIVE: settlement_audit, gst_itc, cash_forecaster,
+three_way_recon, tds_credit. The rest are declared with `status="planned"` and
 have no implementation, because a convincing mock of a working GST reconciler
 is not a roadmap, it is a lie with a progress bar. The UI renders planned agents
 as plainly unavailable and they cannot be run.
 
-Adding the second agent means writing an implementation and flipping a status.
+Adding a new live agent means writing an implementation and flipping a status.
 The registry, the per-business enablement table, the run plumbing and the audit
 log are already generic - that was the point of doing this before agent two
 rather than after.
@@ -100,18 +101,6 @@ def all_agents() -> list[AgentSpec]:
 # None of them are built.
 
 PLANNED = [
-    AgentSpec(
-        id="tds_credit",
-        name="TDS Credit Tracker",
-        tagline="Checks that tax withheld from you actually reached the department.",
-        question="Was TDS deducted from my payouts, and did it show up as my credit?",
-        status="planned",
-        reads=["Form 26AS", "Form 168", "settlement reports"],
-        produces=["missing credit claims", "corrected section codes"],
-        authority="Income Tax Act 2025 s.393 - and the 1 April 2026 code change",
-        why_unbuilt="Deduction and credit live in two different systems that "
-                    "changed identifiers this year. Nobody reconciles them.",
-    ),
     AgentSpec(
         id="payout_timing",
         name="Payout Timing Auditor",

@@ -43,6 +43,7 @@ import merchant.agents.gst  # noqa: F401  - registers the live agent
 import merchant.agents.recon  # noqa: F401  - registers the live agent
 import merchant.agents.treasury  # noqa: F401  - registers the live agent
 import merchant.agents.settlement  # noqa: F401  - registers the live agent
+import merchant.agents.tds_credit  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
 from merchant import catalog, views
 from merchant.accesslog import ACTION_LABEL, AccessLog, Action
@@ -51,6 +52,7 @@ from merchant.catalog import AgentContext
 from merchant.gateway import BEHAVIOUR_LABEL, BEHAVIOUR_NOTE, Behaviour
 from merchant import benchmark as benchmark_mod
 from engine.gst import rules as rules_gst
+from engine.tds import rules as rules_tds
 from merchant import nav, ui
 from merchant.ledger import Ledger
 
@@ -2017,6 +2019,265 @@ def cash_json(key: str, ws: Workspace = Depends(required_workspace)):
         return JSONResponse({"state": state.get("state"),
                              "phase": state.get("phase", "")})
     return JSONResponse(state["payload"])
+
+
+# --- TDS credit tracking ---------------------------------------------------
+#
+# Demo Mode only in this pass - see nav.AGENT_ROUTES's single tab for this
+# agent. Findings persist to the database exactly like settlement and GST
+# (unlike cash forecast and three-way recon, which live in RUNS_STATE dicts),
+# so the result page reads led.tds_findings() directly rather than a stored
+# payload - same shape as /itc/{key}.
+
+
+@app.get("/agents/tds-credit", response_class=HTMLResponse)
+def tds_credit_page(ws: Workspace = Depends(required_workspace),
+                    key: str = "", error: str = ""):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "tds_credit", "")
+        latest = led.latest_tds_run()
+
+    if key:
+        with _lock:
+            state = dict(RUNS.get(key) or {})
+        if state and state.get("state") == "running":
+            return HTMLResponse(_tds_reconciling(state, head, shell))
+        if state and state.get("state") == "error":
+            return RedirectResponse(
+                f"/agents/tds-credit?error={quote(state.get('phase', 'Something went wrong.'))}",
+                status_code=303)
+        run_id = state.get("run_id") or (latest["run_id"] if latest else None)
+        if run_id:
+            return RedirectResponse(f"/tds/{run_id}", status_code=303)
+
+    error_banner = (f'<div class="banner danger" style="margin-bottom:16px">'
+                    f'{views.esc(error)}</div>') if error else ""
+    latest_link = ""
+    if latest:
+        latest_link = (f'<p class="sub" style="margin-top:10px">'
+                       f'<a href="/tds/{views.esc(latest["run_id"])}">'
+                       f'See your last run &rarr;</a></p>')
+
+    body = f"""
+{head}
+{error_banner}
+<div class="card">
+  <h2>Demo Mode</h2>
+  <p class="sub" style="margin:6px 0 14px">A generated deduction history
+     with a rate-cut error planted, straddling 1 April 2026 - the day India
+     replaced its income tax law and TDS on payouts fell from 1% to 0.1%.
+     One click builds both sides: what Razorpay withheld, and what your
+     credit statement shows.</p>
+  <form method="post" action="/agents/tds-credit/demo">
+    <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
+      color:var(--muted);margin-bottom:12px">
+      <input type="checkbox" name="use_agent" value="yes" checked>
+      Ask the agent to judge the records a rule cannot settle outright
+    </label>
+    <button class="btn">Run Demo Mode</button>
+  </form>
+  {latest_link}
+</div>"""
+    return HTMLResponse(views.page("TDS credit", body, "agent:tds_credit",
+                                   **shell))
+
+
+@app.post("/agents/tds-credit/demo")
+async def run_tds_demo(request: Request,
+                       ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "tds_credit"):
+            return RedirectResponse(
+                "/agents/tds-credit?error="
+                + quote("This agent is switched off for this business. "
+                        "Turn it on from Agents."), status_code=303)
+
+    form = await request.form()
+    key = f"tds_{int(time.time() * 1000)}"
+    with _lock:
+        RUNS[key] = {"state": "running", "phase": "Building demo data",
+                    "done": 0, "total": 0, "lines": [], "results": [],
+                    "agent": "TDS Credit Tracker", "started": time.time()}
+
+    with ledger(ws.business_id) as led:
+        led.seed_tds_demo(60)
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail="ran a TDS credit reconciliation on demo data")
+
+    spec = catalog.get("tds_credit")
+    card = {}
+    ctx = AgentContext(business_id=ws.business_id, rate_card=card, db=DB,
+                       target_id=key, use_agent=(form.get("use_agent") == "yes"),
+                       progress=_progress(key))
+    threading.Thread(target=_run_agent, args=("tds_credit", ctx),
+                     daemon=True).start()
+    return RedirectResponse(f"/agents/tds-credit?key={key}", status_code=303)
+
+
+def _tds_reconciling(state: dict, head: str, shell: dict) -> str:
+    """While it runs. Mirrors _reconciling (the ITC agent's progress page)."""
+    phase = state.get("phase") or "Starting"
+    found = [l for l in state.get("lines", [])
+             if l.get("kind") in ("finding", "total")]
+    rows = "".join(
+        f'<div class="found-line">{views.esc(l.get("text", ""))}</div>'
+        for l in found)
+
+    failed = state.get("state") == "failed"
+    body = f"""
+{head}
+<div class="card">
+  <div style="display:flex;align-items:center;gap:11px">
+    {'' if failed else '<span class="spinner"></span>'}
+    <div>
+      <div style="font-weight:580">
+        {views.esc("Could not finish" if failed else "Checking your deductions against your credit statement")}</div>
+      <div class="sub" style="margin-top:2px">{views.esc(phase)}</div>
+    </div>
+  </div>
+  {f'<div class="found">{rows}</div>' if rows else ''}
+</div>
+{'' if failed else '<meta http-equiv="refresh" content="1">'}"""
+    return views.page("Reconciling", body, "agent:tds_credit", **shell)
+
+
+@app.get("/tds/{key}", response_class=HTMLResponse)
+def tds_run_page(key: str, ws: Workspace = Depends(required_workspace)):
+    """While it runs, progress. Once it is done, what it concluded."""
+    with _lock:
+        state = dict(RUNS.get(key) or {})
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "tds_credit", "")
+
+        run_id = state.get("run_id")
+        if not state and not run_id:
+            latest = led.latest_tds_run()
+            run_id = latest["run_id"] if latest else key
+        if run_id is None and state.get("state") != "running":
+            latest = led.latest_tds_run()
+            run_id = latest["run_id"] if latest else None
+
+        findings = led.tds_findings(run_id) if run_id else []
+
+    running = state.get("state") == "running"
+    if running or not findings:
+        return HTMLResponse(_tds_reconciling(state, head, shell))
+
+    action = [f for f in findings
+             if f["exception_code"] not in {"CREDIT_CLEAN", "ROUNDING"}]
+    clean = len(findings) - len(action)
+
+    deducted = sum(f["deducted_amount"] for f in findings)
+    at_risk = sum(abs(f["money_at_stake"] or 0) for f in action)
+
+    pre_change = sum(1 for f in findings if f["deducted_at"] < "2026-04-01")
+    post_change = len(findings) - pre_change
+
+    cards = "".join(_tds_finding_card(f) for f in action)
+
+    if action:
+        section = (
+            '<div style="margin:22px 0 11px;display:flex;align-items:baseline;'
+            'gap:9px"><h2 style="margin:0">Needs review</h2>'
+            f'<span class="sub">{len(action)} payment'
+            f'{"" if len(action) == 1 else "s"}</span></div>{cards}')
+    else:
+        section = ui.blank_slate(
+            "Everything reconciled",
+            f"All {len(findings)} deductions match your credit statement. "
+            f"Nothing needs chasing.")
+
+    body = f"""
+{head}
+
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here has been filed, amended or claimed.</b>
+  Every line is a proposal waiting for you.</span>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
+  <div class="stats">
+    <div class="stat"><b>{rules_tds.rupees(deducted)}</b>
+      <span>withheld by Razorpay</span></div>
+    <div class="stat"><b style="color:var(--danger)">{rules_tds.rupees(at_risk)}</b>
+      <span>needs your attention</span></div>
+    <div class="stat"><b>{clean}/{len(findings)}</b>
+      <span>payments clean</span></div>
+    <div class="stat"><b>{pre_change} / {post_change}</b>
+      <span>before / after 1 Apr 2026</span></div>
+  </div>
+</div>
+
+{section}
+
+<div class="card tint" style="margin-top:20px">
+  <h2>How this was worked out</h2>
+  <p class="sub" style="margin:4px 0 0">Every figure above came from what
+     Razorpay's settlement report says it withheld, compared against your
+     own credit statement &mdash; by arithmetic, never estimated. Where the
+     evidence pointed more than one way, the agent chose and said why; open
+     <em>Show the working</em> on any finding to see exactly what it
+     compared.</p>
+</div>"""
+    return HTMLResponse(views.page("TDS reconciliation", body,
+                                   "agent:tds_credit", **shell))
+
+
+def _tds_finding_card(f) -> str:
+    code = f["exception_code"]
+    reasoning = f["reasoning"] or ""
+    return f"""
+<div class="card" style="margin-bottom:10px">
+  <div style="display:flex;justify-content:space-between;gap:10px">
+    <div>
+      <div style="font-weight:580">{views.esc(f["payment_id"])}</div>
+      <p class="sub" style="margin:4px 0 0;max-width:64ch">
+        {views.esc(reasoning)}</p>
+    </div>
+    <div style="text-align:right;white-space:nowrap">
+      {ui.code_badge(code)}
+      <div class="mono" style="margin-top:6px;font-size:13px">
+        {rules_tds.rupees(f["money_at_stake"] or 0)}</div>
+    </div>
+  </div>
+  <details style="margin-top:8px">
+    <summary class="sub" style="cursor:pointer;font-size:11.5px">
+      Show the working</summary>
+    <div class="sub" style="margin-top:6px;font-size:12px;line-height:1.6">
+      deducted {rules_tds.rupees(f["deducted_amount"])} under
+      {views.esc(f["deducted_code"])} on {views.esc(f["deducted_at"])}<br>
+      credited {rules_tds.rupees(f["credited_amount"] or 0)} under
+      {views.esc(f["credited_code"] or "-")} on
+      {views.esc(f["credited_form"] or "-")}<br>
+      expected {views.esc(f["expected_code"])} on
+      {views.esc(f["expected_form"])}<br>
+      rule cited: {views.esc(f["rule_cited"] or "")}
+    </div>
+  </details>
+</div>"""
+
+
+@app.get("/agents/tds-credit/{key}.json")
+def tds_json(key: str, ws: Workspace = Depends(required_workspace)):
+    with _lock:
+        state = dict(RUNS.get(key) or {})
+    if not state:
+        return JSONResponse({"error": "no such run"}, status_code=404)
+    if state.get("state") != "done":
+        return JSONResponse({"state": state.get("state"),
+                             "phase": state.get("phase", "")})
+    with ledger(ws.business_id) as led:
+        findings = led.tds_findings(state.get("run_id"))
+    return JSONResponse({"state": "done",
+                         "findings": [dict(f) for f in findings]})
 
 
 # --- three-way reconciliation ---------------------------------------------
@@ -4271,6 +4532,14 @@ def _agent_state(led, ws, spec, source_kind) -> str:
             return ui.STATE_SETUP
         return (ui.STATE_DEMO if recon.get("source") == "demo"
                 else ui.STATE_ACTIVE)
+    if spec.id == "tds_credit":
+        # v1 has only Demo Mode - see nav.AGENT_ROUTES's single tab for this
+        # agent - so any run that exists is demo data by definition, same as
+        # every other agent's first checkpoint was before an Upload/Connected
+        # tab existed.
+        if not led.latest_tds_run():
+            return ui.STATE_SETUP
+        return ui.STATE_DEMO
     return ui.STATE_SETUP
 
 
@@ -4306,6 +4575,17 @@ def _agent_metrics(led, ws, spec) -> list:
         metrics = (recon.get("payload") or {}).get("match_metrics") or {}
         return [(f'{metrics.get("match_rate_percentage", 0)}%', "auto-reconciled"),
                 (rupees(metrics.get("at_stake", 0)), "at stake")]
+    if spec.id == "tds_credit":
+        latest = led.latest_tds_run()
+        if not latest:
+            return []
+        at_risk = led.conn.execute(
+            "SELECT COALESCE(SUM(money_at_stake),0) s FROM tds_findings"
+            " WHERE business_id = ? AND run_id = ? AND exception_code NOT IN"
+            " ('CREDIT_CLEAN','ROUNDING')",
+            (ws.business_id, latest["run_id"])).fetchone()["s"]
+        return [(str(latest["n_deductions"]), "deductions"),
+                (rupees(at_risk), "credit at risk")]
     return []
 
 
