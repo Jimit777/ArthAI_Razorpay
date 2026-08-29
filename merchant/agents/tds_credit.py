@@ -1,13 +1,20 @@
 """
-The TDS credit tracker, as a registered agent.
+The TDS credit tracker's run logic - not currently registered as a live
+agent.
 
-Same registration interface as settlement and GST, and the same reason it
-was worth building before agent two: the run plumbing, the progress
-terminal, the audit log all work unchanged.
+`tds_credit` is a planned entry in merchant/catalog.py's PLANNED list, not a
+live one: neither side of this reconciliation has anything resembling an
+API (Razorpay's settlement report carries no TDS line; Form 26AS/168 is
+portal-only), and the only real-data path available would need a merchant
+to manually cross-reference both documents before this ever ran - which
+does the tool's one job for them. See catalog.py's why_unbuilt for the full
+reasoning.
 
-engine/tds knows nothing about businesses, sessions or the web. It takes a
-TdsBatch and returns findings, whether that batch came from the synthetic
-generator or from a merchant's own imported deduction history.
+`run_tds_reconciliation` stays here, tested and working, as groundwork: it
+takes a TdsBatch (from engine/tds's synthetic generator today) and returns
+findings through the same Ledger/AgentContext machinery every other agent
+uses, so wiring this back up is a registration, not a rebuild, if a
+genuinely testable real-data design is found later.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ from engine.tds import rules
 from engine.tds.detector import detect_batch
 from engine.tds.gate import gate_batch
 from engine.tds.taxonomy import CODE_LABEL, NO_ACTION, TdsCode
-from merchant.catalog import AgentContext, AgentSpec, register
+from merchant.catalog import AgentContext
 
 
 def _line(text: str, kind: str = "info", detail: str = "") -> dict:
@@ -121,18 +128,3 @@ def run_tds_reconciliation(ctx: AgentContext) -> None:
                 detail="; ".join(queued[0].reasons) if queued[0].reasons else "")
         say(text="Nothing was filed, amended or claimed. Every line above is a "
                  "proposal.", kind="done")
-
-
-TDS_CREDIT_TRACKER = register(AgentSpec(
-    id="tds_credit",
-    name="TDS Credit Tracker",
-    short_name="TDS credit",
-    tagline="Checks that tax withheld from you actually reached the department.",
-    question="Was TDS deducted from my payouts, and did it show up as my credit?",
-    status="live",
-    reads=["settlement reports (TDS lines)", "Form 26AS", "Form 168"],
-    produces=["missing credit claims", "corrected section codes",
-              "rate corrections"],
-    authority="Income Tax Act 2025 s.393 - and the 1 April 2026 code change",
-    runner=run_tds_reconciliation,
-))

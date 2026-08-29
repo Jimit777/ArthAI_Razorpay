@@ -102,6 +102,23 @@ def all_agents() -> list[AgentSpec]:
 
 PLANNED = [
     AgentSpec(
+        id="tds_credit",
+        name="TDS Credit Tracker",
+        short_name="TDS credit",
+        tagline="Checks that tax withheld from you actually reached the department.",
+        question="Was TDS deducted from my payouts, and did it show up as my credit?",
+        status="planned",
+        reads=["Form 26AS", "Form 168", "settlement reports"],
+        produces=["missing credit claims", "corrected section codes"],
+        authority="Income Tax Act 2025 s.393 - and the 1 April 2026 code change",
+        why_unbuilt="Razorpay's settlement report carries no TDS line - the "
+                    "only real documents are a quarterly Form 16A certificate "
+                    "and Form 26AS/168, neither with an API. Testing this "
+                    "against real data would mean a merchant manually "
+                    "cross-referencing both documents before the tool ever "
+                    "runs, which does the tool's one job for them.",
+    ),
+    AgentSpec(
         id="payout_timing",
         name="Payout Timing Auditor",
         tagline="Measures settlement delay against the cycle you were promised.",

@@ -574,7 +574,7 @@ def test_the_rate_card_carries_the_guardrails_the_gate_needs(tmp_path):
 # flipping a status to "live" without writing a runner fails here rather than
 # in front of an audience.
 IMPLEMENTED = {"settlement_audit", "gst_itc", "three_way_recon",
-               "cash_forecaster", "tds_credit"}
+               "cash_forecaster"}
 
 
 def test_the_live_agents_are_exactly_the_implemented_ones():
@@ -587,7 +587,6 @@ def test_the_live_agents_are_exactly_the_implemented_ones():
     import merchant.agents.gst  # noqa: F401
     import merchant.agents.recon  # noqa: F401
     import merchant.agents.settlement  # noqa: F401
-    import merchant.agents.tds_credit  # noqa: F401
     import merchant.agents.treasury  # noqa: F401
     from merchant.catalog import all_agents, live_agents
 

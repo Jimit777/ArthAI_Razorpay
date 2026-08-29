@@ -1,24 +1,22 @@
 """
-Tests for the TDS credit tracker as a deployed agent rather than as an
-engine.
+Tests for the TDS credit tracker's Ledger layer.
 
-The engine tests (test_tds_rules.py, test_tds_detector.py) prove it reaches
-the right conclusion on a generated batch. These prove the platform actually
-wires Demo Mode into that engine, persists the result, and shows it back -
-which is a different claim, and the one that was missing when the agent was
-measurable but not runnable from a browser.
+`tds_credit` is not currently a live agent (see merchant/catalog.py's
+why_unbuilt: neither side of this reconciliation has anything resembling
+an API, and the only real-data path would need a merchant to manually
+cross-reference both documents before the tool ever ran). These tests exist
+because the Ledger persistence underneath it - seeding, batch assembly,
+committing a run, recording findings - is real, tested, working code kept
+in the repo as groundwork, not something torn out along with the routes.
 """
 
 import sys
-import time as _time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from engine.tds.taxonomy import TdsCode  # noqa: E402
 
 PASSWORD = "a-good-password"
 
@@ -46,20 +44,6 @@ def _seed(client, n: int = 24):
         return led.seed_tds_demo(n)
 
 
-def _run_demo(client, use_agent: str = "no"):
-    """Trigger Demo Mode over HTTP, wait for it to finish, return the key."""
-    location = client.post(
-        "/agents/tds-credit/demo", data={"use_agent": use_agent},
-        follow_redirects=False).headers["location"]
-    key = location.split("key=")[-1]
-    for _ in range(80):
-        r = client.get(f"/agents/tds-credit/{key}.json")
-        if r.json().get("state") != "running":
-            break
-        _time.sleep(0.1)
-    return key
-
-
 # --- demo seeding writes both tables ----------------------------------------
 
 def test_seeding_the_demo_writes_both_tables(shop):
@@ -74,22 +58,6 @@ def test_seeding_the_demo_writes_both_tables(shop):
     assert deductions == n
     assert credits > 0
     assert credits < deductions, "some deductions must have no credit yet"
-
-
-# --- the demo route resolves to a result page -------------------------------
-
-def test_the_demo_route_seeds_and_reconciles_in_one_click(shop):
-    key = _run_demo(shop)
-    page = shop.get(f"/tds/{key}", follow_redirects=True)
-    assert page.status_code == 200
-    assert "TDS reconciliation" in page.text or "reconciled" in page.text.lower()
-
-
-def test_the_agent_is_live_on_the_hub_after_a_run(shop):
-    _run_demo(shop)
-    page = shop.get("/agents").text
-    assert "TDS Credit Tracker" in page
-    assert "Coming soon" not in page.split("TDS Credit Tracker")[1][:200]
 
 
 # --- commit marks the deductions reconciled ---------------------------------
@@ -133,20 +101,7 @@ def test_a_second_seed_does_not_touch_already_reconciled_rows(shop):
             "only the newly seeded rows should be unreconciled"
 
 
-# --- the catalogue flip -----------------------------------------------------
-
-def test_tds_credit_is_registered_live_with_a_runner():
-    import merchant.agents.tds_credit  # noqa: F401
-    from merchant.catalog import get, live_agents
-
-    spec = get("tds_credit")
-    assert spec is not None
-    assert spec.is_live
-    assert spec.runner is not None
-    assert "tds_credit" in {a.id for a in live_agents()}
-
-
-# --- findings carry what the results page needs -----------------------------
+# --- findings carry what a results page would need --------------------------
 
 def test_findings_carry_the_regime_split(shop):
     _seed(shop, 40)
