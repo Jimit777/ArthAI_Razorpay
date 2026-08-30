@@ -10,9 +10,9 @@ across Indian merchant finance, which is why this is a platform and not a tool.
 
 ## Honesty rule for this file
 
-Five agents are LIVE: settlement_audit, gst_itc, cash_forecaster,
-three_way_recon, payout_timing. The rest are declared with `status="planned"`
-and have no implementation, because a convincing mock of a working GST
+Six agents are LIVE: settlement_audit, gst_itc, cash_forecaster,
+three_way_recon, payout_timing, gst_filing. The rest are declared with
+`status="planned"` and have no implementation, because a convincing mock of a working GST
 reconciler is not a roadmap, it is a lie with a progress bar. The UI renders
 planned agents as plainly unavailable and they cannot be run.
 
@@ -141,22 +141,6 @@ PLANNED = [
         authority="The purchase agreement",
         why_unbuilt="Same incentive problem as the gateway: nobody who issues "
                     "an invoice builds the tool that audits it.",
-    ),
-    AgentSpec(
-        id="gst_filing",
-        name="GST Output Tax Reconciler",
-        tagline="Checks that what you declared in GSTR-1 matches what you "
-                "paid in GSTR-3B.",
-        question="Do my GSTR-1 and GSTR-3B agree, and would Rule 88C catch "
-                 "the gap before I do?",
-        status="planned",
-        reads=["GSTR-1", "GSTR-3B", "sales register"],
-        produces=["mismatch report", "Rule 88C explanation draft"],
-        authority="CGST Rule 88C - the GSTR-1/GSTR-3B liability mismatch check",
-        why_unbuilt="The auto-populated GSTR-3B and the GSTR-1 actually filed "
-                    "can drift for a dozen small reasons, and Rule 88C now "
-                    "makes that drift the department's business before it is "
-                    "yours.",
     ),
 ]
 

@@ -574,7 +574,7 @@ def test_the_rate_card_carries_the_guardrails_the_gate_needs(tmp_path):
 # flipping a status to "live" without writing a runner fails here rather than
 # in front of an audience.
 IMPLEMENTED = {"settlement_audit", "gst_itc", "three_way_recon",
-               "cash_forecaster", "payout_timing"}
+               "cash_forecaster", "payout_timing", "gst_filing"}
 
 
 def test_the_live_agents_are_exactly_the_implemented_ones():
@@ -585,6 +585,7 @@ def test_the_live_agents_are_exactly_the_implemented_ones():
     never widened to make a failure go away.
     """
     import merchant.agents.gst  # noqa: F401
+    import merchant.agents.gst_filing  # noqa: F401
     import merchant.agents.payout_timing  # noqa: F401
     import merchant.agents.recon  # noqa: F401
     import merchant.agents.settlement  # noqa: F401
@@ -597,6 +598,8 @@ def test_the_live_agents_are_exactly_the_implemented_ones():
 
 def test_a_live_agent_actually_has_something_to_run():
     import merchant.agents.gst  # noqa: F401
+    import merchant.agents.gst_filing  # noqa: F401
+    import merchant.agents.payout_timing  # noqa: F401
     import merchant.agents.recon  # noqa: F401
     import merchant.agents.settlement  # noqa: F401
     import merchant.agents.treasury  # noqa: F401
@@ -828,17 +831,18 @@ def test_the_front_door_shows_plumbing_stages_honestly(client):
     assert "Not a money-moving feature here" in page
 
 
-def test_the_new_gst_filing_stage_is_planned_not_faked(client):
-    """The fifth planned agent, added to fill the GST Management category -
-    same honesty bar as the other four: greyed, a reason, no CTA."""
+def test_the_gst_filing_stage_is_live_not_a_placeholder(client):
+    """gst_filing filled the GST Management category as a planned stub for
+    a while; it's now the output-tax controller, live - same honesty bar
+    the moment it stops being one applies in the other direction too: a
+    working link and a real CTA, not a greyed card."""
     _start(client)
     client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
     client.post("/settle")
 
     for page in (client.get("/").text, client.get("/agents").text):
         assert "GST Output Tax Reconciler" in page
-        assert "Rule 88C" in page
-        assert 'href="/agents/gst-filing"' not in page
+        assert 'href="/agents/gst-filing"' in page
 
 
 def test_a_brand_new_business_is_told_what_to_do_next(client):

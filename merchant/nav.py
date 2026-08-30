@@ -175,6 +175,19 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             AgentTab("Demo Mode", "",
                      "a generated settlement batch with planted delays"),
         )),
+    "gst_filing": AgentRoute(
+        agent_id="gst_filing", slug="gst-filing",
+        tabs=(
+            AgentTab("Overview", "",
+                     "your GSTR-1 draft, the HSN summary, and what's "
+                     "missing an IRN"),
+            AgentTab("Corrections", "corrections",
+                     "GSTR-1A while the window's open, DRC-03 once it's locked"),
+            AgentTab("Offset", "offset",
+                     "the ITC utilisation hierarchy and the Rule 88C shield"),
+            AgentTab("QRMP", "qrmp",
+                     "quarterly filing, fixed-sum vs self-assessment, and IFF"),
+        )),
 }
 
 SLUG_TO_AGENT = {r.slug: r for r in AGENT_ROUTES.values()}

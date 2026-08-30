@@ -478,6 +478,187 @@ CREATE TABLE IF NOT EXISTS payout_timing_findings (
 
 CREATE INDEX IF NOT EXISTS idx_payout_timing_findings_run
   ON payout_timing_findings(run_id);
+
+-- --- GST output tax (gst_filing) --------------------------------------
+--
+-- The outward side of GST, previously uncovered - gst_itc is entirely about
+-- purchases. Four source/config tables plus one run/findings family per
+-- layer, mirroring the itc_findings/business_itc_runs split.
+
+CREATE TABLE IF NOT EXISTS live_sale_invoices (
+  invoice_id      TEXT,
+  business_id     TEXT NOT NULL,
+  invoice_number  TEXT,
+  invoice_date    TEXT,
+  buyer_name      TEXT,
+  buyer_gstin     TEXT,            -- '' / NULL = unregistered buyer
+  place_of_supply TEXT,            -- 2-digit state code
+  hsn_code        TEXT,
+  taxable_value   INTEGER,         -- paise
+  cgst            INTEGER,
+  sgst            INTEGER,
+  igst            INTEGER,
+  invoice_type    TEXT,            -- 'b2b' | 'b2cl' | 'b2cs' - set by classify()
+                                    -- even for an unconfigured-HSN invoice, so
+                                    -- the UI can say what it WOULD have been;
+                                    -- `code` below is the field that actually
+                                    -- says whether it belongs in a GSTR-1 table
+  code            TEXT,            -- GSTR1Code: CLASSIFIED | IRN_MISSING |
+                                    -- HSN_RATE_UNCONFIGURED
+  irn             TEXT,
+  irn_required    INTEGER,
+  period          TEXT,            -- 'YYYY-MM'
+  recorded_at     INTEGER,
+  filed_run       TEXT,
+  PRIMARY KEY (business_id, invoice_id)
+);
+
+-- GST rates ARE HSN-linked in reality; no official free lookup exists
+-- anywhere in this codebase. Merchant-entered config, same design as
+-- business_rate_card (the merchant's own MDR contract, not a shared file).
+CREATE TABLE IF NOT EXISTS business_hsn_rate_card (
+  business_id  TEXT,
+  hsn_code     TEXT,
+  description  TEXT,
+  rate_bps     INTEGER,
+  PRIMARY KEY (business_id, hsn_code)
+);
+
+-- Layer 2's input. gstr1a window state is DERIVED from gstr3b_filed at
+-- compute time (locked once filed, open until then), not stored redundantly.
+CREATE TABLE IF NOT EXISTS gst_filing_cycles (
+  business_id                TEXT NOT NULL,
+  period                     TEXT NOT NULL,
+  gstr1_filed                TEXT,
+  gstr1_liability            INTEGER,
+  gstr3b_filed                TEXT,          -- NULL = window still open
+  gstr3b_paid                INTEGER,
+  wrongly_claimed_itc_paise  INTEGER DEFAULT 0,
+  qrmp_opted                 INTEGER DEFAULT 0,
+  PRIMARY KEY (business_id, period)
+);
+
+-- Layer 3's input. No real API exists for a merchant's own live ledger
+-- balance (the true balance depends on the portal's whole history of past
+-- utilisation and reversals this system never sees) - merchant-entered,
+-- mirroring business_rate_card; demo variant plants a synthetic snapshot.
+CREATE TABLE IF NOT EXISTS live_gst_ledger_balances (
+  business_id  TEXT NOT NULL,
+  as_of        TEXT,
+  credit_igst  INTEGER,
+  credit_cgst  INTEGER,
+  credit_sgst  INTEGER,
+  cash_igst    INTEGER,
+  cash_cgst    INTEGER,
+  cash_sgst    INTEGER,
+  source       TEXT,               -- 'demo' | 'merchant_entered'
+  recorded_at  INTEGER,
+  PRIMARY KEY (business_id, as_of)
+);
+
+CREATE TABLE IF NOT EXISTS business_gstr1_runs (
+  run_id          TEXT PRIMARY KEY,
+  business_id     TEXT NOT NULL,
+  period          TEXT,
+  n_invoices      INTEGER,
+  n_b2b           INTEGER,
+  n_b2cl          INTEGER,
+  n_b2cs          INTEGER,
+  n_missing_irn   INTEGER,
+  n_unconfigured  INTEGER,
+  total_taxable   INTEGER,
+  total_tax       INTEGER,
+  created_at      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS gst_correction_findings (        -- layer 2, per period
+  id                  INTEGER PRIMARY KEY,
+  run_id              TEXT,
+  business_id         TEXT NOT NULL,
+  period              TEXT,
+  gstr1_liability     INTEGER,
+  gstr3b_paid         INTEGER,
+  delta               INTEGER,
+  tolerance           INTEGER,
+  window_state        TEXT,
+  exception_code      TEXT,
+  action              TEXT,
+  confidence          REAL,
+  reasoning           TEXT,
+  rule_cited          TEXT,
+  interest_paise      INTEGER,
+  interest_rate_bps   INTEGER,
+  days_overdue        INTEGER,
+  decided_by          TEXT,
+  money_at_stake      INTEGER,
+  queued_for_human    INTEGER,
+  gstr1a_draft        TEXT,
+  drc03_draft         TEXT,
+  created_at          INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS gst_offset_findings (             -- layer 3, per period
+  id                    INTEGER PRIMARY KEY,
+  run_id                TEXT,
+  business_id           TEXT NOT NULL,
+  period                TEXT,
+  liability_igst        INTEGER,
+  liability_cgst        INTEGER,
+  liability_sgst        INTEGER,
+  credit_igst           INTEGER,
+  credit_cgst           INTEGER,
+  credit_sgst           INTEGER,
+  offset_igst_to_igst   INTEGER,
+  offset_igst_to_cgst   INTEGER,
+  offset_igst_to_sgst   INTEGER,
+  offset_cgst_to_cgst   INTEGER,
+  offset_sgst_to_sgst   INTEGER,
+  cash_igst_needed      INTEGER,
+  cash_cgst_needed      INTEGER,
+  cash_sgst_needed      INTEGER,
+  rule_88c_breach       INTEGER,
+  breach_amount         INTEGER,
+  exception_code        TEXT,
+  reasoning             TEXT,
+  rule_cited            TEXT,
+  pmt06_draft           TEXT,
+  drc01b_draft          TEXT,
+  created_at            INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS gst_qrmp_findings (                -- layer 4, per quarter
+  id                  INTEGER PRIMARY KEY,
+  run_id              TEXT,
+  business_id         TEXT NOT NULL,
+  quarter             TEXT,
+  turnover_paise      INTEGER,
+  eligible            INTEGER,
+  method              TEXT,
+  fixed_sum_paise     INTEGER,
+  self_assessed_paise INTEGER,
+  month1_pmt06        INTEGER,
+  month2_pmt06        INTEGER,
+  iff_used_month1     INTEGER,
+  iff_used_month2     INTEGER,
+  reasoning           TEXT,
+  created_at          INTEGER
+);
+
+-- One scalar per business, the same shape as businesses.review_above_paise
+-- (merchant/businesses.py) but kept in its own table rather than added as a
+-- column to that shared, already-heavily-depended-on table - lower risk,
+-- same reasoning every other GST filing config table this checkpoint set
+-- used its own table instead of widening an existing one.
+CREATE TABLE IF NOT EXISTS business_qrmp_settings (
+  business_id            TEXT PRIMARY KEY,
+  iff_materiality_paise  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sale_invoices_biz ON live_sale_invoices(business_id);
+CREATE INDEX IF NOT EXISTS idx_gstr1_runs_biz ON business_gstr1_runs(business_id);
+CREATE INDEX IF NOT EXISTS idx_gst_correction_findings_run ON gst_correction_findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_gst_offset_findings_run ON gst_offset_findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_gst_qrmp_findings_run ON gst_qrmp_findings(run_id);
 """
 
 
@@ -855,6 +1036,380 @@ class Ledger:
             "SELECT * FROM business_payout_timing_runs WHERE business_id = ?"
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (self._scoped(),)).fetchone()
+
+    # --- GST filing: layer 1, outward sales / GSTR-1 --------------------
+
+    def set_hsn_rate(self, hsn_code: str, rate_bps: int,
+                     description: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO business_hsn_rate_card (business_id, hsn_code,"
+            " description, rate_bps) VALUES (?,?,?,?)"
+            " ON CONFLICT (business_id, hsn_code) DO UPDATE SET"
+            " description = excluded.description, rate_bps = excluded.rate_bps",
+            (self._scoped(), hsn_code.strip(), description, rate_bps))
+        self.conn.commit()
+
+    def hsn_rate_card(self) -> dict:
+        """hsn_code -> rate_bps, the shape engine.gst_filing.classifier wants."""
+        rows = self.conn.execute(
+            "SELECT * FROM business_hsn_rate_card WHERE business_id = ?",
+            (self._scoped(),)).fetchall()
+        return {r["hsn_code"]: r["rate_bps"] for r in rows}
+
+    def hsn_rate_rows(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM business_hsn_rate_card WHERE business_id = ?"
+            " ORDER BY hsn_code", (self._scoped(),)).fetchall()
+
+    def seed_gst_filing_demo(self, n: int = 40, seed: Optional[int] = None
+                             ) -> tuple[int, dict]:
+        """Generate a demo outward-sales batch and its rate card, in one
+        call. Returns (n, ground_truth) - ground_truth maps invoice_id to
+        the GSTR1Code the generator built it to produce, for
+        engine.gst_filing.scoring to check the classifier against."""
+        import time
+
+        from engine.gst_filing.generator import DEMO_RATE_CARD, generate_invoices
+
+        business_id = self._scoped()
+        kwargs = {"n": n}
+        if seed is not None:
+            kwargs["seed"] = seed
+        invoices, truth = generate_invoices(**kwargs)
+        now = int(time.time())
+
+        for hsn_code, rate_bps in DEMO_RATE_CARD.items():
+            self.set_hsn_rate(hsn_code, rate_bps, description="demo")
+
+        # OR REPLACE, not a plain INSERT: the demo batch is built from a
+        # fixed default seed, so running Demo Mode a second time for the
+        # same business regenerates the same invoice_ids - a fresh,
+        # unfiled row each time is what "run it again" should mean, not a
+        # UNIQUE-constraint crash.
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO live_sale_invoices (invoice_id,"
+            " business_id, invoice_number, invoice_date, buyer_name,"
+            " buyer_gstin, place_of_supply, hsn_code, taxable_value, irn,"
+            " period, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(inv.invoice_id, business_id, inv.invoice_number,
+              str(inv.invoice_date), inv.buyer_name, inv.buyer_gstin or "",
+              inv.place_of_supply, inv.hsn_code, inv.taxable_value,
+              inv.irn or "", str(inv.invoice_date)[:7], now)
+             for inv in invoices])
+        self.conn.commit()
+        return len(invoices), truth
+
+    def unfiled_sale_invoices(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_sale_invoices WHERE business_id = ?"
+            " AND filed_run IS NULL ORDER BY invoice_date",
+            (self._scoped(),)).fetchall()
+
+    def build_gstr1_batch(self, only_unfiled: bool = True) -> Optional[list]:
+        """Assemble the merchant's real outward invoices into the shape
+        engine/gst_filing/classifier.py already takes."""
+        from engine.gst_filing.classifier import OutwardInvoice
+
+        rows = (self.unfiled_sale_invoices() if only_unfiled else
+               self.conn.execute(
+                   "SELECT * FROM live_sale_invoices WHERE business_id = ?"
+                   " ORDER BY invoice_date", (self._scoped(),)).fetchall())
+        if not rows:
+            return None
+        return [OutwardInvoice(
+            invoice_id=r["invoice_id"], invoice_number=r["invoice_number"],
+            invoice_date=date.fromisoformat(r["invoice_date"]),
+            buyer_name=r["buyer_name"], buyer_gstin=r["buyer_gstin"] or None,
+            place_of_supply=r["place_of_supply"], hsn_code=r["hsn_code"],
+            taxable_value=r["taxable_value"], irn=r["irn"] or None)
+            for r in rows]
+
+    def commit_gstr1_run(self, classified: list, draft, period: str = "") -> str:
+        import time
+
+        run_id = f"gstr1_{secrets.token_hex(6)}"
+        business_id = self._scoped()
+        # Counted from the draft's own tables, not the raw classified list -
+        # an unconfigured-HSN invoice still gets an invoice_type assigned by
+        # classify() (so the UI can say what it WOULD have been), but
+        # assemble_gstr1() correctly excludes it from every table, and the
+        # run's own headline counts have to agree with what the draft shows,
+        # not double-count something the draft itself left out.
+        n_b2b, n_b2cl, n_b2cs = len(draft.b2b), len(draft.b2cl), len(draft.b2cs)
+
+        self.conn.execute(
+            "INSERT INTO business_gstr1_runs (run_id, business_id, period,"
+            " n_invoices, n_b2b, n_b2cl, n_b2cs, n_missing_irn,"
+            " n_unconfigured, total_taxable, total_tax, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, business_id, period, len(classified), n_b2b, n_b2cl,
+             n_b2cs, len(draft.missing_irn), len(draft.unconfigured),
+             draft.total_taxable, draft.total_tax, int(time.time())))
+
+        self.conn.executemany(
+            "UPDATE live_sale_invoices SET cgst = ?, sgst = ?, igst = ?,"
+            " invoice_type = ?, code = ?, irn_required = ?, filed_run = ?"
+            " WHERE invoice_id = ? AND business_id = ?",
+            [(c.cgst, c.sgst, c.igst, c.invoice_type, str(c.code),
+              int(c.code == "IRN_MISSING" or (c.irn is not None)),
+              run_id, c.invoice_id, business_id) for c in classified])
+        self.conn.commit()
+        return run_id
+
+    def latest_gstr1_run(self):
+        return self.conn.execute(
+            "SELECT * FROM business_gstr1_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
+
+    def sale_invoices_in_run(self, run_id: str) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_sale_invoices WHERE business_id = ?"
+            " AND filed_run = ? ORDER BY invoice_type, invoice_date",
+            (self._scoped(), run_id)).fetchall()
+
+    # --- GST filing: layer 2, GSTR-1A / DRC-03 correction timing ---------
+
+    def upsert_filing_cycle(self, cycle) -> None:
+        """`cycle` is an engine.gst_filing.timing.FilingCycle."""
+        self.conn.execute(
+            "INSERT INTO gst_filing_cycles (business_id, period, gstr1_filed,"
+            " gstr1_liability, gstr3b_filed, gstr3b_paid,"
+            " wrongly_claimed_itc_paise) VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT (business_id, period) DO UPDATE SET"
+            " gstr1_liability = excluded.gstr1_liability,"
+            " gstr3b_filed = excluded.gstr3b_filed,"
+            " gstr3b_paid = excluded.gstr3b_paid,"
+            " wrongly_claimed_itc_paise = excluded.wrongly_claimed_itc_paise",
+            (self._scoped(), cycle.period, str(cycle.period),
+             cycle.gstr1_liability,
+             str(cycle.gstr3b_filed) if cycle.gstr3b_filed else None,
+             cycle.gstr3b_paid, cycle.wrongly_claimed_itc_paise))
+        self.conn.commit()
+
+    def filing_cycles(self) -> list:
+        """Every planted/recorded period for this business, as
+        engine.gst_filing.timing.FilingCycle objects, oldest first."""
+        from engine.gst_filing.timing import FilingCycle
+
+        rows = self.conn.execute(
+            "SELECT * FROM gst_filing_cycles WHERE business_id = ?"
+            " ORDER BY period", (self._scoped(),)).fetchall()
+        return [FilingCycle(
+            period=r["period"], gstr1_liability=r["gstr1_liability"] or 0,
+            gstr3b_filed=(date.fromisoformat(r["gstr3b_filed"])
+                         if r["gstr3b_filed"] else None),
+            gstr3b_paid=r["gstr3b_paid"] or 0,
+            wrongly_claimed_itc_paise=r["wrongly_claimed_itc_paise"] or 0)
+            for r in rows]
+
+    def seed_gst_correction_demo(self, current_period: str,
+                                 current_liability_paise: int
+                                 ) -> tuple[int, dict]:
+        """Plants four prior periods (clean / locked-normal /
+        locked-wrong-itc / Rule-88C-breach) alongside the current one, so
+        layers 2 and 3 have something to judge the first time an agent runs
+        the pipeline. Returns (n, ground_truth) - ground_truth maps period
+        to the CorrectionCode it was built to produce."""
+        from engine.gst_filing.generator import generate_cycles
+
+        cycles, truth = generate_cycles(current_period, current_liability_paise)
+        for c in cycles:
+            self.upsert_filing_cycle(c)
+        return len(cycles), truth
+
+    def record_correction_findings(self, run_id: str, findings,
+                                   decisions: dict) -> None:
+        """`findings` are CorrectionFinding objects, `decisions` maps
+        period -> engine.gst_filing.gate.CorrectionDecision."""
+        import json
+        import time
+
+        from engine.gst_filing.timing import drc03_draft, gstr1a_draft
+
+        now = int(time.time())
+        business_id = self._scoped()
+        rows = []
+        for f in findings:
+            d = decisions.get(f.period)
+            reasoning = (d.priority_reasoning if d and d.priority_reasoning
+                        else f.reasoning)
+            g1a = (json.dumps(gstr1a_draft(f))
+                  if f.action == "file_1a" else None)
+            drc03 = (json.dumps(drc03_draft(f))
+                    if f.action == "pay_drc03" else None)
+            rows.append((
+                run_id, business_id, f.period, f.gstr1_liability,
+                f.gstr3b_paid, f.delta, f.tolerance, f.window_state,
+                f.exception_code, f.action,
+                d.confidence if d else 1.0, reasoning, f.rule_cited,
+                f.interest_paise, f.interest_rate_bps, f.days_overdue,
+                d.decided_by if d else "calculator",
+                (d.money_at_stake if d else abs(f.delta) + f.interest_paise),
+                int(d.queued_for_human) if d else 0, g1a, drc03, now))
+        self.conn.executemany(
+            "INSERT INTO gst_correction_findings (run_id, business_id,"
+            " period, gstr1_liability, gstr3b_paid, delta, tolerance,"
+            " window_state, exception_code, action, confidence, reasoning,"
+            " rule_cited, interest_paise, interest_rate_bps, days_overdue,"
+            " decided_by, money_at_stake, queued_for_human, gstr1a_draft,"
+            " drc03_draft, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def correction_findings_for_run(self, run_id: str) -> list:
+        return self.conn.execute(
+            "SELECT * FROM gst_correction_findings WHERE business_id = ?"
+            " AND run_id = ? ORDER BY period", (self._scoped(), run_id)
+            ).fetchall()
+
+    # --- GST filing: layer 3, ITC offset hierarchy / Rule 88C shield -----
+
+    def set_gst_ledger_balance(self, as_of: str, *, credit_igst: int,
+                               credit_cgst: int, credit_sgst: int,
+                               cash_igst: int, cash_cgst: int,
+                               cash_sgst: int, source: str) -> None:
+        import time
+
+        self.conn.execute(
+            "INSERT INTO live_gst_ledger_balances (business_id, as_of,"
+            " credit_igst, credit_cgst, credit_sgst, cash_igst, cash_cgst,"
+            " cash_sgst, source, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT (business_id, as_of) DO UPDATE SET"
+            " credit_igst = excluded.credit_igst,"
+            " credit_cgst = excluded.credit_cgst,"
+            " credit_sgst = excluded.credit_sgst,"
+            " cash_igst = excluded.cash_igst,"
+            " cash_cgst = excluded.cash_cgst,"
+            " cash_sgst = excluded.cash_sgst,"
+            " source = excluded.source",
+            (self._scoped(), as_of, credit_igst, credit_cgst, credit_sgst,
+             cash_igst, cash_cgst, cash_sgst, source, int(time.time())))
+        self.conn.commit()
+
+    def latest_gst_ledger_balance(self):
+        return self.conn.execute(
+            "SELECT * FROM live_gst_ledger_balances WHERE business_id = ?"
+            " ORDER BY as_of DESC, recorded_at DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
+
+    def seed_gst_offset_demo(self, liability, as_of: str) -> None:
+        """
+        Plants a credit/cash snapshot sized off THIS period's own liability
+        (by head), not fixed rupee amounts - so the scenario holds together
+        regardless of exactly which invoices the fixed-seed generator
+        produced. Deliberately covers all of IGST's own liability plus
+        spills into CGST, with zero direct CGST credit, so a naive
+        per-head-only allocator would ask for the full CGST liability in
+        cash while the real hierarchy does not - see
+        engine/gst_filing/offset.py's module docstring.
+        """
+        credit_igst = liability.igst + (liability.cgst * 60 // 100)
+        credit_sgst = liability.sgst * 40 // 100
+        cash_cgst = liability.cgst // 20            # a little already on hand
+        self.set_gst_ledger_balance(
+            as_of, credit_igst=credit_igst, credit_cgst=0,
+            credit_sgst=credit_sgst, cash_igst=0, cash_cgst=cash_cgst,
+            cash_sgst=0, source="demo")
+
+    def record_offset_findings(self, run_id: str, findings,
+                               drc01b_bodies: Optional[dict] = None) -> None:
+        """`findings` are engine.gst_filing.offset.OffsetFinding objects.
+        `drc01b_bodies` maps period -> the drafted document's body text,
+        for breach periods the caller already ran through
+        agent/gst_filing_documents.py::drc01b_response()."""
+        import json
+        import time
+
+        from engine.gst_filing.offset import pmt06_draft
+
+        drc01b_bodies = drc01b_bodies or {}
+        now = int(time.time())
+        business_id = self._scoped()
+        rows = []
+        for f in findings:
+            p = f.plan
+            pmt06 = json.dumps(pmt06_draft(f)) if p is not None else None
+            drc01b = drc01b_bodies.get(f.period)
+            rows.append((
+                run_id, business_id, f.period,
+                p.liability.igst if p else 0, p.liability.cgst if p else 0,
+                p.liability.sgst if p else 0,
+                p.credit.igst if p else 0, p.credit.cgst if p else 0,
+                p.credit.sgst if p else 0,
+                p.offset_igst_to_igst if p else 0,
+                p.offset_igst_to_cgst if p else 0,
+                p.offset_igst_to_sgst if p else 0,
+                p.offset_cgst_to_cgst if p else 0,
+                p.offset_sgst_to_sgst if p else 0,
+                p.cash_igst_needed if p else 0,
+                p.cash_cgst_needed if p else 0,
+                p.cash_sgst_needed if p else 0,
+                int(f.rule_88c_breach), f.breach_amount, f.exception_code,
+                f.reasoning, f.rule_cited, pmt06, drc01b, now))
+        self.conn.executemany(
+            "INSERT INTO gst_offset_findings (run_id, business_id, period,"
+            " liability_igst, liability_cgst, liability_sgst, credit_igst,"
+            " credit_cgst, credit_sgst, offset_igst_to_igst,"
+            " offset_igst_to_cgst, offset_igst_to_sgst, offset_cgst_to_cgst,"
+            " offset_sgst_to_sgst, cash_igst_needed, cash_cgst_needed,"
+            " cash_sgst_needed, rule_88c_breach, breach_amount,"
+            " exception_code, reasoning, rule_cited, pmt06_draft,"
+            " drc01b_draft, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows)
+        self.conn.commit()
+
+    def offset_findings_for_run(self, run_id: str) -> list:
+        return self.conn.execute(
+            "SELECT * FROM gst_offset_findings WHERE business_id = ?"
+            " AND run_id = ? ORDER BY period", (self._scoped(), run_id)
+            ).fetchall()
+
+    # --- GST filing: layer 4, QRMP method choice / IFF plan --------------
+
+    DEFAULT_IFF_MATERIALITY_PAISE = 2_000_00      # Rs 2,000 - a demo default,
+                                                   # not a statutory figure;
+                                                   # IFF has no legal per-
+                                                   # invoice value cap to cite
+
+    def iff_materiality(self) -> int:
+        row = self.conn.execute(
+            "SELECT iff_materiality_paise FROM business_qrmp_settings"
+            " WHERE business_id = ?", (self._scoped(),)).fetchone()
+        return row["iff_materiality_paise"] if row else self.DEFAULT_IFF_MATERIALITY_PAISE
+
+    def set_iff_materiality(self, paise: int) -> None:
+        self.conn.execute(
+            "INSERT INTO business_qrmp_settings (business_id,"
+            " iff_materiality_paise) VALUES (?,?)"
+            " ON CONFLICT (business_id) DO UPDATE SET"
+            " iff_materiality_paise = excluded.iff_materiality_paise",
+            (self._scoped(), paise))
+        self.conn.commit()
+
+    def record_qrmp_finding(self, run_id: str, finding) -> None:
+        """`finding` is an engine.gst_filing.qrmp.QRMPFinding."""
+        import time
+
+        self.conn.execute(
+            "INSERT INTO gst_qrmp_findings (run_id, business_id, quarter,"
+            " turnover_paise, eligible, method, fixed_sum_paise,"
+            " self_assessed_paise, month1_pmt06, month2_pmt06,"
+            " iff_used_month1, iff_used_month2, reasoning, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, self._scoped(), finding.quarter, finding.turnover_paise,
+             int(finding.is_eligible), finding.method, finding.fixed_sum_paise,
+             finding.self_assessed_paise, finding.month1_pmt06,
+             finding.month2_pmt06, finding.iff_used_month1,
+             finding.iff_used_month2, finding.reasoning, int(time.time())))
+        self.conn.commit()
+
+    def qrmp_finding_for_run(self, run_id: str):
+        return self.conn.execute(
+            "SELECT * FROM gst_qrmp_findings WHERE business_id = ?"
+            " AND run_id = ? ORDER BY created_at DESC LIMIT 1",
+            (self._scoped(), run_id)).fetchone()
 
     def commit_recon_run(self, source: str, n_records: int) -> str:
         """

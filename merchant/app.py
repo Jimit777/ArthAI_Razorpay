@@ -44,6 +44,7 @@ import merchant.agents.recon  # noqa: F401  - registers the live agent
 import merchant.agents.treasury  # noqa: F401  - registers the live agent
 import merchant.agents.settlement  # noqa: F401  - registers the live agent
 import merchant.agents.payout_timing  # noqa: F401  - registers the live agent
+import merchant.agents.gst_filing  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
 from merchant import catalog, views
 from merchant.accesslog import ACTION_LABEL, AccessLog, Action
@@ -52,6 +53,7 @@ from merchant.catalog import AgentContext
 from merchant.gateway import BEHAVIOUR_LABEL, BEHAVIOUR_NOTE, Behaviour
 from merchant import benchmark as benchmark_mod
 from engine.gst import rules as rules_gst
+from engine.gst_filing import rules as rules_gstf
 from engine.payout_timing import rules as rules_payout
 from merchant import nav, ui
 from merchant.ledger import Ledger
@@ -2245,6 +2247,547 @@ def payout_timing_run_page(run_id: str, ws: Workspace = Depends(required_workspa
 </div>"""
     return HTMLResponse(views.page("Payout timing", body,
                                    "agent:payout_timing", **shell))
+
+
+# --- GST output tax (gst_filing) -------------------------------------------
+#
+# Four layers, one workspace - see engine/gst_filing/taxonomy.py and
+# merchant/agents/gst_filing.py: Overview (layer 1), Corrections (layer 2),
+# Offset (layer 3) and QRMP (layer 4) are all live.
+
+
+@app.get("/agents/gst-filing", response_class=HTMLResponse)
+def gst_filing_page(ws: Workspace = Depends(required_workspace),
+                    key: str = "", error: str = ""):
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "gst_filing", "")
+        latest = led.latest_gstr1_run()
+
+    if key:
+        with _lock:
+            state = dict(RUNS.get(key) or {})
+        if state and state.get("state") == "running":
+            return HTMLResponse(_gst_filing_running(state, head, shell))
+        if state and state.get("state") == "error":
+            from urllib.parse import quote
+
+            return RedirectResponse(
+                f"/agents/gst-filing?error="
+                f"{quote(state.get('phase', 'Something went wrong.'))}",
+                status_code=303)
+        run_id = state.get("run_id") or (latest["run_id"] if latest else None)
+        if run_id:
+            return RedirectResponse(f"/agents/gst-filing/run/{run_id}",
+                                    status_code=303)
+
+    error_banner = (f'<div class="banner danger" style="margin-bottom:16px">'
+                    f'{views.esc(error)}</div>') if error else ""
+    latest_link = ""
+    if latest:
+        latest_link = (f'<p class="sub" style="margin-top:10px">'
+                       f'<a href="/agents/gst-filing/run/'
+                       f'{views.esc(latest["run_id"])}">'
+                       f'See your last run &rarr;</a></p>')
+
+    body = f"""
+{head}
+{error_banner}
+<div class="card">
+  <h2>Demo Mode</h2>
+  <p class="sub" style="margin:6px 0 14px">A generated month of outward
+     sales, classified into B2B, B2CL and B2CS, with a missing e-invoice IRN
+     and an unconfigured HSN rate both planted so you can see how each is
+     handled - plus three prior filing periods, one clean, one locked with
+     an ordinary shortfall, one locked with wrongly-claimed ITC. One click
+     builds all of it.</p>
+  <form method="post" action="/agents/gst-filing/demo">
+    <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
+      color:var(--muted);margin-bottom:12px">
+      <input type="checkbox" name="use_agent" value="yes" checked>
+      Ask the agent which open filing period to correct first
+    </label>
+    <button class="btn">Run Demo Mode</button>
+  </form>
+  {latest_link}
+</div>"""
+    return HTMLResponse(views.page("GST output tax", body,
+                                   "agent:gst_filing", **shell))
+
+
+@app.post("/agents/gst-filing/demo")
+async def run_gst_filing_demo(request: Request,
+                              ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "gst_filing"):
+            return RedirectResponse(
+                "/agents/gst-filing?error="
+                + quote("This agent is switched off for this business. "
+                        "Turn it on from Agents."), status_code=303)
+
+    form = await request.form()
+    key = f"gstf_{int(time.time() * 1000)}"
+    with _lock:
+        RUNS[key] = {"state": "running", "phase": "Recording demo sales",
+                    "done": 0, "total": 0, "lines": [], "results": [],
+                    "agent": "GST Output Tax Reconciler", "started": time.time()}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail="ran the GST output-tax pipeline on demo data")
+
+    ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
+                       target_id=key, use_agent=(form.get("use_agent") == "yes"),
+                       progress=_progress(key))
+    threading.Thread(target=_run_agent, args=("gst_filing", ctx),
+                     daemon=True).start()
+    return RedirectResponse(f"/agents/gst-filing?key={key}", status_code=303)
+
+
+def _gst_filing_running(state: dict, head: str, shell: dict) -> str:
+    phase = state.get("phase") or "Starting"
+    found = [l for l in state.get("lines", [])
+            if l.get("kind") in ("finding", "rules", "total")]
+    rows = "".join(
+        f'<div class="found-line">{views.esc(l.get("text", ""))}</div>'
+        for l in found)
+
+    failed = state.get("state") == "failed"
+    body = f"""
+{head}
+<div class="card">
+  <div style="display:flex;align-items:center;gap:11px">
+    {'' if failed else '<span class="spinner"></span>'}
+    <div>
+      <div style="font-weight:580">
+        {views.esc("Could not finish" if failed else "Classifying your outward sales")}</div>
+      <div class="sub" style="margin-top:2px">{views.esc(phase)}</div>
+    </div>
+  </div>
+  {f'<div class="found">{rows}</div>' if rows else ''}
+</div>
+{'' if failed else '<meta http-equiv="refresh" content="1">'}"""
+    return views.page("Assembling", body, "agent:gst_filing", **shell)
+
+
+@app.get("/agents/gst-filing/run/{run_id}", response_class=HTMLResponse)
+def gst_filing_run_page(run_id: str, ws: Workspace = Depends(required_workspace)):
+    with _lock:
+        state = dict(RUNS.get(run_id) or {})
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "gst_filing", "")
+
+        run = led.conn.execute(
+            "SELECT * FROM business_gstr1_runs WHERE run_id = ?"
+            " AND business_id = ?", (run_id, ws.business_id)).fetchone()
+
+        running = state.get("state") == "running"
+        if running or run is None:
+            return HTMLResponse(_gst_filing_running(state, head, shell))
+
+        invoices = led.sale_invoices_in_run(run_id)
+
+    def _table(rows, title):
+        if not rows:
+            return ""
+        body_rows = "".join(f"""
+          <tr>
+            <td class="mono">{views.esc(r["invoice_number"])}</td>
+            <td>{views.esc(r["buyer_name"])}</td>
+            <td class="mono">{views.esc(r["buyer_gstin"] or "-")}</td>
+            <td class="r">{rules_gstf.rupees(r["taxable_value"])}</td>
+            <td class="r">{rules_gstf.rupees((r["cgst"] or 0) + (r["sgst"] or 0) + (r["igst"] or 0))}</td>
+          </tr>""" for r in rows)
+        return f"""
+<div class="card" style="padding:0;overflow:hidden;margin-top:14px">
+  <div class="card-head" style="padding:12px 16px 0"><h2>{views.esc(title)}
+    <span class="sub">{len(rows)}</span></h2></div>
+  <table>
+    <thead><tr><th>Invoice</th><th>Buyer</th><th>GSTIN</th>
+      <th class="r">Taxable value</th><th class="r">Tax</th></tr></thead>
+    <tbody>{body_rows}</tbody>
+  </table>
+</div>"""
+
+    # `invoice_type` alone can't tell an assembled invoice from one
+    # assemble_gstr1() excluded - classify() assigns a type to an
+    # unconfigured-HSN invoice too, so the tables below key off `code`,
+    # the field that actually says what happened to it.
+    configured = [r for r in invoices if r["code"] != "HSN_RATE_UNCONFIGURED"]
+    b2b = [r for r in configured if r["invoice_type"] == "b2b"]
+    b2cl = [r for r in configured if r["invoice_type"] == "b2cl"]
+    b2cs = [r for r in configured if r["invoice_type"] == "b2cs"]
+    missing_irn = [r for r in b2b if r["irn_required"] and not r["irn"]]
+
+    unconfigured_rows = "".join(f"""
+      <tr><td class="mono">{views.esc(r["invoice_number"])}</td>
+        <td class="mono">{views.esc(r["hsn_code"])}</td>
+        <td class="r">{rules_gstf.rupees(r["taxable_value"])}</td></tr>"""
+        for r in invoices if r["code"] == "HSN_RATE_UNCONFIGURED")
+
+    missing_irn_card = ""
+    if missing_irn:
+        rows = "".join(f'<div class="found-line">{views.esc(r["invoice_number"])} '
+                       f'({views.esc(r["buyer_name"])}) - no IRN on file</div>'
+                       for r in missing_irn)
+        missing_irn_card = f"""
+<div class="card" style="border-left:3px solid var(--warn);margin-top:16px">
+  <h2 style="font-size:15px">Missing an e-invoice IRN</h2>
+  <p class="sub" style="margin:6px 0 10px">These B2B invoices need an IRN
+     before they can be filed. Raise them through the e-invoice portal - this
+     tool does not construct an e-invoice submission payload; the IRP's own
+     schema was not verified field-for-field this session.</p>
+  {rows}
+</div>"""
+
+    unconfigured_card = ""
+    if unconfigured_rows:
+        unconfigured_card = f"""
+<div class="card" style="border-left:3px solid var(--muted);margin-top:16px">
+  <h2 style="font-size:15px">Excluded - no HSN rate on file</h2>
+  <p class="sub" style="margin:6px 0 10px">Add these HSN codes to your rate
+     card before they can be assembled. Never defaulted to a guessed rate.</p>
+  <table><thead><tr><th>Invoice</th><th>HSN</th>
+    <th class="r">Taxable value</th></tr></thead>
+    <tbody>{unconfigured_rows}</tbody></table>
+</div>"""
+
+    body = f"""
+{head}
+
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here has been filed.</b> This is a draft, laid out like
+  the GSTR-1 return - not the GSTN offline-utility JSON, and not
+  upload-ready. Copy the figures into the portal or your filing software.</span>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="stats">
+    <div class="stat"><b>{run["n_invoices"]}</b><span>invoices</span></div>
+    <div class="stat"><b>{run["n_b2b"]}/{run["n_b2cl"]}/{run["n_b2cs"]}</b>
+      <span>B2B / B2CL / B2CS</span></div>
+    <div class="stat"><b>{rules_gstf.rupees(run["total_tax"])}</b>
+      <span>output tax</span></div>
+    <div class="stat"><b style="color:var(--warn)">{run["n_missing_irn"]}</b>
+      <span>missing an IRN</span></div>
+  </div>
+</div>
+
+{missing_irn_card}
+{unconfigured_card}
+{_table(b2b, "B2B")}
+{_table(b2cl, "B2CL")}
+{_table(b2cs, "B2CS")}
+"""
+    return HTMLResponse(views.page("GST output tax", body,
+                                   "agent:gst_filing", **shell))
+
+
+@app.get("/agents/gst-filing/corrections", response_class=HTMLResponse)
+def gst_filing_corrections_page(ws: Workspace = Depends(required_workspace)):
+    import json
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "gst_filing", "corrections")
+        latest = led.latest_gstr1_run()
+        rows = (led.correction_findings_for_run(latest["run_id"])
+               if latest else [])
+
+    if not latest:
+        body = f"""
+{head}
+<div class="card tint">
+  <h2>No filing periods yet</h2>
+  <p class="sub" style="margin:4px 0 0">Run Demo Mode from the Overview tab
+     first - it builds the GSTR-1 and the filing-period history this tab
+     reads.</p>
+</div>"""
+        return HTMLResponse(views.page("GST output tax", body,
+                                       "agent:gst_filing", **shell))
+
+    STATE_ORDER = {"LOCKED_NEEDS_DRC03": 0, "CORRECTABLE_VIA_1A": 1,
+                   "PERIOD_CLEAN": 2}
+    rows = sorted(rows, key=lambda r: STATE_ORDER.get(r["exception_code"], 3))
+
+    cards = []
+    for r in rows:
+        code = r["exception_code"]
+        badge = {"LOCKED_NEEDS_DRC03": "warn", "CORRECTABLE_VIA_1A": "violet",
+                 "PERIOD_CLEAN": "good"}.get(code, "brand")
+        queued = ('<span class="pill warn" style="margin-left:8px">'
+                  'needs a person</span>' if r["queued_for_human"] else "")
+        header = f"""
+  <div style="display:flex;align-items:center;justify-content:space-between;
+    flex-wrap:wrap;gap:8px">
+    <div>
+      <h2 style="font-size:15px">{views.esc(r["period"])}
+        <span class="pill {badge}" style="margin-left:8px">
+          {views.esc(code.replace('_', ' ').title())}</span>{queued}</h2>
+      <p class="sub" style="margin:4px 0 0">{views.esc(r["reasoning"])}</p>
+    </div>
+    <div class="r" style="font-size:13px;color:var(--muted)">
+      GSTR-1 {rules_gstf.rupees(r["gstr1_liability"])} vs
+      GSTR-3B {rules_gstf.rupees(r["gstr3b_paid"])}<br>
+      gap {rules_gstf.rupees(r["delta"])}
+      · decided by {views.esc(r["decided_by"] or "calculator")}
+    </div>
+  </div>"""
+
+        detail = ""
+        if code == "CORRECTABLE_VIA_1A" and r["gstr1a_draft"]:
+            d = json.loads(r["gstr1a_draft"])
+            detail = f"""
+  <div class="banner brand" style="margin-top:12px">GSTR-1A is optional to
+    file - this shows what an amendment would say, not that one is worth
+    filing.</div>
+  <table style="margin-top:8px">
+    <tbody>
+      <tr><td>Currently reflected in GSTR-3B</td>
+        <td class="r">{views.esc(d["currently_reflected_display"])}</td></tr>
+      <tr><td>What GSTR-1 actually supports</td>
+        <td class="r">{views.esc(d["corrected_to_display"])}</td></tr>
+      <tr><td><b>Amendment</b></td>
+        <td class="r"><b>{views.esc(d["amendment_display"])}</b></td></tr>
+    </tbody>
+  </table>"""
+        elif code == "LOCKED_NEEDS_DRC03" and r["drc03_draft"]:
+            d = json.loads(r["drc03_draft"])
+            detail = f"""
+  <div class="banner brand" style="margin-top:12px">Filed through the GST
+    portal's own DRC-03 form. A draft of the values, not a submission.</div>
+  <table style="margin-top:8px">
+    <tbody>
+      <tr><td>Financial year</td><td class="r">{views.esc(d["financial_year"])}</td></tr>
+      <tr><td>Tax period</td><td class="r">{views.esc(d["tax_period"])}</td></tr>
+      <tr><td>Cause of payment</td><td class="r">{views.esc(d["cause_of_payment"])}</td></tr>
+      <tr><td>Tax</td><td class="r">{views.esc(d["tax_display"])}</td></tr>
+      <tr><td>Interest ({d["days_overdue"]} days at
+        {d["interest_rate_bps"] / 100:.0f}% p.a.)</td>
+        <td class="r">{views.esc(d["interest_display"])}</td></tr>
+      <tr><td>Penalty</td><td class="r">{views.esc(d["penalty_display"])}</td></tr>
+      <tr><td>Fee</td><td class="r">{views.esc(d["fee_display"])}</td></tr>
+      <tr><td>Others</td><td class="r">{views.esc(d["others_display"])}</td></tr>
+      <tr><td><b>Total</b></td><td class="r"><b>{views.esc(d["total_display"])}</b></td></tr>
+    </tbody>
+  </table>"""
+
+        cards.append(f'<div class="card" style="margin-top:14px">'
+                     f'{header}{detail}</div>')
+
+    body = f"""
+{head}
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here has been filed or paid.</b> GSTR-1A and DRC-03 are
+  both filed through the GST portal's own forms - these are drafts of the
+  values, not submissions.</span>
+</div>
+{''.join(cards)}"""
+    return HTMLResponse(views.page("GST output tax", body,
+                                   "agent:gst_filing", **shell))
+
+
+@app.get("/agents/gst-filing/offset", response_class=HTMLResponse)
+def gst_filing_offset_page(ws: Workspace = Depends(required_workspace)):
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "gst_filing", "offset")
+        latest = led.latest_gstr1_run()
+        rows = (led.offset_findings_for_run(latest["run_id"])
+               if latest else [])
+
+    if not latest:
+        body = f"""
+{head}
+<div class="card tint">
+  <h2>No offset data yet</h2>
+  <p class="sub" style="margin:4px 0 0">Run Demo Mode from the Overview tab
+     first - it builds the credit and cash ledger snapshot this tab reads.</p>
+</div>"""
+        return HTMLResponse(views.page("GST output tax", body,
+                                       "agent:gst_filing", **shell))
+
+    # Every row allocate() produced is OFFSET_CLEAN (needing some cash is
+    # normal, never itself an exception - see offset.py); every row from a
+    # Rule 88C check is RULE_88C_BREACH, since a clean 88C check is never
+    # written as a row at all. The two codes are how this page tells the
+    # current period's cash-needed table apart from a locked period's
+    # notice-risk card, with no separate "period == current" lookup needed.
+    allocation = next((r for r in rows
+                       if r["exception_code"] == "OFFSET_CLEAN"), None)
+    breaches = [r for r in rows if r["exception_code"] == "RULE_88C_BREACH"]
+
+    cards = []
+    if allocation:
+        cards.append(f"""
+<div class="card">
+  <h2 style="font-size:15px">{views.esc(allocation["period"])} - what you
+    actually owe</h2>
+  <p class="sub" style="margin:4px 0 10px">{views.esc(allocation["reasoning"])}</p>
+  <table>
+    <thead><tr><th></th><th class="r">IGST</th><th class="r">CGST</th>
+      <th class="r">SGST</th></tr></thead>
+    <tbody>
+      <tr><td>Liability</td>
+        <td class="r">{rules_gstf.rupees(allocation["liability_igst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["liability_cgst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["liability_sgst"])}</td></tr>
+      <tr><td>Credit available</td>
+        <td class="r">{rules_gstf.rupees(allocation["credit_igst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["credit_cgst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["credit_sgst"])}</td></tr>
+      <tr><td>IGST credit applied (incl. spillover)</td>
+        <td class="r">{rules_gstf.rupees(allocation["offset_igst_to_igst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["offset_igst_to_cgst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["offset_igst_to_sgst"])}</td></tr>
+      <tr><td>Own-head credit applied</td>
+        <td class="r">&mdash;</td>
+        <td class="r">{rules_gstf.rupees(allocation["offset_cgst_to_cgst"])}</td>
+        <td class="r">{rules_gstf.rupees(allocation["offset_sgst_to_sgst"])}</td></tr>
+      <tr><td><b>New PMT-06 deposit needed</b></td>
+        <td class="r"><b>{rules_gstf.rupees(allocation["cash_igst_needed"])}</b></td>
+        <td class="r"><b>{rules_gstf.rupees(allocation["cash_cgst_needed"])}</b></td>
+        <td class="r"><b>{rules_gstf.rupees(allocation["cash_sgst_needed"])}</b></td></tr>
+    </tbody>
+  </table>
+  <div class="banner brand" style="margin-top:12px">CPIN, its expiry and the
+    CIN are assigned by the portal when a challan is generated there. This
+    computes the amount only.</div>
+</div>""")
+    else:
+        cards.append("""
+<div class="card tint"><p class="sub">No current-period allocation in this
+  run.</p></div>""")
+
+    for r in breaches:
+        cards.append(f"""
+<div class="card" style="margin-top:14px;border-left:3px solid var(--warn)">
+  <h2 style="font-size:15px">{views.esc(r["period"])}
+    <span class="pill warn" style="margin-left:8px">Rule 88C notice risk</span></h2>
+  <p class="sub" style="margin:4px 0 10px">{views.esc(r["reasoning"])}</p>
+  <div class="banner brand">Nothing has been sent. This is text for you to
+    read, edit and send yourself through the portal's reply screen.</div>
+  <div class="draft">{views.esc(r["drc01b_draft"] or "")}</div>
+</div>""")
+
+    body = f"""
+{head}
+{''.join(cards)}"""
+    return HTMLResponse(views.page("GST output tax", body,
+                                   "agent:gst_filing", **shell))
+
+
+@app.get("/agents/gst-filing/qrmp", response_class=HTMLResponse)
+def gst_filing_qrmp_page(ws: Workspace = Depends(required_workspace),
+                         error: str = ""):
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "gst_filing", "qrmp")
+        latest = led.latest_gstr1_run()
+        finding = led.qrmp_finding_for_run(latest["run_id"]) if latest else None
+        materiality = led.iff_materiality()
+
+    error_banner = (f'<div class="banner danger" style="margin-bottom:16px">'
+                    f'{views.esc(error)}</div>') if error else ""
+    materiality_form = f"""
+<div class="card tint" style="margin-top:14px">
+  <h2 style="font-size:14px">IFF materiality</h2>
+  <p class="sub" style="margin:4px 0 10px">The bar a B2B invoice has to
+     clear before it is worth filing early through the Invoice Furnishing
+     Facility in month 1 or 2 of the quarter - your own call, not a
+     statutory cap. Currently {rules_gstf.rupees(materiality)}.</p>
+  <form method="post" action="/agents/gst-filing/iff-materiality"
+    style="display:flex;gap:8px;align-items:center">
+    <input name="rupees" type="number" step="0.01" min="0"
+      placeholder="e.g. 2000.00" style="max-width:180px">
+    <button class="btn ghost small">Save</button>
+  </form>
+</div>"""
+
+    if not latest or finding is None:
+        body = f"""
+{head}
+{error_banner}
+<div class="card tint">
+  <h2>No QRMP plan yet</h2>
+  <p class="sub" style="margin:4px 0 0">Run Demo Mode from the Overview tab
+     first - it builds the quarter this tab reads.</p>
+</div>
+{materiality_form}"""
+        return HTMLResponse(views.page("GST output tax", body,
+                                       "agent:gst_filing", **shell))
+
+    if not finding["eligible"]:
+        card = f"""
+<div class="card">
+  <h2 style="font-size:15px">{views.esc(finding["quarter"])}
+    <span class="pill">Not eligible</span></h2>
+  <p class="sub" style="margin:4px 0 0">{views.esc(finding["reasoning"])}</p>
+</div>"""
+    else:
+        method_label = ("Fixed sum" if finding["method"] == "fixed_sum"
+                        else "Self-assessment")
+        card = f"""
+<div class="card">
+  <h2 style="font-size:15px">{views.esc(finding["quarter"])}
+    <span class="pill violet" style="margin-left:8px">{method_label}</span></h2>
+  <p class="sub" style="margin:4px 0 10px">{views.esc(finding["reasoning"])}</p>
+  <table>
+    <thead><tr><th></th><th class="r">Month 1</th><th class="r">Month 2</th>
+      <th class="r">Two-month total</th></tr></thead>
+    <tbody>
+      <tr><td>PMT-06 recommended</td>
+        <td class="r">{rules_gstf.rupees(finding["month1_pmt06"])}</td>
+        <td class="r">{rules_gstf.rupees(finding["month2_pmt06"])}</td>
+        <td class="r"><b>{rules_gstf.rupees(finding["month1_pmt06"] + finding["month2_pmt06"])}</b></td></tr>
+      <tr><td>Fixed-sum safe harbour</td>
+        <td class="r" colspan="2" style="text-align:right">
+          {rules_gstf.rupees(finding["fixed_sum_paise"])}/month</td>
+        <td class="r">{rules_gstf.rupees(finding["fixed_sum_paise"] * 2)}</td></tr>
+      <tr><td>Self-assessed total compared</td>
+        <td class="r" colspan="2"></td>
+        <td class="r">{rules_gstf.rupees(finding["self_assessed_paise"])}</td></tr>
+      <tr><td>B2B invoices worth an early IFF filing</td>
+        <td class="r">{finding["iff_used_month1"]}</td>
+        <td class="r">{finding["iff_used_month2"]}</td><td class="r"></td></tr>
+    </tbody>
+  </table>
+  <p class="sub" style="margin-top:10px">Turnover (annualised estimate):
+     {rules_gstf.rupees(finding["turnover_paise"])}. Month 3 has no IFF
+     window - it is covered by the quarter's own regular GSTR-1.</p>
+</div>"""
+
+    body = f"""
+{head}
+{error_banner}
+{card}
+{materiality_form}"""
+    return HTMLResponse(views.page("GST output tax", body,
+                                   "agent:gst_filing", **shell))
+
+
+@app.post("/agents/gst-filing/iff-materiality")
+def set_iff_materiality(rupees: str = Form(""),
+                        ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    try:
+        paise = round(float(rupees) * 100)
+        if paise < 0:
+            raise ValueError
+    except ValueError:
+        return RedirectResponse(
+            "/agents/gst-filing/qrmp?error=" + quote("Enter a valid amount."),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        led.set_iff_materiality(paise)
+    return RedirectResponse("/agents/gst-filing/qrmp", status_code=303)
 
 
 # --- three-way reconciliation ---------------------------------------------
@@ -4507,6 +5050,10 @@ def _agent_state(led, ws, spec, source_kind) -> str:
         if not led.latest_payout_timing_run():
             return ui.STATE_SETUP
         return ui.STATE_DEMO
+    if spec.id == "gst_filing":
+        if not led.latest_gstr1_run():
+            return ui.STATE_SETUP
+        return ui.STATE_DEMO
     return ui.STATE_SETUP
 
 
@@ -4549,6 +5096,12 @@ def _agent_metrics(led, ws, spec) -> list:
         return [(f'{latest["miss_rate_bps"] / 100:.0f}%', "missed the cycle"),
                 (rules_payout.rupees(latest["total_float_cost"] or 0),
                  "assumed float cost")]
+    if spec.id == "gst_filing":
+        latest = led.latest_gstr1_run()
+        if not latest:
+            return []
+        return [(str(latest["n_invoices"]), "invoices"),
+                (rules_gstf.rupees(latest["total_tax"] or 0), "output tax")]
     return []
 
 
