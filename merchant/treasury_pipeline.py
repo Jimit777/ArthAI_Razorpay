@@ -120,21 +120,25 @@ def run(inputs: TreasuryInputs, *, days: int = DEFAULT_DAYS,
     disputed_receipts: list = []
     at_risk_credit_found: list = []
     recon_flagged: list = []
+    at_risk_output_tax_found: list = []
     if source != "demo" and business_id:
         from merchant.cross_agent_tools import build_tools as cross_agent_tools
 
-        extra_tools = cross_agent_tools(business_id, found=disputed_receipts,
-                                        credit_found=at_risk_credit_found,
-                                        recon_found=recon_flagged)
+        extra_tools = cross_agent_tools(
+            business_id, found=disputed_receipts,
+            credit_found=at_risk_credit_found, recon_found=recon_flagged,
+            output_tax_found=at_risk_output_tax_found)
 
     out.verdict = agent.judge(out.forecast, business=business, inputs=inputs,
                               extra_tools=extra_tools)
-    # All three are populated as a side effect of judge() calling the tools
+    # All four are populated as a side effect of judge() calling the tools
     # above - read back now that the call is done, not threaded through
     # judge()'s own return value, so this stays the merchant layer's business.
     out.verdict.disputed_receipts = disputed_receipts
     out.verdict.at_risk_credit = at_risk_credit_found[-1] if at_risk_credit_found else {}
     out.verdict.recon_flagged = recon_flagged
+    out.verdict.at_risk_output_tax = (
+        at_risk_output_tax_found[-1] if at_risk_output_tax_found else {})
     out.usage.add(out.verdict)
     if getattr(out.verdict, "error", None):
         out.failed_calls = 1

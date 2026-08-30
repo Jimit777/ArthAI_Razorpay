@@ -1252,7 +1252,7 @@ def test_a_connected_run_is_offered_the_cross_agent_tool():
 
     names = {t.name for t in seen["extra_tools"]}
     assert names == {"settlement_status", "at_risk_input_credit",
-                     "recon_status"}
+                     "recon_status", "at_risk_output_tax"}
 
 
 def test_a_connected_run_with_no_business_gets_no_extra_tool():

@@ -1669,6 +1669,7 @@ TOOL_WORDS = {
     "settlement_status": "checked the settlement audit for a dispute",
     "at_risk_input_credit": "checked the GST reconciler for credit at risk",
     "recon_status": "checked the three-way reconciliation",
+    "at_risk_output_tax": "checked the GST output-tax reconciler for locked shortfalls",
 }
 
 CASH_TONE = {
@@ -2180,6 +2181,28 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
             f'style="color:var(--warn);font-weight:600">See it in your '
             f'input credit reconciliation &rarr;</a></div></div>')
 
+    # The fourth live cross-agent connection: the mirror of at_risk_credit
+    # on the outward side. A locked GST filing period whose GSTR-3B fell
+    # short of what GSTR-1 supports is not money the curve is counting as
+    # arriving either - it is a tax bill already due, sitting outside the
+    # thirty days, with interest accruing whether or not this forecast
+    # notices it.
+    at_risk_output_tax = ""
+    output_tax = verdict.get("at_risk_output_tax") or {}
+    if output_tax.get("at_risk_paise"):
+        n = output_tax.get("count", 0)
+        at_risk_output_tax = (
+            f'<div class="draft" style="border-left:3px solid var(--warn)">'
+            f'<div style="font-weight:600;margin-bottom:2px">Outside this '
+            f'curve: {esc(output_tax.get("at_risk_display", ""))} of '
+            f'output tax is already due</div>'
+            f'<div>{n} locked filing period{"" if n == 1 else "s"} your '
+            f'GST output-tax reconciler found short of what GSTR-3B paid '
+            f'&mdash; interest is accruing under s.50 whether or not this '
+            f'forecast counts it.<br><a href="/agents/gst-filing/corrections" '
+            f'style="color:var(--warn);font-weight:600">See it in your '
+            f'output-tax corrections &rarr;</a></div></div>')
+
     if forecast["finding_type"] == "CASH_HEALTHY":
         return f"""
 <div class="finding-card">
@@ -2194,6 +2217,7 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
   {disputed}
   {recon_flagged}
   {at_risk_credit}
+  {at_risk_output_tax}
 </div>"""
 
     held = ""
@@ -2289,6 +2313,7 @@ def _cash_alert(payload: dict, tone: str, badge) -> str:
   {disputed}
   {recon_flagged}
   {at_risk_credit}
+  {at_risk_output_tax}
   {looked_up}
   {corrections}
 

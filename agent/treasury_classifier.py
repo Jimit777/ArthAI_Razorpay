@@ -152,6 +152,12 @@ class TreasuryVerdict:
     # credited as a different amount - a stronger signal than a fee dispute
     # that the money in the forecast is not actually coming.
     recon_flagged: list = field(default_factory=list)
+    # Same idea again, for the GST output-tax reconciler: a locked filing
+    # period this run found short of what GSTR-3B paid, with s.50 interest
+    # accruing. The mirror of at_risk_credit on the outward side - a
+    # standing liability rather than a per-receipt fact, so it is one
+    # aggregate dict too.
+    at_risk_output_tax: dict = field(default_factory=dict)
 
     model: str = MODEL
     input_tokens: int = 0
@@ -173,6 +179,7 @@ class TreasuryVerdict:
             "disputed_receipts": list(self.disputed_receipts),
             "at_risk_credit": dict(self.at_risk_credit),
             "recon_flagged": list(self.recon_flagged),
+            "at_risk_output_tax": dict(self.at_risk_output_tax),
             "errored": bool(self.error),
         }
 

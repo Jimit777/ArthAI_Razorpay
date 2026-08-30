@@ -1,16 +1,25 @@
 """
-Tests for the two tools that connect the cash forecaster to the OTHER live
+Tests for the four tools that connect the cash forecaster to the OTHER live
 agents' own findings.
 
-Eliminates a specific criticism: this platform ran four agents that shared a
-database and nothing else. A merchant could be told "hold this payout,
-relief arrives Tuesday" by the forecaster while the settlement auditor
-already knew that Tuesday's money was under an open dispute - and the two
-would never compare notes. settlement_status is that comparison.
+Eliminates a specific criticism: this platform ran several agents that
+shared a database and nothing else. A merchant could be told "hold this
+payout, relief arrives Tuesday" by the forecaster while the settlement
+auditor already knew that Tuesday's money was under an open dispute - and
+the two would never compare notes. settlement_status is that comparison.
 
 at_risk_input_credit is the second one, symmetric in spirit and opposite in
 direction: before calling a month comfortable, check whether the GST
-reconciler found claimed credit the merchant may have to pay back.
+input-credit reconciler found claimed credit the merchant may have to pay
+back.
+
+recon_status is the third: before counting a receipt, check whether the
+three-way reconciler already found it never reached the bank.
+
+at_risk_output_tax is the fourth, the mirror of at_risk_input_credit on the
+OUTWARD side: before calling a month comfortable, check whether the GST
+output-tax reconciler found a locked filing period still short of what
+GSTR-3B paid.
 
 No agent calls in this file - it tests the lookups and the wiring around
 them, not the model's judgment.
@@ -84,7 +93,8 @@ def test_no_business_id_no_tool():
 
 def test_offered_for_a_real_business():
     assert {t.name for t in build_tools("biz_123")} == {
-        "settlement_status", "at_risk_input_credit", "recon_status"}
+        "settlement_status", "at_risk_input_credit", "recon_status",
+        "at_risk_output_tax"}
 
 
 def test_an_unaudited_payment_says_so(led):
@@ -465,4 +475,132 @@ def test_the_recon_tool_is_read_only(led):
     _call_recon(led.business_id, "pay_readonly")
 
     after = led.conn.execute("SELECT COUNT(*) n FROM recon_findings").fetchone()["n"]
+    assert before == after
+
+
+# --- at_risk_output_tax ------------------------------------------------
+
+def _plant_output_tax(led, business_id, run_id="gstr1_run_1", **overrides):
+    """Insert one GST output-tax correction finding directly - layer 2 is
+    tested on its own elsewhere; this just needs a row to be found."""
+    row = {
+        "period": "2026-06", "delta": 430000, "interest_paise": 7422,
+        "days_overdue": 35, "money_at_stake": 437422,
+        "exception_code": "LOCKED_NEEDS_DRC03",
+        "rule_cited": "CGST Act s.50(1) - 18% a year on late payment",
+        "created_at": 0,
+    }
+    row.update(overrides)
+
+    led.conn.execute(
+        "INSERT OR IGNORE INTO business_gstr1_runs (run_id, business_id,"
+        " period, n_invoices, created_at) VALUES (?,?,?,1,?)",
+        (run_id, business_id, row["period"], row["created_at"]))
+    led.conn.execute(
+        "INSERT INTO gst_correction_findings (run_id, business_id, period,"
+        " gstr1_liability, gstr3b_paid, delta, tolerance, window_state,"
+        " exception_code, action, confidence, reasoning, rule_cited,"
+        " interest_paise, interest_rate_bps, days_overdue, decided_by,"
+        " money_at_stake, queued_for_human, created_at)"
+        " VALUES (?,?,?,0,0,?,0,'locked',?,'pay_drc03',1.0,'',?,?,1800,?,"
+        "'calculator',?,0,?)",
+        (run_id, business_id, row["period"], row["delta"],
+         row["exception_code"], row["rule_cited"], row["interest_paise"],
+         row["days_overdue"], row["money_at_stake"], row["created_at"]))
+    led.conn.commit()
+
+
+def _call_output_tax(business_id):
+    tools = {t.name: t for t in build_tools(business_id)}
+    return json.loads(tools["at_risk_output_tax"].call({}))
+
+
+def _call_output_tax_with_found(business_id):
+    found = []
+    tools = {t.name: t for t in build_tools(business_id, output_tax_found=found)}
+    result = json.loads(tools["at_risk_output_tax"].call({}))
+    return result, found
+
+
+def test_offered_alongside_the_other_three():
+    names = {t.name for t in build_tools("biz_123")}
+    assert "at_risk_output_tax" in names
+
+
+def test_no_gstr1_run_at_all_reads_clean(led):
+    result = _call_output_tax(led.business_id)
+    assert result["checked"] is True
+    assert result["at_risk_paise"] == 0
+
+
+def test_finds_a_locked_shortfall(led):
+    _plant_output_tax(led, led.business_id)
+
+    result = _call_output_tax(led.business_id)
+
+    assert result["checked"] is True
+    assert result["at_risk_paise"] == 437422
+    assert result["periods"][0]["period"] == "2026-06"
+    assert result["periods"][0]["days_overdue"] == 35
+
+
+def test_an_open_correctable_period_is_not_counted(led):
+    """CORRECTABLE_VIA_1A is still a fixable draft gap while the window is
+    open, not yet a liability the department can act on - the same
+    reasoning _overclaimed() applies to ITC's AT_RISK half."""
+    _plant_output_tax(led, led.business_id,
+                      exception_code="CORRECTABLE_VIA_1A")
+
+    result = _call_output_tax(led.business_id)
+
+    assert result["at_risk_paise"] == 0
+
+
+def test_a_clean_period_is_not_at_risk(led):
+    _plant_output_tax(led, led.business_id, exception_code="PERIOD_CLEAN")
+    result = _call_output_tax(led.business_id)
+    assert result["at_risk_paise"] == 0
+
+
+def test_only_the_latest_gstr1_run_counts(led):
+    """Mirrors the same rule for ITC credit risk and recon flags - an older
+    run's finding must not still be counted once a newer one exists."""
+    _plant_output_tax(led, led.business_id, run_id="gstr1_old",
+                      created_at=1, money_at_stake=999999)
+    _plant_output_tax(led, led.business_id, run_id="gstr1_new",
+                      created_at=2, money_at_stake=437422)
+
+    result = _call_output_tax(led.business_id)
+
+    assert result["at_risk_paise"] == 437422
+
+
+def test_found_records_the_at_risk_output_tax(led):
+    _plant_output_tax(led, led.business_id)
+
+    _result, found = _call_output_tax_with_found(led.business_id)
+
+    assert len(found) == 1
+    assert found[0]["at_risk_paise"] == 437422
+    assert found[0]["count"] == 1
+
+
+def test_a_business_cannot_see_another_businesss_output_tax_risk(led):
+    other_id = led.businesses.create("Someone Else")
+    _plant_output_tax(led, other_id, run_id="gstr1_other")
+
+    result = _call_output_tax(led.business_id)
+
+    assert result["at_risk_paise"] == 0
+
+
+def test_the_output_tax_tool_is_read_only(led):
+    _plant_output_tax(led, led.business_id)
+    before = led.conn.execute(
+        "SELECT COUNT(*) n FROM gst_correction_findings").fetchone()["n"]
+
+    _call_output_tax(led.business_id)
+
+    after = led.conn.execute(
+        "SELECT COUNT(*) n FROM gst_correction_findings").fetchone()["n"]
     assert before == after

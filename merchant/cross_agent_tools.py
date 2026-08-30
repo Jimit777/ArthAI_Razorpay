@@ -4,7 +4,7 @@ database: before the cash forecaster tells a controller a receipt is safe to
 count on, or that the month is comfortable, it can check what this
 platform's OTHER agents already found.
 
-Three connections live here:
+Four connections live here:
 
   settlement_status(payment_id) - before counting a specific receipt,
   check whether the settlement auditor found something wrong with that
@@ -21,6 +21,13 @@ Three connections live here:
   Also offered to the three-way reconciler itself, so it can ask the
   settlement auditor the mirror question before raising an alarm - see
   agent/recon_agent.py.
+
+  at_risk_output_tax() - the mirror of at_risk_input_credit() on the
+  OUTWARD side: before calling the month comfortable, check whether the
+  GST output-tax reconciler found a filing period that is locked (GSTR-3B
+  already filed) and still short of what GSTR-1 supports - a real,
+  already-discovered tax liability with s.50 interest accruing daily, not
+  a line item tied to any one receipt.
 
 ## Why this lives in merchant/, not agent/
 
@@ -122,6 +129,39 @@ def _overclaimed(business_id: str) -> list[dict]:
         led.close()
 
 
+def _at_risk_output_tax(business_id: str) -> list[dict]:
+    """
+    This business's latest GST output-tax run, narrowed to filing periods
+    that are LOCKED and still need a DRC-03 voluntary payment - the mirror
+    of _overclaimed() on the outward side. A period still CORRECTABLE_VIA_1A
+    is excluded on purpose: while the window is open it is a fixable draft
+    gap, not yet a liability the department can act on, the same "not yet
+    real" reasoning _overclaimed() applies to ITC's AT_RISK half.
+    """
+    from engine.gst_filing.taxonomy import CorrectionCode
+    from merchant.ledger import Ledger
+
+    led = Ledger(DB, business_id)
+    try:
+        latest = led.conn.execute(
+            "SELECT run_id FROM business_gstr1_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (business_id,)).fetchone()
+        if not latest:
+            return []
+        rows = led.conn.execute(
+            "SELECT period, delta, interest_paise, days_overdue,"
+            " money_at_stake, rule_cited"
+            " FROM gst_correction_findings WHERE business_id = ?"
+            " AND run_id = ? AND exception_code = ?"
+            " ORDER BY money_at_stake DESC",
+            (business_id, latest["run_id"],
+             str(CorrectionCode.LOCKED_NEEDS_DRC03))).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        led.close()
+
+
 def _recon_lookup(business_id: str, payment_id: str) -> list[dict]:
     """
     This business's LATEST reconciliation, narrowed to one payment.
@@ -155,17 +195,18 @@ def _recon_lookup(business_id: str, payment_id: str) -> list[dict]:
 
 def build_tools(business_id: str, found: Optional[list] = None,
                 credit_found: Optional[list] = None,
-                recon_found: Optional[list] = None) -> list[Callable]:
+                recon_found: Optional[list] = None,
+                output_tax_found: Optional[list] = None) -> list[Callable]:
     """
-    Three tools, offered only when there is a real business to check against.
+    Four tools, offered only when there is a real business to check against.
 
-    `found`, `credit_found` and `recon_found` are how the caller gets back
-    what these tools actually turned up, without threading a new return
-    value through judge()'s whole call chain: pass a list, and whatever a
-    tool surfaces during this run gets appended to it as the tool is called.
-    The caller reads it back after judge() returns and attaches it to the
-    verdict, so the merchant sees a link to the actual finding - not just a
-    sentence naming it in the agent's prose.
+    `found`, `credit_found`, `recon_found` and `output_tax_found` are how
+    the caller gets back what these tools actually turned up, without
+    threading a new return value through judge()'s whole call chain: pass a
+    list, and whatever a tool surfaces during this run gets appended to it
+    as the tool is called. The caller reads it back after judge() returns
+    and attaches it to the verdict, so the merchant sees a link to the
+    actual finding - not just a sentence naming it in the agent's prose.
     """
     if not business_id:
         return []
@@ -269,6 +310,53 @@ def build_tools(business_id: str, found: Optional[list] = None,
         })
 
     @beta_tool
+    def at_risk_output_tax() -> str:
+        """Check whether this business's GST output-tax reconciler found a
+        filing period whose GSTR-3B liability came in short of what GSTR-1
+        supports, and is now locked past the point a GSTR-1A can fix it.
+
+        This is not about any one receipt or payout - it is a standing
+        liability sitting outside the thirty-day curve entirely, the
+        mirror of at_risk_input_credit() but on the outward side: tax the
+        business already owes the department for a period already filed,
+        with s.50 interest accruing daily, and if the gap is large enough
+        it risks an automated Rule 88C notice on top. Call this once,
+        before deciding the month looks comfortable - a balance that is
+        fine on paper is not fine if part of it is a tax bill already due.
+        """
+        try:
+            rows = _at_risk_output_tax(business_id)
+        except Exception as exc:                            # noqa: BLE001
+            return json.dumps({"error": f"could not check: {type(exc).__name__}"})
+
+        if not rows:
+            return json.dumps({
+                "checked": True, "at_risk_paise": 0,
+                "note": "no locked filing period currently needs a DRC-03 "
+                        "payment"})
+
+        at_risk = sum(r["money_at_stake"] or 0 for r in rows)
+        if output_tax_found is not None:
+            output_tax_found.append({
+                "at_risk_paise": at_risk,
+                "at_risk_display": _money(at_risk)["display"],
+                "count": len(rows),
+            })
+
+        return json.dumps({
+            "checked": True, "at_risk_paise": at_risk,
+            "at_risk_display": _money(at_risk)["display"],
+            "periods": [{
+                "period": r["period"],
+                "shortfall": _money(r["delta"] or 0),
+                "interest": _money(r["interest_paise"] or 0),
+                "days_overdue": r["days_overdue"],
+                "total_owed": _money(r["money_at_stake"] or 0),
+                "rule_cited": r["rule_cited"],
+            } for r in rows[:5]],
+        })
+
+    @beta_tool
     def recon_status(payment_id: str) -> str:
         """Check whether this platform's three-way reconciler already
         flagged a problem with this exact payment.
@@ -317,4 +405,5 @@ def build_tools(business_id: str, found: Optional[list] = None,
             "at_risk": _money(at_risk),
         })
 
-    return [settlement_status, at_risk_input_credit, recon_status]
+    return [settlement_status, at_risk_input_credit, recon_status,
+            at_risk_output_tax]
