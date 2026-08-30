@@ -386,15 +386,18 @@ def test_the_agent_is_registered_as_the_fourth_live_one(shop):
     assert "Forward Cash Forecaster" in shop.get("/agents").text
 
 
-def test_the_payout_timing_auditor_is_still_planned():
+def test_the_cash_forecaster_and_payout_timing_stay_distinct_agents():
     """
-    It measures settlement DELAY and prices the float - a different question.
-    Promoting it to ship this would have put one product out under another's
+    Cash forecasting projects a balance forward; payout timing measures
+    settlement DELAY and prices the float - a different question, now a
+    different live agent rather than one product folded under another's
     name.
     """
     from merchant.catalog import get
 
-    assert get("payout_timing").status == "planned"
+    assert get("payout_timing") is not None
+    assert get("payout_timing").status == "live"
+    assert get("payout_timing").id != get("cash_forecaster").id
 
 
 def test_the_tabs_are_the_three_ways_the_inputs_arrive():

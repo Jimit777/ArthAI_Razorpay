@@ -11,10 +11,10 @@ across Indian merchant finance, which is why this is a platform and not a tool.
 ## Honesty rule for this file
 
 Five agents are LIVE: settlement_audit, gst_itc, cash_forecaster,
-three_way_recon, tds_credit. The rest are declared with `status="planned"` and
-have no implementation, because a convincing mock of a working GST reconciler
-is not a roadmap, it is a lie with a progress bar. The UI renders planned agents
-as plainly unavailable and they cannot be run.
+three_way_recon, payout_timing. The rest are declared with `status="planned"`
+and have no implementation, because a convincing mock of a working GST
+reconciler is not a roadmap, it is a lie with a progress bar. The UI renders
+planned agents as plainly unavailable and they cannot be run.
 
 Adding a new live agent means writing an implementation and flipping a status.
 The registry, the per-business enablement table, the run plumbing and the audit
@@ -117,19 +117,6 @@ PLANNED = [
                     "against real data would mean a merchant manually "
                     "cross-referencing both documents before the tool ever "
                     "runs, which does the tool's one job for them.",
-    ),
-    AgentSpec(
-        id="payout_timing",
-        name="Payout Timing Auditor",
-        tagline="Measures settlement delay against the cycle you were promised.",
-        question="Is my money arriving on T+2, and what is the float worth?",
-        status="planned",
-        reads=["settlement reports", "bank statements"],
-        produces=["delay distribution", "float cost estimate"],
-        authority="The merchant agreement's stated settlement cycle",
-        why_unbuilt="A day of delay on every settlement is invisible per "
-                    "transaction and material across a year. The float accrues "
-                    "to whoever holds it.",
     ),
     AgentSpec(
         id="chargeback",

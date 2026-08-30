@@ -427,6 +427,57 @@ CREATE TABLE IF NOT EXISTS tds_findings (
 CREATE INDEX IF NOT EXISTS idx_tds_deductions_biz ON live_tds_deductions(business_id);
 CREATE INDEX IF NOT EXISTS idx_tds_credits_biz    ON live_tds_credits(business_id);
 CREATE INDEX IF NOT EXISTS idx_tds_findings_run    ON tds_findings(run_id);
+
+-- --- payout timing ---------------------------------------------------------
+--
+-- One verdict per RUN here, not one per record - there is only ever one
+-- pattern to judge (see engine/payout_timing/detector.py). The per-record
+-- rows in payout_timing_findings exist so the results page can show the
+-- distribution and the worst offenders, not because any of them was judged
+-- separately.
+
+CREATE TABLE IF NOT EXISTS business_payout_timing_runs (
+  run_id            TEXT PRIMARY KEY,
+  business_id       TEXT NOT NULL,
+  n_settled         INTEGER,
+  n_on_time         INTEGER,
+  n_sla_miss        INTEGER,
+  n_unmatched       INTEGER,
+  miss_rate_bps     INTEGER,
+  mean_delay_days   REAL,
+  max_delay_days    INTEGER,
+  total_float_cost  INTEGER,
+  pattern           TEXT,
+  action            TEXT,
+  confidence        REAL,
+  reasoning         TEXT,
+  escalation_text   TEXT,
+  decided_by        TEXT,
+  queued_for_human  INTEGER,
+  errored           INTEGER DEFAULT 0,
+  source            TEXT,
+  created_at        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS payout_timing_findings (
+  id                    INTEGER PRIMARY KEY,
+  run_id                TEXT,
+  business_id           TEXT NOT NULL,
+  invoice_id            TEXT,
+  txn_id                TEXT,
+  invoice_amount        INTEGER,
+  net_settled           INTEGER,
+  due_date              TEXT,
+  settlement_date       TEXT,
+  delay_working_days    INTEGER,
+  delay_calendar_days   INTEGER,
+  float_cost_paise      INTEGER,
+  code                  TEXT,
+  created_at            INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_payout_timing_findings_run
+  ON payout_timing_findings(run_id);
 """
 
 
@@ -737,6 +788,71 @@ class Ledger:
     def latest_tds_run(self):
         return self.conn.execute(
             "SELECT * FROM business_tds_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
+
+    # --- payout timing -------------------------------------------------
+
+    def commit_payout_timing_run(self, summary, decision, verdict=None,
+                                 source: str = "demo") -> str:
+        """
+        One row for the whole run - the verdict IS the record here, not an
+        aggregate over per-record decisions, since there is only ever one
+        pattern judged per run. `verdict` carries the reasoning/escalation
+        text when the agent ran; `decision` alone (calculator-only) falls
+        back to the arithmetic's own explanation.
+        """
+        import time
+
+        run_id = f"payout_{secrets.token_hex(6)}"
+        business_id = self._scoped()
+        self.conn.execute(
+            "INSERT INTO business_payout_timing_runs (run_id, business_id,"
+            " n_settled, n_on_time, n_sla_miss, n_unmatched, miss_rate_bps,"
+            " mean_delay_days, max_delay_days, total_float_cost, pattern,"
+            " action, confidence, reasoning, escalation_text, decided_by,"
+            " queued_for_human, errored, source, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, business_id, summary.n_settled, summary.n_on_time,
+             summary.n_sla_miss, summary.n_unmatched, summary.miss_rate_bps,
+             summary.mean_delay_working_days, summary.max_delay_working_days,
+             decision.float_cost_paise, decision.pattern, decision.action,
+             decision.confidence,
+             verdict.reasoning if verdict else summary.detail,
+             verdict.escalation_text if verdict else None,
+             decision.decided_by, int(decision.queued_for_human),
+             int(decision.errored), source, int(time.time())))
+        self.conn.commit()
+        return run_id
+
+    def record_payout_timing_findings(self, run_id: str, summary) -> None:
+        import time
+
+        business_id = self._scoped()
+        now = int(time.time())
+        rows = [(
+            run_id, business_id, r.invoice_id, r.txn_id, r.invoice_amount,
+            r.net_settled, str(r.due_date),
+            str(r.settlement_date) if r.settlement_date else None,
+            r.delay_working_days, r.delay_calendar_days, r.float_cost_paise,
+            r.code, now) for r in summary.records]
+        self.conn.executemany(
+            "INSERT INTO payout_timing_findings (run_id, business_id,"
+            " invoice_id, txn_id, invoice_amount, net_settled, due_date,"
+            " settlement_date, delay_working_days, delay_calendar_days,"
+            " float_cost_paise, code, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def payout_timing_findings(self, run_id: str) -> list:
+        return self.conn.execute(
+            "SELECT * FROM payout_timing_findings WHERE business_id = ?"
+            " AND run_id = ? ORDER BY delay_working_days DESC",
+            (self._scoped(), run_id)).fetchall()
+
+    def latest_payout_timing_run(self):
+        return self.conn.execute(
+            "SELECT * FROM business_payout_timing_runs WHERE business_id = ?"
             " ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (self._scoped(),)).fetchone()
 

@@ -169,6 +169,12 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             AgentTab("With API", "connected",
                      "settlements pulled; balances still yours to supply"),
         )),
+    "payout_timing": AgentRoute(
+        agent_id="payout_timing", slug="payout-timing",
+        tabs=(
+            AgentTab("Demo Mode", "",
+                     "a generated settlement batch with planted delays"),
+        )),
 }
 
 SLUG_TO_AGENT = {r.slug: r for r in AGENT_ROUTES.values()}
@@ -206,6 +212,7 @@ FLOWS: tuple[Flow, ...] = (
         FlowStage("Sell", note="Razorpay collects the payment. Nothing to "
                    "audit yet - the gap starts at settlement."),
         FlowStage("Settle", agent_id="settlement_audit"),
+        FlowStage("Payout", agent_id="payout_timing"),
         FlowStage("Refund/Dispute", agent_id="chargeback"),
         FlowStage("Reconcile", agent_id="three_way_recon"),
         FlowStage("Report", agent_id="tds_credit"),

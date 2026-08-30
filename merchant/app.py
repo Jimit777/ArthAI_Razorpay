@@ -43,6 +43,7 @@ import merchant.agents.gst  # noqa: F401  - registers the live agent
 import merchant.agents.recon  # noqa: F401  - registers the live agent
 import merchant.agents.treasury  # noqa: F401  - registers the live agent
 import merchant.agents.settlement  # noqa: F401  - registers the live agent
+import merchant.agents.payout_timing  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
 from merchant import catalog, views
 from merchant.accesslog import ACTION_LABEL, AccessLog, Action
@@ -51,6 +52,7 @@ from merchant.catalog import AgentContext
 from merchant.gateway import BEHAVIOUR_LABEL, BEHAVIOUR_NOTE, Behaviour
 from merchant import benchmark as benchmark_mod
 from engine.gst import rules as rules_gst
+from engine.payout_timing import rules as rules_payout
 from merchant import nav, ui
 from merchant.ledger import Ledger
 
@@ -2017,6 +2019,232 @@ def cash_json(key: str, ws: Workspace = Depends(required_workspace)):
         return JSONResponse({"state": state.get("state"),
                              "phase": state.get("phase", "")})
     return JSONResponse(state["payload"])
+
+
+# --- payout timing -----------------------------------------------------
+#
+# Demo Mode only - see nav.AGENT_ROUTES's single tab for this agent.
+# Findings persist to the database exactly like settlement, GST and TDS
+# (unlike cash forecast and three-way recon's ephemeral RUNS dicts), because
+# there is one verdict per run rather than a per-record payload - see
+# merchant/agents/payout_timing.py and engine/payout_timing/detector.py.
+
+
+@app.get("/agents/payout-timing", response_class=HTMLResponse)
+def payout_timing_page(ws: Workspace = Depends(required_workspace),
+                       key: str = "", error: str = ""):
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "payout_timing", "")
+        latest = led.latest_payout_timing_run()
+
+    if key:
+        with _lock:
+            state = dict(RUNS.get(key) or {})
+        if state and state.get("state") == "running":
+            return HTMLResponse(_payout_timing_running(state, head, shell))
+        if state and state.get("state") == "error":
+            from urllib.parse import quote
+
+            return RedirectResponse(
+                f"/agents/payout-timing?error="
+                f"{quote(state.get('phase', 'Something went wrong.'))}",
+                status_code=303)
+        run_id = state.get("run_id") or (latest["run_id"] if latest else None)
+        if run_id:
+            return RedirectResponse(f"/payout-timing/{run_id}",
+                                    status_code=303)
+
+    error_banner = (f'<div class="banner danger" style="margin-bottom:16px">'
+                    f'{views.esc(error)}</div>') if error else ""
+    latest_link = ""
+    if latest:
+        latest_link = (f'<p class="sub" style="margin-top:10px">'
+                       f'<a href="/payout-timing/{views.esc(latest["run_id"])}">'
+                       f'See your last run &rarr;</a></p>')
+
+    body = f"""
+{head}
+{error_banner}
+<div class="card">
+  <h2>Demo Mode</h2>
+  <p class="sub" style="margin:6px 0 14px">A generated settlement batch with
+     a systematic delay planted against it - some settlements land days
+     after the promised T+{rules_payout.SETTLEMENT_WORKING_DAYS} working-day
+     cycle. One click builds the batch and measures it.</p>
+  <form method="post" action="/agents/payout-timing/run">
+    <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
+      color:var(--muted);margin-bottom:12px">
+      <input type="checkbox" name="use_agent" value="yes" checked>
+      Ask the agent to narrate the pattern and draft the escalation
+    </label>
+    <button class="btn">Run Demo Mode</button>
+  </form>
+  {latest_link}
+</div>"""
+    return HTMLResponse(views.page("Payout timing", body,
+                                   "agent:payout_timing", **shell))
+
+
+@app.post("/agents/payout-timing/run")
+async def run_payout_timing_demo(request: Request,
+                                 ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "payout_timing"):
+            return RedirectResponse(
+                "/agents/payout-timing?error="
+                + quote("This agent is switched off for this business. "
+                        "Turn it on from Agents."), status_code=303)
+
+    form = await request.form()
+    key = f"payout_{int(time.time() * 1000)}"
+    with _lock:
+        RUNS[key] = {"state": "running", "phase": "Building the batch",
+                    "done": 0, "total": 0, "lines": [], "results": [],
+                    "agent": "Payout Timing Auditor", "started": time.time()}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail="ran a payout timing audit on demo data")
+
+    ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
+                       target_id=key, use_agent=(form.get("use_agent") == "yes"),
+                       progress=_progress(key))
+    threading.Thread(target=_run_agent, args=("payout_timing", ctx),
+                     daemon=True).start()
+    return RedirectResponse(f"/agents/payout-timing?key={key}",
+                            status_code=303)
+
+
+def _payout_timing_running(state: dict, head: str, shell: dict) -> str:
+    phase = state.get("phase") or "Starting"
+    found = [l for l in state.get("lines", [])
+             if l.get("kind") in ("finding", "total")]
+    rows = "".join(
+        f'<div class="found-line">{views.esc(l.get("text", ""))}</div>'
+        for l in found)
+
+    failed = state.get("state") == "failed"
+    body = f"""
+{head}
+<div class="card">
+  <div style="display:flex;align-items:center;gap:11px">
+    {'' if failed else '<span class="spinner"></span>'}
+    <div>
+      <div style="font-weight:580">
+        {views.esc("Could not finish" if failed else "Checking your settlements against the promised cycle")}</div>
+      <div class="sub" style="margin-top:2px">{views.esc(phase)}</div>
+    </div>
+  </div>
+  {f'<div class="found">{rows}</div>' if rows else ''}
+</div>
+{'' if failed else '<meta http-equiv="refresh" content="1">'}"""
+    return views.page("Checking", body, "agent:payout_timing", **shell)
+
+
+@app.get("/payout-timing/{run_id}", response_class=HTMLResponse)
+def payout_timing_run_page(run_id: str, ws: Workspace = Depends(required_workspace)):
+    with _lock:
+        state = dict(RUNS.get(run_id) or {})
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "payout_timing", "")
+
+        run = led.conn.execute(
+            "SELECT * FROM business_payout_timing_runs WHERE run_id = ?"
+            " AND business_id = ?", (run_id, ws.business_id)).fetchone()
+
+        running = state.get("state") == "running"
+        if running or run is None:
+            return HTMLResponse(_payout_timing_running(state, head, shell))
+
+        findings = led.payout_timing_findings(run_id)
+
+    misses = [f for f in findings if f["code"] == "SLA_MISS"]
+    tone = {"escalate": "danger", "watch": "warn", "none": "good"}.get(
+        run["action"], "")
+
+    worst_rows = "".join(f"""
+      <tr>
+        <td class="mono">{views.esc(f["invoice_id"])}</td>
+        <td class="r">{views.esc(f["due_date"])}</td>
+        <td class="r">{views.esc(f["settlement_date"] or "-")}</td>
+        <td class="r">{f["delay_working_days"]} working days</td>
+        <td class="r">{rules_payout.rupees(f["float_cost_paise"])}</td>
+      </tr>""" for f in sorted(misses, key=lambda f: -f["delay_working_days"])[:10])
+
+    table = (f"""
+<div class="card" style="padding:0"><table>
+  <thead><tr><th>Invoice</th><th class="r">Due</th><th class="r">Settled</th>
+    <th class="r">Delay</th><th class="r">Float cost</th></tr></thead>
+  <tbody>{worst_rows}</tbody>
+</table></div>""" if misses else ui.blank_slate(
+        "Everything settled on time",
+        f"All {run['n_settled']} settled records met the promised "
+        f"T+{rules_payout.SETTLEMENT_WORKING_DAYS} working-day cycle."))
+
+    escalation = ""
+    if run["escalation_text"]:
+        escalation = f"""
+<div class="card tint" style="margin-top:16px">
+  <h2>Ready to send</h2>
+  <p class="sub" style="margin:4px 0 10px">Paste-ready, addressed to
+     Razorpay's settlement or support team.</p>
+  <pre style="white-space:pre-wrap;font-family:inherit;font-size:13px;
+    background:var(--raised);border-radius:8px;padding:12px">{views.esc(run["escalation_text"])}</pre>
+</div>"""
+
+    body = f"""
+{head}
+
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here has been filed, sent or claimed.</b>
+  This is a proposal waiting for you.</span>
+</div>
+
+<div class="card" style="border-left:3px solid var(--{tone or 'line'})">
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <h2 style="margin:0">{views.esc(run["pattern"].replace('_', ' ').title())}</h2>
+    {ui.badge(run["action"].replace('_', ' ').title() or "None", tone)}
+  </div>
+  <p class="sub" style="margin:8px 0 0;max-width:70ch">{views.esc(run["reasoning"] or "")}</p>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden;margin-top:16px">
+  <div class="stats">
+    <div class="stat"><b>{run["n_settled"]}</b><span>settled records</span></div>
+    <div class="stat"><b>{run["n_sla_miss"]}</b><span>missed the cycle</span></div>
+    <div class="stat"><b>{run["miss_rate_bps"] / 100:.1f}%</b><span>miss rate</span></div>
+    <div class="stat"><b style="color:var(--danger)">
+      {rules_payout.rupees(run["total_float_cost"])}</b>
+      <span>assumed float cost</span></div>
+  </div>
+</div>
+
+<div style="margin:22px 0 11px">
+  <h2 style="margin:0">Worst late settlements</h2>
+</div>
+{table}
+{escalation}
+
+<div class="card tint" style="margin-top:20px">
+  <h2>How this was worked out</h2>
+  <p class="sub" style="margin:4px 0 0">Every settlement's due date comes
+     from Razorpay's own promised T+{rules_payout.SETTLEMENT_WORKING_DAYS}
+     working-day cycle, working days meaning Monday-Friday only - Indian
+     bank holidays are not yet subtracted, which can make a settlement due
+     just after one read as late when it was not the merchant's fault. The
+     float cost assumes a {rules_payout.ASSUMED_COST_OF_CAPITAL_BPS_PER_ANNUM / 100:.0f}%
+     per annum cost of capital, stated as an assumption - there is no
+     statutory rate for a late gateway settlement the way GST section 50
+     sets one for clawed-back input credit.</p>
+</div>"""
+    return HTMLResponse(views.page("Payout timing", body,
+                                   "agent:payout_timing", **shell))
 
 
 # --- three-way reconciliation ---------------------------------------------
@@ -4271,6 +4499,14 @@ def _agent_state(led, ws, spec, source_kind) -> str:
             return ui.STATE_SETUP
         return (ui.STATE_DEMO if recon.get("source") == "demo"
                 else ui.STATE_ACTIVE)
+    if spec.id == "payout_timing":
+        # v1 has only Demo Mode - see nav.AGENT_ROUTES's single tab for this
+        # agent - so any run that exists is demo data by definition, same
+        # reasoning as every other agent's first checkpoint before an
+        # Upload/Connected tab existed.
+        if not led.latest_payout_timing_run():
+            return ui.STATE_SETUP
+        return ui.STATE_DEMO
     return ui.STATE_SETUP
 
 
@@ -4306,6 +4542,13 @@ def _agent_metrics(led, ws, spec) -> list:
         metrics = (recon.get("payload") or {}).get("match_metrics") or {}
         return [(f'{metrics.get("match_rate_percentage", 0)}%', "auto-reconciled"),
                 (rupees(metrics.get("at_stake", 0)), "at stake")]
+    if spec.id == "payout_timing":
+        latest = led.latest_payout_timing_run()
+        if not latest:
+            return []
+        return [(f'{latest["miss_rate_bps"] / 100:.0f}%', "missed the cycle"),
+                (rules_payout.rupees(latest["total_float_cost"] or 0),
+                 "assumed float cost")]
     return []
 
 
