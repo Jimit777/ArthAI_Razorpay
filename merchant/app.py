@@ -78,7 +78,17 @@ DB = os.environ.get("AUDITOR_DB", str(Path(__file__).parent.parent / "merchant.d
 # a host, or a directory the deploy created empty. SQLite will not create a
 # missing parent directory, and the failure surfaces as a bare "unable to
 # open database file" on the first request rather than at startup.
-Path(DB).expanduser().parent.mkdir(parents=True, exist_ok=True)
+#
+# A failure to create it must NOT kill the process. A path like
+# /var/data/merchant.db with no disk actually mounted raises PermissionError
+# here, and crashing at import made the whole deploy fail with a traceback
+# that says nothing about the real cause - a misconfigured path. Letting it
+# through means the server starts, /healthz reports the storage problem in
+# words, and the deploy fails on a health check that explains itself.
+try:
+    Path(DB).expanduser().parent.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 COOKIE = "business_id"
 

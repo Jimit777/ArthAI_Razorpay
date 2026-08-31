@@ -31,12 +31,20 @@ services:
       - key: PYTHON_VERSION
         value: "3.13.4"
 
-      # Where the SQLite file lives. On the free plan this path is on the
-      # instance's own temporary disk and its contents do NOT survive a
-      # restart, a redeploy, or the free plan's inactivity sleep. Attach the
-      # disk below (paid) if the data must persist between sessions.
-      - key: AUDITOR_DB
-        value: /var/data/merchant.db
+      # Where the SQLite file lives.
+      #
+      # NOT set here on purpose. Unset, the app puts merchant.db in its own
+      # project directory, which is writable on every plan. Pointing this at
+      # /var/data while the disk below is commented out is what broke the
+      # first deploy: nothing is mounted there, /var is not writable by the
+      # app's user, and creating the directory raises PermissionError before
+      # the server ever starts.
+      #
+      # Set it to /var/data/merchant.db ONLY together with the disk block at
+      # the bottom of this file. The two are a pair.
+      #
+      # Either way the free plan keeps no data between restarts - the disk is
+      # what makes it persist, not this variable.
 
       # Set these in the Render dashboard, never here - this file is public.
       - key: ANTHROPIC_API_KEY

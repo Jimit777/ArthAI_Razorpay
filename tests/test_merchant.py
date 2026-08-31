@@ -1367,6 +1367,27 @@ def test_the_setup_tab_folded_into_the_tab_it_configures(client):
     assert "Connect a GST filing-status API" in page
 
 
+def test_an_unreachable_database_is_reported_not_crashed_at_startup(tmp_path,
+                                                                    monkeypatch):
+    """
+    Regression from a failed deploy. AUDITOR_DB pointed at /var/data while no
+    disk was mounted there; the startup mkdir raised PermissionError, the
+    process died on import, and the platform reported a traceback that said
+    nothing about the real cause - a misconfigured path.
+
+    Importing must survive it, and /healthz must say what is wrong, so the
+    deploy fails on a health check that explains itself.
+    """
+    import merchant.app as appmod
+
+    monkeypatch.setattr(appmod, "DB", "/proc/definitely-not-writable/x.db")
+    response = TestClient(appmod.app).get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json()["ok"] is False
+    assert response.json()["error"], "a 503 with no reason helps nobody"
+
+
 def test_the_health_check_answers_on_a_brand_new_instance(client):
     """
     The host restarts the service on a failing health check, so this must be
