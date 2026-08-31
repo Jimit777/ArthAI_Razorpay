@@ -175,6 +175,37 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             AgentTab("Demo Mode", "",
                      "a generated settlement batch with planted delays"),
         )),
+    "vendor_terms": AgentRoute(
+        agent_id="vendor_terms", slug="vendor-terms",
+        tabs=(
+            # Same shape as the input credit agent's tabs, for the same
+            # reason: the only thing that differs between them is where the
+            # line items come from. The rate-card check, the agent and the
+            # results page are identical whichever tab produced the batch.
+            AgentTab("Demo Mode", "",
+                     "generated invoices and a matching rate card, one click"),
+            AgentTab("Without API", "without-api",
+                     "your own purchase register, uploaded as a file"),
+            AgentTab("With API", "with-api",
+                     "purchases pulled from Zoho Books"),
+        )),
+    "chargeback": AgentRoute(
+        agent_id="chargeback", slug="chargeback",
+        tabs=(
+            # The same honest asymmetry cash_forecaster's own tabs already
+            # have: With API pulls the dispute NOTICE for real, but the
+            # EVIDENCE behind it - delivery proof, a customer's chat log -
+            # is nobody's API, so it stays yours to supply on every tab.
+            AgentTab("Demo Mode", "",
+                     "generated disputes and generated evidence, scored "
+                     "against a planted answer key"),
+            AgentTab("Without API", "without-api",
+                     "type in a dispute notice yourself, and what "
+                     "evidence you have"),
+            AgentTab("With API", "with-api",
+                     "disputes pulled from Razorpay; evidence still "
+                     "yours to supply"),
+        )),
     "gst_filing": AgentRoute(
         agent_id="gst_filing", slug="gst-filing",
         tabs=(

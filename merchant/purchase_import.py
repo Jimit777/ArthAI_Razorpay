@@ -469,6 +469,161 @@ def filing_history_csv(histories) -> str:
     return out.getvalue()
 
 
+# --- mode C: a line-item register for the vendor invoice auditor -----------
+#
+# Phase A above reduces a purchase register to one tax total per supplier -
+# exactly what ITC reconciliation needs, and exactly not enough for a price
+# check, which needs the item, the quantity and the unit price the ITC path
+# never asked for. A new parser rather than widening `parse()`: the two
+# products read different files for different questions, and a merchant
+# checking prices should not have to fill in tax columns they may not have.
+
+LINE_ITEM_COLUMNS = {
+    "supplier_gstin": COLUMNS["supplier_gstin"],
+    "supplier_name": COLUMNS["supplier_name"],
+    "invoice_number": COLUMNS["invoice_number"],
+    "invoice_date": COLUMNS["invoice_date"],
+    "description": ("item", "item description", "description", "product",
+                    "product name", "particulars", "goods description"),
+    "quantity": ("qty", "quantity", "units", "no of units"),
+    "unit_price": ("rate", "unit price", "price", "rate per unit",
+                   "unit rate", "price per unit"),
+    "line_total": ("amount", "line total", "total", "item amount",
+                   "gross amount"),
+}
+
+
+@dataclass
+class ImportedLineItem:
+    description: str
+    quantity_x100: int
+    unit_price_paise: int
+    line_total_paise: int
+
+
+@dataclass
+class InvoiceLineItems:
+    """One invoice's worth of line items - the shape
+    Ledger.import_purchase_line_items() takes, one call per invoice."""
+    supplier_gstin: str
+    supplier_name: str
+    invoice_number: str
+    invoice_date: str
+    items: list[ImportedLineItem] = field(default_factory=list)
+
+
+@dataclass
+class LineItemImportResult:
+    invoices: list[InvoiceLineItems] = field(default_factory=list)
+    rows_read: int = 0
+    rows_skipped: list[str] = field(default_factory=list)
+    missing_columns: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.invoices)
+
+    @property
+    def n_items(self) -> int:
+        return sum(len(inv.items) for inv in self.invoices)
+
+
+def _quantity_x100(value) -> int:
+    """A quantity cell, as an integer hundredth - same reasoning _paise()
+    gives for money: a float here would drift across a batch."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(round(float(value) * 100))
+    text = re.sub(r"[^0-9.\-]", "", str(value).strip())
+    if not text or text in {"-", "."}:
+        return 0
+    try:
+        return int(round(float(text) * 100))
+    except ValueError:
+        return 0
+
+
+def parse_line_items(data: bytes, filename: str) -> LineItemImportResult:
+    """
+    Read a supplier's billed line items, grouped by invoice.
+
+    Reuses read_rows()/map_columns()/_paise()/GSTIN exactly as parse() does
+    - only the columns being looked for and what gets built from them
+    differ. A row without a well-formed GSTIN, or with no usable quantity
+    or price, is skipped and named rather than guessed at.
+    """
+    result = LineItemImportResult()
+    body, headers = read_rows(data, filename)
+    if not headers:
+        result.missing_columns = ["the file appears to be empty"]
+        return result
+
+    columns = map_columns(headers, LINE_ITEM_COLUMNS)
+    required = ("supplier_gstin", "description", "quantity", "unit_price")
+    result.missing_columns = [f for f in required if f not in columns]
+    if result.missing_columns:
+        return result
+
+    def cell(row, name, default=""):
+        index = columns.get(name)
+        if index is None or index >= len(row):
+            return default
+        value = row[index]
+        return default if value is None else value
+
+    grouped: dict[tuple[str, str], InvoiceLineItems] = {}
+
+    for number, row in enumerate(body, start=2):
+        result.rows_read += 1
+        gstin = str(cell(row, "supplier_gstin")).strip().upper()
+        if not GSTIN.match(gstin):
+            result.rows_skipped.append(
+                f"row {number}: {gstin or '(blank)'} is not a GSTIN")
+            continue
+
+        description = str(cell(row, "description")).strip()
+        quantity_x100 = _quantity_x100(cell(row, "quantity", 0))
+        unit_price_paise = _paise(cell(row, "unit_price", 0))
+        if not description or quantity_x100 <= 0 or unit_price_paise <= 0:
+            result.rows_skipped.append(
+                f"row {number}: {description or '(blank item)'} has no "
+                f"usable quantity or price")
+            continue
+
+        line_total = _paise(cell(row, "line_total", 0)) or (
+            unit_price_paise * quantity_x100) // 100
+
+        invoice_number = str(cell(row, "invoice_number")).strip()
+        key = (gstin, invoice_number or f"row-{number}")
+        invoice = grouped.get(key)
+        if invoice is None:
+            invoice = InvoiceLineItems(
+                supplier_gstin=gstin,
+                supplier_name=str(cell(row, "supplier_name") or gstin).strip(),
+                invoice_number=invoice_number,
+                invoice_date=str(cell(row, "invoice_date")).strip()[:10])
+            grouped[key] = invoice
+        invoice.items.append(ImportedLineItem(
+            description=description, quantity_x100=quantity_x100,
+            unit_price_paise=unit_price_paise, line_total_paise=line_total))
+
+    result.invoices = list(grouped.values())
+    return result
+
+
+SAMPLE_LINE_ITEM_REGISTER = """\
+Supplier Name,Supplier GSTIN,Invoice No,Invoice Date,Item Description,Qty,Rate,Amount
+Anand Steel Traders,27AABCU9603R1ZM,ANA/2201,2026-08-05,Steel Rod - 12mm,20,68,1360
+Anand Steel Traders,27AABCU9603R1ZM,ANA/2214,2026-08-14,Steel Rod - 12mm,15,78,1170
+Konkan Cement Supply,24RWIZN6453L6ZT,KON/5510,2026-08-06,Cement - OPC 53 Grade (bag),40,412,16480
+Konkan Cement Supply,24RWIZN6453L6ZT,KON/5522,2026-08-19,Cement - OPC 53 Grade (bag),30,412,12360
+Bright Packaging Co,27OENNZ1701S7ZP,BRI/7701,2026-08-09,Corrugated Box - Large,100,34.5,3450
+Bright Packaging Co,27OENNZ1701S7ZP,BRI/7715,2026-08-21,Packing Tape - 2 inch,50,42,2100
+Surat Textile Mills,24TRQGP7249B1ZD,SUR/3301,2026-08-11,Cotton Fabric - per metre,60,145,8700
+"""
+
+
 def sample_filing_history(months: int = 36) -> str:
     """
     A filing-history file for the sample register's eight suppliers.

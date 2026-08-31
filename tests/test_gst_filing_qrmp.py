@@ -12,9 +12,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from engine.gst_filing import rules  # noqa: E402
 from engine.gst_filing.generator import (plant_qrmp_quarter,  # noqa: E402
                                          quarter_of)
+from engine.gst_filing.offset import HeadAmounts  # noqa: E402
 from engine.gst_filing.qrmp import (build_qrmp_plan,  # noqa: E402
-                                    eligible, fixed_sum_amount,
-                                    iff_worth_filing, recommend_method)
+                                    build_quarterly_gstr3b, eligible,
+                                    fixed_sum_amount, iff_worth_filing,
+                                    recommend_method)
 from engine.gst_filing.taxonomy import QRMPMethod  # noqa: E402
 
 
@@ -89,7 +91,7 @@ def test_the_planted_quarter_shows_the_correct_method_and_iff_plan():
     """The checkpoint's own 'done when': a planted quarter, run through
     the same seam plant_qrmp_quarter() hands the runner, produces a
     correct method recommendation and a correct IFF count."""
-    kwargs = plant_qrmp_quarter(
+    kwargs, month3 = plant_qrmp_quarter(
         "2026-08", current_month_taxable_paise=15_000_00_00,
         current_month_self_assessed_paise=25_331_83,
         current_month_b2b_tax_paise=[313362, 277900, 202728, 60000])
@@ -106,9 +108,77 @@ def test_the_planted_quarter_shows_the_correct_method_and_iff_plan():
 
 
 def test_month1_is_labelled_an_estimate_not_a_second_real_month():
-    kwargs = plant_qrmp_quarter(
+    kwargs, month3 = plant_qrmp_quarter(
         "2026-08", current_month_taxable_paise=15_000_00_00,
         current_month_self_assessed_paise=25_331_83,
         current_month_b2b_tax_paise=[])
     assert kwargs["month1_iff_invoices"] == []
     assert kwargs["month1_self_assessed_paise"] == (25_331_83 * 85) // 100
+    assert month3 == (25_331_83 * 110) // 100
+
+
+# --- build_quarterly_gstr3b (month 3) -------------------------------------
+
+def test_grand_total_sums_all_three_months():
+    month2 = HeadAmounts(igst=15_00_000, cgst=7_50_000, sgst=7_50_000)
+    out = build_quarterly_gstr3b(
+        "Q2 FY2026-27", month1_liability_paise=20_00_000,
+        month2_liability=month2, month3_liability_paise=25_00_000,
+        prior_advances_paise=0, gstin="27ABCDE1234F1Z5", ret_period="Q2")
+    r = out["reconciliation"]
+    assert r["grand_total_liability_paise"] == 20_00_000 + 30_00_000 + 25_00_000
+    assert r["month2_liability_paise"] == 30_00_000
+
+
+def test_head_split_uses_month2s_real_ratio_applied_once_to_the_total():
+    """IGST is exactly half of month 2's real liability - the aggregated
+    total should keep that same 50% ratio, not re-derive it per month."""
+    month2 = HeadAmounts(igst=10_00_000, cgst=5_00_000, sgst=5_00_000)
+    out = build_quarterly_gstr3b(
+        "Q2 FY2026-27", month1_liability_paise=10_00_000,
+        month2_liability=month2, month3_liability_paise=10_00_000,
+        prior_advances_paise=0, gstin="27ABCDE1234F1Z5", ret_period="Q2")
+    osup = out["sup_details"]["osup_det"]
+    total = osup["iamt"] + osup["camt"] + osup["samt"]
+    assert total == 40_00_000
+    assert osup["iamt"] == total // 2                # 50%, matching month 2
+
+
+def test_balance_due_when_advances_fall_short():
+    month2 = HeadAmounts(igst=10_00_000, cgst=0, sgst=0)
+    out = build_quarterly_gstr3b(
+        "Q2 FY2026-27", month1_liability_paise=10_00_000,
+        month2_liability=month2, month3_liability_paise=10_00_000,
+        prior_advances_paise=15_00_000, gstin="27ABCDE1234F1Z5",
+        ret_period="Q2")
+    r = out["reconciliation"]
+    assert r["grand_total_liability_paise"] == 30_00_000
+    assert r["balance_due_paise"] == 15_00_000
+    assert r["credit_carried_forward_paise"] == 0
+
+
+def test_credit_carried_forward_when_advances_exceed_liability():
+    month2 = HeadAmounts(igst=5_00_000, cgst=0, sgst=0)
+    out = build_quarterly_gstr3b(
+        "Q2 FY2026-27", month1_liability_paise=5_00_000,
+        month2_liability=month2, month3_liability_paise=5_00_000,
+        prior_advances_paise=20_00_000, gstin="27ABCDE1234F1Z5",
+        ret_period="Q2")
+    r = out["reconciliation"]
+    assert r["grand_total_liability_paise"] == 15_00_000
+    assert r["balance_due_paise"] == 0
+    assert r["credit_carried_forward_paise"] == 5_00_000
+
+
+def test_top_level_shape_matches_the_verified_gstr3b_template():
+    """gstin/ret_period/sup_details.osup_det, cross-checked this session
+    against resilient-tech/india-compliance's real production
+    gstr_3b_report_template.json."""
+    month2 = HeadAmounts(igst=1_00_000, cgst=50_000, sgst=50_000)
+    out = build_quarterly_gstr3b(
+        "Q2 FY2026-27", month1_liability_paise=1_00_000,
+        month2_liability=month2, month3_liability_paise=1_00_000,
+        prior_advances_paise=0, gstin="27ABCDE1234F1Z5", ret_period="Q2")
+    assert set(out) == {"gstin", "ret_period", "sup_details", "reconciliation"}
+    osup = out["sup_details"]["osup_det"]
+    assert set(osup) == {"txval", "iamt", "camt", "samt", "csamt"}

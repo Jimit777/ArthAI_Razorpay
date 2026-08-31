@@ -128,6 +128,13 @@ input, select, textarea { width:100%; padding:7px 10px; font-size:13px;
 input:focus, select:focus, textarea:focus { outline:2px solid var(--brand-wash);
   border-color:var(--brand) }
 input[readonly] { color:var(--muted); background:var(--line-2) }
+/* Checkboxes and radios are not text fields - the rule above stretched them
+   to fill their container and gave them a text-input's padding and border,
+   which renders as a large blank box with the tick lost somewhere inside
+   it rather than a small control next to its label. */
+input[type="checkbox"], input[type="radio"] { width:16px; height:16px;
+  min-width:16px; padding:0; border:0; background:none; accent-color:var(--brand);
+  flex:0 0 auto; cursor:pointer }
 .row { display:flex; gap:9px; align-items:flex-end; flex-wrap:wrap }
 .row > div { flex:1; min-width:132px }
 button, .btn { padding:7px 13px; font-size:12.8px; font-weight:560; border:0;
@@ -2721,4 +2728,743 @@ def cash_connected_screen(held: dict, source_kind: Optional[str],
       Ask the agent which payout to move
     </label>
   </form>
+</div>"""
+
+
+# --- vendor invoice auditor -------------------------------------------------
+
+def vendor_terms_demo_screen(latest_link: str = "") -> str:
+    """Tab 1. A generated purchase register with a matching rate card, and
+    known overbilling planted against it."""
+    return f"""
+<div class="src demo">
+  <span class="src-dot"></span>
+  <div><b>Demo mode &mdash; this is a generated purchase register</b>
+    <div class="src-what">Forty billed line items across six suppliers, and
+      a vendor rate card built to match &mdash; with a handful of items
+      deliberately billed above the contracted price. The arithmetic is
+      real; the suppliers are not.</div></div>
+</div>
+
+<div class="card" style="text-align:center;padding:34px 24px">
+  <h2 style="margin:0">Check the batch</h2>
+  <p class="sub" style="margin:7px auto 18px;max-width:58ch">One click bills
+     forty line items, checks every one against the rate card, and drafts a
+     credit note request for every supplier who overcharged. Nothing is
+     sent.</p>
+  <form method="post" action="/agents/vendor-terms/run">
+    <input type="hidden" name="tab" value="demo">
+    <button style="font-size:14px;padding:12px 26px">Run Demo Mode</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent whether each overbilled supplier is worth pursuing
+    </label>
+  </form>
+  {latest_link}
+</div>
+
+<div class="card tint">
+  <h2>What counts as overbilled, and what does not</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">A line billed above
+     the contracted price, past a small tolerance for rounding, is
+     overbilled. A line billed at or below the contracted price is never a
+     finding &mdash; being undercharged helps you, not a reason to raise
+     anything. An item with no contracted price on file is excluded from
+     every total rather than guessed at; add a rate and it can be checked.</p>
+</div>"""
+
+
+def vendor_terms_upload_screen(pending_items: int, sample_csv: str,
+                               latest_link: str = "") -> str:
+    """Tab 2. A merchant's own purchase register, as a file."""
+    import base64
+
+    sample_href = ("data:text/csv;base64,"
+                   + base64.b64encode(sample_csv.encode()).decode())
+
+    run_card = f"""
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Ready to check</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">
+     {pending_items} billed line item{"" if pending_items == 1 else "s"} on
+     file, not yet checked.</p>
+  <form method="post" action="/agents/vendor-terms/run">
+    <input type="hidden" name="tab" value="without-api">
+    <button style="font-size:14px;padding:12px 26px">
+      Check against the rate card</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent whether each overbilled supplier is worth pursuing
+    </label>
+  </form>
+  {latest_link}
+</div>""" if pending_items else """
+<div class="card tint">
+  <h2>Nothing to check yet</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:68ch">Upload a purchase
+     register below - every supplier, item, quantity and rate you were
+     billed.</p>
+</div>"""
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is sent, claimed or paid.</b> Your file is read and
+  checked against your rate card. A credit note request is only ever a
+  draft.</span>
+</div>
+
+{run_card}
+
+<div class="card" style="margin-top:16px">
+  <h2 style="margin:0 0 4px">Upload a purchase register</h2>
+  <p class="sub" style="margin:0 0 14px;max-width:64ch">A CSV or Excel
+     export from Tally, Zoho, Busy or a spreadsheet &mdash; supplier name,
+     GSTIN, invoice number and date, item description, quantity and rate.
+     Column names are matched by what they mean, not by an exact header.</p>
+  <form method="post" action="/agents/vendor-terms/upload"
+        enctype="multipart/form-data"
+        style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <input type="file" name="file" accept=".csv,.xlsx,.xlsm" required>
+    <button class="btn small">Upload</button>
+  </form>
+  <p class="sub" style="margin:12px 0 0">
+    <a href="{sample_href}" download="sample-purchase-register.csv">
+      Download a sample file</a> to see the expected shape.</p>
+</div>
+
+<div class="card tint" style="margin-top:16px">
+  <h2>Rate card</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">A billed item with no
+     contracted price on file is excluded from every check, never guessed
+     at. <a href="/agents/vendor-terms/rates">Review and add rates</a>
+     before running, or add them inline once a check has run.</p>
+</div>"""
+
+
+def vendor_terms_connected_screen(pending_items: int, zoho_connected: bool,
+                                  latest_link: str = "") -> str:
+    """Tab 3. Purchases pulled from Zoho Books."""
+    if not zoho_connected:
+        return """
+<div class="banner warn">
+  <span><b>No Zoho Books account is connected to this business.</b> Connect
+    one in <a href="/data/zoho">Data &amp; integrations</a> and your bills -
+    with their line items - can be pulled directly.</span>
+</div>
+
+<div class="card tint">
+  <h2>What connecting gets you</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">The same Zoho
+     connection the GST input credit reconciler already uses. Pulling bills
+     also pulls each bill's item, quantity and rate - the detail the ITC
+     reconciler never needed and this agent runs on.</p>
+</div>"""
+
+    run_card = f"""
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Ready to check</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">
+     {pending_items} billed line item{"" if pending_items == 1 else "s"}
+     pulled from Zoho, not yet checked.</p>
+  <form method="post" action="/agents/vendor-terms/run">
+    <input type="hidden" name="tab" value="with-api">
+    <button style="font-size:14px;padding:12px 26px">
+      Check against the rate card</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent whether each overbilled supplier is worth pursuing
+    </label>
+  </form>
+  {latest_link}
+</div>""" if pending_items else """
+<div class="card tint">
+  <h2>Nothing pulled yet</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:68ch">Pull your bills from
+     <a href="/data/zoho">Data &amp; integrations</a> first - the same pull
+     the GST input credit reconciler uses also brings in each bill's line
+     items.</p>
+</div>"""
+
+    return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>Zoho Books connected</b>
+    <div class="src-what">Bills are pulled from Data &amp; integrations;
+      each one's items, quantities and rates are checked here.</div></div>
+</div>
+
+{run_card}"""
+
+
+def vendor_rate_card_screen(rows) -> str:
+    """The merchant's own negotiated prices, one row per supplier per item -
+    the only source for this check, since no API for a supplier's agreed
+    price exists anywhere."""
+    body_rows = "".join(f"""
+      <tr>
+        <td class="mono">{esc(r["supplier_gstin"])}</td>
+        <td>{esc(r["description"])}</td>
+        <td class="r">Rs {r["contracted_unit_price_paise"] / 100:,.2f}</td>
+        <td>{esc(r["source"] or "")}</td>
+      </tr>""" for r in rows)
+
+    table = (f"""
+<div class="card" style="padding:0;overflow:hidden"><table>
+  <thead><tr><th>Supplier GSTIN</th><th>Item</th><th class="r">Contracted
+    price</th><th>Source</th></tr></thead>
+  <tbody>{body_rows}</tbody>
+</table></div>""" if rows else
+        '<div class="card tint"><h2>No rates on file yet</h2>'
+        '<p class="sub" style="margin:4px 0 0">Add one below.</p></div>')
+
+    return f"""
+<div class="card" style="margin-bottom:16px">
+  <h2 style="margin:0 0 10px">Add a rate</h2>
+  <form method="post" action="/agents/vendor-terms/rate"
+        style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+    <input type="hidden" name="back_to" value="/agents/vendor-terms/rates">
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Supplier GSTIN</label>
+      <input name="supplier_gstin" placeholder="27AABCU9603R1ZM" required></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Item description</label>
+      <input name="description" placeholder="Steel Rod - 12mm" required></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Contracted price (Rs / unit)</label>
+      <input name="price_rupees" type="number" step="0.01" min="0.01"
+        required style="width:130px"></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Source (optional)</label>
+      <input name="source" placeholder="PO-1042"></div>
+    <button class="btn small">Save</button>
+  </form>
+</div>
+{table}"""
+
+
+def _vendor_terms_supplier_card(supplier_name: str, gstin: str,
+                                items: list, credit_note_text: str,
+                                decided_by: str, queued: bool) -> str:
+    rows = "".join(f"""
+      <tr>
+        <td>{esc(r["description"])}</td>
+        <td class="r">{r["quantity_x100"] / 100:g}</td>
+        <td class="r">Rs {r["unit_price_paise"] / 100:,.2f}</td>
+        <td class="r">Rs {r["contracted_unit_price_paise"] / 100:,.2f}</td>
+        <td class="r" style="color:var(--danger)">
+          Rs {r["money_at_stake_paise"] / 100:,.2f}</td>
+      </tr>""" for r in items)
+
+    stake = sum(r["money_at_stake_paise"] for r in items)
+    note = ""
+    if queued:
+        note = ('<div class="banner warn" style="margin:10px 0 0">'
+               '<span>Sent to a person to decide.</span></div>')
+
+    letter = ""
+    if credit_note_text:
+        letter = f"""
+<details class="working" style="margin-top:12px">
+  <summary>Credit note request - ready to send</summary>
+  <div class="working-body">
+    <pre style="white-space:pre-wrap;font-family:inherit;font-size:12.8px;
+      background:var(--raised);border-radius:8px;padding:12px;margin:0">
+{esc(credit_note_text)}</pre>
+  </div>
+</details>"""
+
+    return f"""
+<div class="card" style="margin-bottom:14px">
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <h2 style="margin:0">{esc(supplier_name)}</h2>
+    <b style="color:var(--danger)">Rs {stake / 100:,.2f} at stake</b>
+  </div>
+  <p class="sub mono" style="margin:2px 0 10px">{esc(gstin)}</p>
+  <table>
+    <thead><tr><th>Item</th><th class="r">Qty</th><th class="r">Billed</th>
+      <th class="r">Contracted</th><th class="r">Over</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  {note}
+  {letter}
+</div>"""
+
+
+def vendor_terms_results(run, findings) -> str:
+    """Overbilled suppliers first, then what could not be checked."""
+    from collections import defaultdict
+
+    from merchant.ui import blank_slate
+
+    by_supplier: dict = defaultdict(list)
+    unconfigured = []
+    for f in findings:
+        if f["code"] == "OVERBILLED":
+            by_supplier[(f["supplier_gstin"], f["supplier_name"])].append(f)
+        elif f["code"] == "RATE_UNCONFIGURED":
+            unconfigured.append(f)
+
+    total_stake = sum(f["money_at_stake_paise"] for f in findings)
+    n_overbilled = sum(len(v) for v in by_supplier.values())
+
+    stats = f"""
+<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
+  <div class="stats">
+    <div class="stat"><b>{run["n_items"]}</b><span>line items checked</span></div>
+    <div class="stat"><b>{n_overbilled}</b><span>overbilled</span></div>
+    <div class="stat"><b>{len(unconfigured)}</b><span>no rate on file</span></div>
+    <div class="stat"><b style="color:var(--danger)">
+      Rs {total_stake / 100:,.2f}</b><span>total at stake</span></div>
+  </div>
+</div>"""
+
+    supplier_cards = "" if by_supplier else blank_slate(
+        "Nothing overbilled",
+        "Every priced line item matched the rate card, within tolerance.")
+    for (gstin, name), items in sorted(
+            by_supplier.items(), key=lambda kv: -sum(
+                r["money_at_stake_paise"] for r in kv[1])):
+        first = items[0]
+        supplier_cards += _vendor_terms_supplier_card(
+            name, gstin, items, first["credit_note_text"] or "",
+            first["decided_by"], bool(first["queued_for_human"]))
+
+    unconfigured_rows = "".join(f"""
+      <tr>
+        <td>{esc(r["supplier_name"])}</td>
+        <td>{esc(r["description"])}</td>
+        <td class="r">Rs {r["unit_price_paise"] / 100:,.2f}</td>
+        <td>
+          <form method="post" action="/agents/vendor-terms/rate"
+                style="display:flex;gap:6px;align-items:center">
+            <input type="hidden" name="back_to" value="/vendor-terms/{esc(run["run_id"])}">
+            <input type="hidden" name="supplier_gstin" value="{esc(r["supplier_gstin"])}">
+            <input type="hidden" name="description" value="{esc(r["description"])}">
+            <input name="price_rupees" type="number" step="0.01" min="0.01"
+              placeholder="Rs / unit" required style="width:100px">
+            <button class="ghost small">Set rate</button>
+          </form>
+        </td>
+      </tr>""" for r in unconfigured)
+
+    unconfigured_block = ""
+    if unconfigured:
+        unconfigured_block = f"""
+<div style="margin:22px 0 11px"><h2 style="margin:0">No rate on file</h2></div>
+<div class="card" style="padding:0;overflow:hidden"><table>
+  <thead><tr><th>Supplier</th><th>Item</th><th class="r">Billed at</th>
+    <th>Set the rate</th></tr></thead>
+  <tbody>{unconfigured_rows}</tbody>
+</table></div>"""
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here has been sent or claimed.</b>
+  Every credit note request is a draft waiting for you.</span>
+</div>
+
+{stats}
+{supplier_cards}
+{unconfigured_block}
+
+<div class="card tint" style="margin-top:20px">
+  <h2>How this was worked out</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Every billed line is
+     compared to your own vendor rate card. A gap of Rs 1 or 0.5% of the
+     contracted price, whichever is larger, is treated as rounding, not an
+     overcharge. Undercharging is never flagged. An item with no contracted
+     price on file is excluded from the totals above rather than guessed
+     at.</p>
+</div>"""
+
+
+# --- chargeback defence assembler -------------------------------------------
+
+_CB_EVIDENCE_LABEL: dict[str, str] = {
+    "shipping_proof": "Proof of shipment/delivery",
+    "billing_proof": "Proof of order/billing",
+    "cancellation_proof": "Proof of cancellation",
+    "customer_communication": "Customer communication",
+    "proof_of_service": "Proof of service",
+    "explanation_letter": "Explanation letter",
+    "refund_confirmation": "Refund confirmation",
+    "access_activity_log": "Access/activity log",
+    "refund_cancellation_policy": "Refund/cancellation policy",
+    "term_and_conditions": "Terms and conditions",
+}
+
+
+def chargeback_demo_screen(latest_link: str = "") -> str:
+    """Tab 1. Generated disputes with generated evidence, planted against a
+    known answer key."""
+    return f"""
+<div class="src demo">
+  <span class="src-dot"></span>
+  <div><b>Demo mode &mdash; this is a generated dispute batch</b>
+    <div class="src-what">Thirty disputes across UPI, RuPay and Razorpay's
+      own reason codes, with evidence planted complete, partial or missing
+      by design - and one reason code deliberately outside this build's
+      requirement table. The reason-code rules are real; the disputes are
+      not.</div></div>
+</div>
+
+<div class="card" style="text-align:center;padding:34px 24px">
+  <h2 style="margin:0">Check the batch</h2>
+  <p class="sub" style="margin:7px auto 18px;max-width:58ch">One click
+     checks every dispute's evidence against its reason code's real
+     requirement list, and drafts a representment letter for anything
+     with something on file. Nothing is submitted.</p>
+  <form method="post" action="/agents/chargeback/run">
+    <input type="hidden" name="tab" value="demo">
+    <button style="font-size:14px;padding:12px 26px">Run Demo Mode</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent whether each dispute is worth contesting
+    </label>
+  </form>
+  {latest_link}
+</div>
+
+<div class="card tint">
+  <h2>What "evidence complete" actually means</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Every reason code
+     here is checked against a real, published table of which evidence
+     types a card network expects for it - not a guess. A dispute with
+     some but not all of what's required still gets a drafted letter; the
+     letter says plainly what's missing rather than arguing around the
+     gap. A reason code outside that table is never given a made-up
+     checklist - it goes to a person instead.</p>
+</div>"""
+
+
+def _dispute_evidence_form(dispute_id: str, reason_code: str,
+                           required: list[str], back_to: str) -> str:
+    from engine.chargeback.rules import evidence_types_for
+
+    types = required or list(evidence_types_for(reason_code))
+    if not types:
+        return ('<p class="sub" style="margin:8px 0 0">No requirement list '
+               'for this reason code - nothing to enter yet.</p>')
+    fields = "".join(f"""
+      <div style="margin-bottom:8px">
+        <label class="sub" style="display:block;margin-bottom:3px">
+          {esc(_CB_EVIDENCE_LABEL.get(t, t))}</label>
+        <input name="evidence_{t}"
+          placeholder="what you have - a tracking number, a one-line summary"
+          style="width:100%"></div>
+      """ for t in types)
+    return f"""
+    <form method="post" action="/agents/chargeback/evidence" style="margin-top:10px">
+      <input type="hidden" name="dispute_id" value="{esc(dispute_id)}">
+      <input type="hidden" name="reason_code" value="{esc(reason_code)}">
+      <input type="hidden" name="back_to" value="{esc(back_to)}">
+      {fields}
+      <button class="ghost small">Save evidence</button>
+    </form>"""
+
+
+def _pending_dispute_card(row, back_to: str) -> str:
+    from engine.chargeback.rules import evidence_types_for
+
+    required = list(evidence_types_for(row["reason_code"]))
+    return f"""
+<div class="card" style="margin-bottom:12px">
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <b>{esc(row["reason_code"])}</b>
+    <span class="sub">Rs {row["amount_paise"] / 100:,.2f}</span>
+  </div>
+  <p class="sub" style="margin:2px 0 0">{esc(row["reason_description"] or "")}
+     &mdash; payment {esc(row["payment_id"] or "")}</p>
+  {_dispute_evidence_form(row["dispute_id"], row["reason_code"], required, back_to)}
+</div>"""
+
+
+def chargeback_manual_screen(pending: list, latest_link: str = "") -> str:
+    """Tab 2. A merchant typing in a dispute notice themselves - there is
+    no register concept for this the way there is for a purchase invoice,
+    since a chargeback notice is a one-off event, not a recurring file."""
+    run_card = f"""
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Ready to check</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">
+     {len(pending)} dispute{"" if len(pending) == 1 else "s"} on file, not
+     yet checked.</p>
+  <form method="post" action="/agents/chargeback/run">
+    <input type="hidden" name="tab" value="without-api">
+    <button style="font-size:14px;padding:12px 26px">
+      Check against the requirement list</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent whether each dispute is worth contesting
+    </label>
+  </form>
+  {latest_link}
+</div>""" if pending else """
+<div class="card tint">
+  <h2>Nothing to check yet</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:68ch">Record a dispute
+     below - the reason code, amount and deadline from the notice you
+     received.</p>
+</div>"""
+
+    pending_cards = "".join(
+        _pending_dispute_card(r, "/agents/chargeback/without-api")
+        for r in pending)
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here is sent, submitted or claimed.</b> A representment
+  letter is only ever a draft.</span>
+</div>
+
+{run_card}
+
+<div class="card" style="margin-top:16px">
+  <h2 style="margin:0 0 4px">Record a dispute</h2>
+  <p class="sub" style="margin:0 0 14px;max-width:64ch">Type in what the
+     notice said - the reason code exactly as Razorpay showed it, the
+     amount, and the date you must respond by.</p>
+  <form method="post" action="/agents/chargeback/manual"
+        style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Payment reference</label>
+      <input name="payment_id" placeholder="pay_..." required></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Reason code</label>
+      <input name="reason_code" placeholder="1064" required style="width:90px"></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Reason (optional)</label>
+      <input name="reason_description" placeholder="Goods/Services Not Received"></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Amount (Rs)</label>
+      <input name="amount_rupees" type="number" step="0.01" min="0.01"
+        required style="width:110px"></div>
+    <div><label class="sub" style="display:block;margin-bottom:4px">
+      Respond by</label>
+      <input name="respond_by_date" type="date" required></div>
+    <button class="btn small">Record</button>
+  </form>
+</div>
+
+{f'<div style="margin:22px 0 11px"><h2 style="margin:0">Not yet checked</h2></div>{pending_cards}' if pending else ""}"""
+
+
+def chargeback_connected_screen(pending: list, source_kind, has_secret: bool,
+                                latest_link: str = "") -> str:
+    """Tab 3. Dispute notices pulled from Razorpay; evidence still the
+    merchant's to supply, on this tab exactly as on Without API."""
+    if source_kind != "razorpay":
+        return """
+<div class="banner warn">
+  <span><b>No Razorpay account is connected to this business.</b> Connect
+    one in <a href="/data">Data &amp; integrations</a> and dispute notices
+    can be pulled directly - reason code, amount and deadline, straight
+    from Razorpay's own Disputes API.</span>
+</div>
+
+<div class="card tint">
+  <h2>What connecting changes, and what it does not</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">The dispute NOTICE
+     itself - reason code, amount, the response deadline - is real and
+     fetchable once connected. The evidence behind it is not: no API
+     anywhere supplies delivery proof or a customer's chat log, so you
+     still enter that yourself, exactly as on the Without API tab.</p>
+</div>"""
+
+    field = ('<input name="key_secret" type="password" placeholder="Key secret" required>'
+             if not has_secret else
+             '<span class="sub">The secret is stored encrypted.</span>')
+
+    pull_card = f"""
+<div class="card" style="margin-bottom:16px">
+  <h2>Pull disputes from Razorpay</h2>
+  <p class="sub" style="margin:6px 0 12px">Reads your real Disputes -
+     reason code, amount and the response deadline. Alongside Demo Mode,
+     never instead of it.</p>
+  <form method="post" action="/agents/chargeback/sync-disputes"
+        style="display:flex;gap:10px;align-items:center">
+    {field}
+    <button class="btn small">Sync</button>
+  </form>
+</div>"""
+
+    run_card = f"""
+<div class="card" style="text-align:center;padding:28px 24px">
+  <h2 style="margin:0">Ready to check</h2>
+  <p class="sub" style="margin:7px auto 16px;max-width:56ch">
+     {len(pending)} dispute{"" if len(pending) == 1 else "s"} pulled, not
+     yet checked.</p>
+  <form method="post" action="/agents/chargeback/run">
+    <input type="hidden" name="tab" value="with-api">
+    <button style="font-size:14px;padding:12px 26px">
+      Check against the requirement list</button>
+    <label style="display:flex;align-items:center;justify-content:center;
+      gap:8px;margin-top:14px;font-size:12.4px;color:var(--ink-2)">
+      <input type="checkbox" name="use_agent" value="yes" checked
+        style="width:auto;margin:0">
+      Ask the agent whether each dispute is worth contesting
+    </label>
+  </form>
+  {latest_link}
+</div>""" if pending else """
+<div class="card tint">
+  <h2>Nothing pulled yet</h2>
+  <p class="sub" style="margin:4px 0 0">Sync above first.</p>
+</div>"""
+
+    pending_cards = "".join(
+        _pending_dispute_card(r, "/agents/chargeback/with-api")
+        for r in pending)
+
+    return f"""
+<div class="src ok">
+  <span class="src-dot"></span>
+  <div><b>Razorpay connected</b>
+    <div class="src-what">Dispute notices are pulled here; evidence is
+      still yours to enter below, per dispute.</div></div>
+</div>
+
+{pull_card}
+{run_card}
+{f'<div style="margin:22px 0 11px"><h2 style="margin:0">Not yet checked</h2></div>{pending_cards}' if pending else ""}"""
+
+
+def _cb_deadline_badge(days: int) -> str:
+    from merchant.ui import badge
+
+    if days <= 2:
+        return badge(f"{days} day(s) left", "danger")
+    if days <= 5:
+        return badge(f"{days} day(s) left", "warn")
+    return badge(f"{days} day(s) left", "good")
+
+
+def _chargeback_finding_card(row, now: int) -> str:
+    import json
+
+    from merchant.ui import badge
+
+    code = row["code"]
+    tone = {"EVIDENCE_COMPLETE": "good", "EVIDENCE_PARTIAL": "warn",
+           "EVIDENCE_MISSING": "", "REASON_CODE_UNMAPPED": "danger"}.get(code, "")
+    label = {"EVIDENCE_COMPLETE": "Every required document is on file",
+            "EVIDENCE_PARTIAL": "Some required documents are on file",
+            "EVIDENCE_MISSING": "No evidence on file yet",
+            "REASON_CODE_UNMAPPED": "No requirement list for this reason code",
+            }.get(code, code)
+
+    days = int((row["respond_by"] - now) // 86_400)
+
+    pack_html = ""
+    if row["evidence_pack_json"]:
+        pack = json.loads(row["evidence_pack_json"])
+        if pack.get("explanation_letter"):
+            pack_html = f"""
+<details class="working" style="margin-top:12px">
+  <summary>Explanation letter - ready to send</summary>
+  <div class="working-body">
+    <pre style="white-space:pre-wrap;font-family:inherit;font-size:12.8px;
+      background:var(--raised);border-radius:8px;padding:12px;margin:0">
+{esc(pack["explanation_letter"])}</pre>
+  </div>
+</details>"""
+        if pack.get("summary"):
+            pack_html += f"""
+<div class="sub" style="margin-top:8px"><b>Submission summary:</b>
+  {esc(pack["summary"])}</div>"""
+
+    note = ""
+    if row["queued_for_human"]:
+        note = ('<div class="banner warn" style="margin:10px 0 0">'
+               '<span>Sent to a person to decide.</span></div>')
+
+    evidence_form = ""
+    if code in ("EVIDENCE_PARTIAL", "EVIDENCE_MISSING"):
+        evidence_form = _dispute_evidence_form(
+            row["dispute_id"], row["reason_code"], [],
+            f"/chargeback/{row['run_id']}")
+
+    return f"""
+<div class="card" style="margin-bottom:14px">
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <div>
+      <b>{esc(row["reason_code"])}</b>
+      <span class="sub" style="margin-left:8px">Rs {row["amount_paise"] / 100:,.2f}</span>
+    </div>
+    {_cb_deadline_badge(max(days, 0))}
+  </div>
+  <p class="sub" style="margin:4px 0 8px">{esc(row["reasoning"] or "")}</p>
+  {badge(label, tone)}
+  {note}
+  {pack_html}
+  {evidence_form}
+</div>"""
+
+
+def chargeback_results(run, findings) -> str:
+    """Worst-deadline-first - there is no natural grouping key the way
+    "supplier" was for vendor_terms; each dispute already is the unit."""
+    import time as _time
+
+    from merchant.ui import blank_slate
+
+    # Demo deadlines are planted relative to the generator's own fixed
+    # AS_OF, not real time - see engine/chargeback/generator.py's own
+    # docstring and merchant/agents/chargeback.py's identical reasoning for
+    # the classification pass. Real wall-clock time keeps moving further
+    # past that fixed anchor, so scoring "days left" against it here would
+    # make every demo dispute read as overdue the moment this demo ages.
+    if run["source"] == "demo":
+        from engine.chargeback.generator import AS_OF
+
+        now = int(AS_OF.timestamp())
+    else:
+        now = int(_time.time())
+
+    ordered = sorted(findings, key=lambda r: r["respond_by"])
+    actionable = [r for r in ordered if r["action"] == "draft_evidence_pack"]
+    unmapped = [r for r in ordered if r["code"] == "REASON_CODE_UNMAPPED"]
+    total_stake = sum(r["amount_paise"] for r in actionable)
+
+    stats = f"""
+<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
+  <div class="stats">
+    <div class="stat"><b>{run["n_disputes"]}</b><span>disputes checked</span></div>
+    <div class="stat"><b>{len(actionable)}</b><span>evidence drafted</span></div>
+    <div class="stat"><b>{len(unmapped)}</b><span>no requirement list</span></div>
+    <div class="stat"><b>Rs {total_stake / 100:,.2f}</b>
+      <span>covered by a draft</span></div>
+  </div>
+</div>"""
+
+    cards = "".join(_chargeback_finding_card(r, now) for r in ordered)
+    if not ordered:
+        cards = blank_slate("Nothing to show", "Run a check first.")
+
+    return f"""
+<div class="banner brand" style="margin-bottom:16px">
+  <span><b>Nothing here has been submitted to Razorpay or any network.</b>
+  Every draft is a proposal waiting for you.</span>
+</div>
+
+{stats}
+{cards}
+
+<div class="card tint" style="margin-top:20px">
+  <h2>How this was worked out</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Every dispute's
+     evidence checklist comes from a real, published table of what each
+     card network expects for that reason code - never a guess. A
+     dispute within two days of its deadline is always sent to a person,
+     whatever the agent's confidence.</p>
 </div>"""

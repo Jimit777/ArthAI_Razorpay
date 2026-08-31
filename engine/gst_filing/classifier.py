@@ -6,12 +6,13 @@ judgment code exists here.
 ## What this produces, and what it deliberately does not
 
 A draft laid out like the real GSTR-1 return - the same table names
-(B2B/B2CL/B2CS, an HSN-wise summary) a merchant already recognises. It is
-NOT the GSTN offline-utility JSON: that schema was not verified byte-for-byte
-this session, and shipping something that looks official without being
-upload-ready would be a worse failure than not offering it. See
-merchant/agents/gst_filing.py and the Overview tab for exactly how this gets
-labelled to the merchant.
+(B2B/B2CL/B2CS, an HSN-wise summary) a merchant already recognises. Layer
+1's own findings are the input to engine/gst_filing/gstn_export.py, which
+turns this draft into the real GSTN offline-utility JSON shape (cross-
+verified against a certified GSP's API docs and a production GST-filing
+tool - see that module's docstring for exactly what "verified" means and
+what still is not). See merchant/agents/gst_filing.py and the Overview tab
+for exactly how the export gets labelled to the merchant.
 """
 
 from __future__ import annotations

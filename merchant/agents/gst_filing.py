@@ -26,7 +26,7 @@ from engine.gst_filing import rules
 from engine.gst_filing.classifier import assemble_gstr1, classify_batch
 from engine.gst_filing.generator import AS_OF, plant_qrmp_quarter
 from engine.gst_filing.offset import HeadAmounts, liability_from_invoices
-from engine.gst_filing.qrmp import build_qrmp_plan
+from engine.gst_filing.qrmp import build_qrmp_plan, build_quarterly_gstr3b
 from engine.gst_filing.scoring import score_classification, score_corrections
 from engine.gst_filing.taxonomy import CorrectionCode
 from merchant.catalog import AgentContext, AgentSpec, register
@@ -51,13 +51,22 @@ def run_gst_filing_pipeline(ctx: AgentContext) -> None:
         ctx.progress(line=_line(**kw))
 
     with Ledger(ctx.db, ctx.business_id) as led:
-        n, l1_truth = led.seed_gst_filing_demo(40)
-        say(text=f"Recorded {n} outward sales and a demo HSN rate card",
-            kind="start")
-
-        batch = led.build_gstr1_batch()
-        if batch is None:
-            raise ValueError("there are no unfiled outward invoices")
+        l1_truth = None
+        if ctx.source == "connected":
+            batch = led.build_gstr1_batch()
+            if batch is None:
+                raise ValueError(
+                    "no unfiled Razorpay invoices on file - pull invoices "
+                    "from the Overview tab first")
+            say(text=f"Using {len(batch)} outward invoices already pulled "
+                     f"from Razorpay", kind="start")
+        else:
+            n, l1_truth = led.seed_gst_filing_demo(40)
+            say(text=f"Recorded {n} outward sales and a demo HSN rate card",
+                kind="start")
+            batch = led.build_gstr1_batch()
+            if batch is None:
+                raise ValueError("there are no unfiled outward invoices")
 
         rate_card = led.hsn_rate_card()
         classified = classify_batch(
@@ -76,12 +85,17 @@ def run_gst_filing_pipeline(ctx: AgentContext) -> None:
                      f"no rate on file - excluded from the draft, not guessed",
                 kind="finding")
 
-        l1_card = score_classification(classified, l1_truth)
-        say(text=f"Measured against the planted answer key: "
-                 f"{l1_card.correct}/{l1_card.total} invoices classified "
-                 f"correctly ({l1_card.accuracy:.0%}), "
-                 f"{l1_card.anomalies_caught}/{l1_card.anomalies} planted "
-                 f"anomalies caught", kind="rules")
+        if l1_truth is not None:
+            # A real Razorpay pull has no planted answer key - an accuracy
+            # percentage needs something to be accurate against, the same
+            # reason merchant/benchmark.py's own docstring gives for why
+            # this number only ever appears next to a generator's data.
+            l1_card = score_classification(classified, l1_truth)
+            say(text=f"Measured against the planted answer key: "
+                     f"{l1_card.correct}/{l1_card.total} invoices classified "
+                     f"correctly ({l1_card.accuracy:.0%}), "
+                     f"{l1_card.anomalies_caught}/{l1_card.anomalies} planted "
+                     f"anomalies caught", kind="rules")
 
         run_id = led.commit_gstr1_run(classified, draft, period=FILING_PERIOD)
         ctx.progress(target_id=run_id, run_id=run_id)
@@ -144,14 +158,37 @@ def run_gst_filing_pipeline(ctx: AgentContext) -> None:
                      f"88C and now have a DRC-01B reply drafted",
                 kind="finding")
 
-        qrmp_kwargs = plant_qrmp_quarter(
+        qrmp_kwargs, month3_liability_paise = plant_qrmp_quarter(
             FILING_PERIOD, current_month_taxable_paise=draft.total_taxable,
             current_month_self_assessed_paise=current.plan.total_cash_needed,
             current_month_b2b_tax_paise=[i.total_tax for i in draft.b2b])
         qrmp_plan = build_qrmp_plan(
             **qrmp_kwargs, materiality_paise=led.iff_materiality())
-        led.record_qrmp_finding(run_id, qrmp_plan)
+
+        quarterly = None
+        if qrmp_plan.is_eligible:
+            quarterly = build_quarterly_gstr3b(
+                qrmp_plan.quarter, month1_liability_paise=qrmp_kwargs["month1_self_assessed_paise"],
+                month2_liability=liability, month3_liability_paise=month3_liability_paise,
+                prior_advances_paise=qrmp_plan.month1_pmt06 + qrmp_plan.month2_pmt06,
+                gstin=led.gst_profile()["gstin"], ret_period=qrmp_plan.quarter)
+
+        led.record_qrmp_finding(run_id, qrmp_plan, quarterly)
         say(text=qrmp_plan.reasoning, kind="rules")
+        if quarterly:
+            r = quarterly["reconciliation"]
+            if r["balance_due_paise"]:
+                settle_text = (
+                    f"Month 3: quarter's total liability "
+                    f"{rules.rupees(r['grand_total_liability_paise'])} against "
+                    f"{rules.rupees(r['prior_pmt06_advances_paise'])} already "
+                    f"paid via PMT-06 - {rules.rupees(r['balance_due_paise'])} "
+                    f"due with the quarterly GSTR-3B")
+            else:
+                settle_text = (
+                    f"Month 3: {rules.rupees(r['credit_carried_forward_paise'])} "
+                    f"credit carried forward after the quarter's advances")
+            say(text=settle_text, kind="rules")
 
         say(text="Nothing has been filed or paid. This is a draft, laid out "
                  "like GSTR-1, GSTR-1A, DRC-03, PMT-06 and DRC-01B - never "

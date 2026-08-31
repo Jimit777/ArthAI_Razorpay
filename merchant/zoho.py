@@ -293,6 +293,37 @@ def to_purchase(bill: dict, vendors_by_id: Optional[dict] = None) -> dict:
     }
 
 
+def to_line_items(bill: dict) -> list[dict]:
+    """
+    One Zoho bill's commercial detail, in the shape
+    Ledger.import_purchase_line_items() takes.
+
+    `bill()` already fetches the full payload this needs - `to_purchase()`
+    above reads only the tax columns off the same bill because that is all
+    ITC reconciliation needs; this is the sibling that stops discarding
+    `line_items`, for the vendor invoice auditor's different question. A
+    line missing its own quantity or rate is skipped rather than guessed
+    at, the same discipline `to_purchase()` applies to a missing GSTIN.
+    """
+    out = []
+    for line in bill.get("line_items") or []:
+        description = (line.get("name") or line.get("description") or "").strip()
+        quantity = line.get("quantity")
+        rate = line.get("rate")
+        if not description or quantity in (None, 0) or rate in (None, 0):
+            continue
+        quantity_x100 = int(round(float(quantity) * 100))
+        unit_price_paise = _paise(rate)
+        line_total_paise = _paise(line.get("item_total")) or (
+            unit_price_paise * quantity_x100) // 100
+        out.append({
+            "description": description, "quantity_x100": quantity_x100,
+            "unit_price_paise": unit_price_paise,
+            "line_total_paise": line_total_paise,
+        })
+    return out
+
+
 def importable(purchase: dict) -> Optional[str]:
     """
     Why this bill cannot be imported, or None if it can.

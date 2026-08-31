@@ -10,8 +10,8 @@ across Indian merchant finance, which is why this is a platform and not a tool.
 
 ## Honesty rule for this file
 
-Six agents are LIVE: settlement_audit, gst_itc, cash_forecaster,
-three_way_recon, payout_timing, gst_filing. The rest are declared with
+Eight agents are LIVE: settlement_audit, gst_itc, cash_forecaster,
+three_way_recon, payout_timing, gst_filing, vendor_terms, chargeback. The rest are declared with
 `status="planned"` and have no implementation, because a convincing mock of a working GST
 reconciler is not a roadmap, it is a lie with a progress bar. The UI renders
 planned agents as plainly unavailable and they cannot be run.
@@ -37,6 +37,8 @@ class AgentContext:
     target_id: str                      # what to work on; a settlement id here
     use_agent: bool = True              # False = deterministic rules only
     progress: Callable[..., None] = lambda **kw: None
+    source: str = "demo"                # "demo" | "connected" - which
+                                         # runners branch on it; most ignore it
 
 
 class AgentRunner(Protocol):
@@ -117,30 +119,6 @@ PLANNED = [
                     "against real data would mean a merchant manually "
                     "cross-referencing both documents before the tool ever "
                     "runs, which does the tool's one job for them.",
-    ),
-    AgentSpec(
-        id="chargeback",
-        name="Chargeback Defence Assembler",
-        tagline="Builds the evidence pack before the window closes.",
-        question="Which disputes can I actually win, and what do I need to send?",
-        status="planned",
-        reads=["chargeback notices", "order records", "delivery proof"],
-        produces=["evidence packs", "deadline tracking"],
-        authority="Card network dispute rules and their representment windows",
-        why_unbuilt="The deadline is short and the paperwork is per-case. Small "
-                    "merchants forfeit by not replying.",
-    ),
-    AgentSpec(
-        id="vendor_terms",
-        name="Vendor Invoice Auditor",
-        tagline="Checks supplier invoices against the terms you agreed.",
-        question="Am I being billed the rates and discounts in my contract?",
-        status="planned",
-        reads=["supplier invoices", "purchase contracts"],
-        produces=["term breaches", "credit note requests"],
-        authority="The purchase agreement",
-        why_unbuilt="Same incentive problem as the gateway: nobody who issues "
-                    "an invoice builds the tool that audits it.",
     ),
 ]
 

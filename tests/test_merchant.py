@@ -574,7 +574,8 @@ def test_the_rate_card_carries_the_guardrails_the_gate_needs(tmp_path):
 # flipping a status to "live" without writing a runner fails here rather than
 # in front of an audience.
 IMPLEMENTED = {"settlement_audit", "gst_itc", "three_way_recon",
-               "cash_forecaster", "payout_timing", "gst_filing"}
+               "cash_forecaster", "payout_timing", "gst_filing",
+               "vendor_terms", "chargeback"}
 
 
 def test_the_live_agents_are_exactly_the_implemented_ones():
@@ -590,6 +591,8 @@ def test_the_live_agents_are_exactly_the_implemented_ones():
     import merchant.agents.recon  # noqa: F401
     import merchant.agents.settlement  # noqa: F401
     import merchant.agents.treasury  # noqa: F401
+    import merchant.agents.vendor_terms  # noqa: F401
+    import merchant.agents.chargeback  # noqa: F401
     from merchant.catalog import all_agents, live_agents
 
     assert {a.id for a in live_agents()} == IMPLEMENTED
@@ -622,7 +625,7 @@ def test_every_planned_agent_is_honestly_unrunnable():
 
 def test_a_planned_agent_cannot_be_turned_on(client):
     _start(client)
-    response = client.post("/agents/chargeback/toggle")
+    response = client.post("/agents/tds_credit/toggle")
     assert response.status_code == 400
     assert "not built yet" in response.text
 
@@ -652,7 +655,7 @@ def test_agent_enablement_is_explicit_not_inferred(tmp_path):
     boot.businesses.set_agent(biz, "settlement_audit", True)
     assert boot.businesses.agent_enabled(biz, "settlement_audit")
 
-    assert not boot.businesses.agent_enabled(biz, "chargeback"), "never built"
+    assert not boot.businesses.agent_enabled(biz, "tds_credit"), "never built"
     boot.close()
 
 

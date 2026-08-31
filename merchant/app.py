@@ -45,6 +45,8 @@ import merchant.agents.treasury  # noqa: F401  - registers the live agent
 import merchant.agents.settlement  # noqa: F401  - registers the live agent
 import merchant.agents.payout_timing  # noqa: F401  - registers the live agent
 import merchant.agents.gst_filing  # noqa: F401  - registers the live agent
+import merchant.agents.vendor_terms  # noqa: F401  - registers the live agent
+import merchant.agents.chargeback  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
 from merchant import catalog, views
 from merchant.accesslog import ACTION_LABEL, AccessLog, Action
@@ -1551,7 +1553,8 @@ def zoho_import(request: Request, ws: Workspace = Depends(required_workspace)):
     """
     from urllib.parse import quote
 
-    from merchant.zoho import ZohoConnections, ZohoError, importable, to_purchase
+    from merchant.zoho import (ZohoConnections, ZohoError, importable,
+                               to_line_items, to_purchase)
 
     ws.require_owner("how this business gets its purchase data", request)
 
@@ -1571,7 +1574,7 @@ def zoho_import(request: Request, ws: Workspace = Depends(required_workspace)):
                                     status_code=303)
 
         existing = {r["invoice_number"] for r in led.purchases(limit=5_000)}
-        imported, skipped = 0, []
+        imported, skipped, n_line_items = 0, [], 0
         for bill in bills:
             purchase = to_purchase(bill, vendors)
             reason = importable(purchase)
@@ -1580,11 +1583,30 @@ def zoho_import(request: Request, ws: Workspace = Depends(required_workspace)):
                 continue
             if purchase["invoice_number"] in existing:
                 continue
-            led.record_zoho_purchase(purchase)
+            purchase_id = led.record_zoho_purchase(purchase)
             imported += 1
+
+            # A bill's line items - what the vendor invoice auditor checks -
+            # are only on the FULL fetch (bills() is the list view and omits
+            # them, same reason it omits the tax breakdown). Fetched only for
+            # bills that are actually imported, not for ones already on file
+            # or skipped, to avoid a second API call nothing will use.
+            try:
+                full = client.bill(bill.get("bill_id", ""))
+            except ZohoError:
+                full = {}
+            items = to_line_items(full)
+            if items:
+                led.import_purchase_line_items(
+                    purchase_id, supplier_name=purchase["supplier_name"],
+                    supplier_gstin=purchase["supplier_gstin"],
+                    invoice_number=purchase["invoice_number"],
+                    invoice_date=purchase["invoice_date"] or "", items=items)
+                n_line_items += len(items)
 
         note = (f"Pulled {len(bills)} bills from {len(vendors)} vendors, "
                 f"imported {imported}"
+                + (f" ({n_line_items} line items)" if n_line_items else "")
                 + (f", skipped {len(skipped)}" if skipped else "") + ".")
         connections.record_pull(ws.business_id, note)
 
@@ -2249,6 +2271,625 @@ def payout_timing_run_page(run_id: str, ws: Workspace = Depends(required_workspa
                                    "agent:payout_timing", **shell))
 
 
+# --- vendor invoice auditor (vendor_terms) ----------------------------------
+#
+# Same three-tab shape as the ITC reconciler (merchant/agents/gst.py): the
+# only thing that differs between Demo/Without API/With API is where the
+# billed line items come from. The rate check, the agent and the results
+# page are identical whichever tab produced the batch.
+
+VT_TAB_DEMO = "demo"
+VT_TAB_WITHOUT_API = "without-api"
+VT_TAB_WITH_API = "with-api"
+
+VT_CSV_MAX_BYTES = 12 * 1024 * 1024
+
+
+def _vendor_terms_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
+    from merchant.purchase_import import SAMPLE_LINE_ITEM_REGISTER
+    from merchant.zoho import ZohoConnections
+
+    slug = "" if tab == VT_TAB_DEMO else tab
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "vendor_terms", slug)
+        latest = led.latest_vendor_terms_run()
+        pending_items = len(led.unreconciled_line_items())
+        zoho_connected = (
+            ZohoConnections(led.conn).client(ws.business_id) is not None)
+
+    with _lock:
+        state = dict(RUNS.get(key) or {}) if key else {}
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    if state.get("state") == "running":
+        return HTMLResponse(_vendor_terms_running(state, head, shell))
+    if state.get("state") == "error":
+        from urllib.parse import quote
+
+        landing = {"demo": "/agents/vendor-terms",
+                  "without-api": "/agents/vendor-terms/without-api",
+                  "with-api": "/agents/vendor-terms/with-api"}.get(
+                      state.get("source", "demo"), "/agents/vendor-terms")
+        return RedirectResponse(
+            f"{landing}?error="
+            f"{quote(state.get('phase', 'Something went wrong.'))}",
+            status_code=303)
+
+    run_id = state.get("run_id")
+    if run_id:
+        return RedirectResponse(f"/vendor-terms/{run_id}", status_code=303)
+
+    latest_link = ""
+    if latest:
+        latest_link = (f'<p class="sub" style="margin-top:10px">'
+                       f'<a href="/vendor-terms/{views.esc(latest["run_id"])}">'
+                       f'See your last run &rarr;</a></p>')
+
+    if tab == VT_TAB_WITHOUT_API:
+        body = views.vendor_terms_upload_screen(
+            pending_items, SAMPLE_LINE_ITEM_REGISTER, latest_link)
+    elif tab == VT_TAB_WITH_API:
+        body = views.vendor_terms_connected_screen(
+            pending_items, zoho_connected, latest_link)
+    else:
+        body = views.vendor_terms_demo_screen(latest_link)
+
+    return HTMLResponse(views.page("Vendor invoice auditor", head + banner + body,
+                                   "agent:vendor_terms", **shell))
+
+
+@app.get("/agents/vendor-terms", response_class=HTMLResponse)
+def vendor_terms_page(ws: Workspace = Depends(required_workspace),
+                      key: str = "", error: str = "", ok: str = ""):
+    return _vendor_terms_page(ws, VT_TAB_DEMO, key, error, ok)
+
+
+@app.get("/agents/vendor-terms/without-api", response_class=HTMLResponse)
+def vendor_terms_without_api(ws: Workspace = Depends(required_workspace),
+                             key: str = "", error: str = "", ok: str = ""):
+    return _vendor_terms_page(ws, VT_TAB_WITHOUT_API, key, error, ok)
+
+
+@app.get("/agents/vendor-terms/with-api", response_class=HTMLResponse)
+def vendor_terms_with_api(ws: Workspace = Depends(required_workspace),
+                          key: str = "", error: str = "", ok: str = ""):
+    return _vendor_terms_page(ws, VT_TAB_WITH_API, key, error, ok)
+
+
+@app.post("/agents/vendor-terms/upload")
+async def upload_vendor_line_items(request: Request,
+                                   ws: Workspace = Depends(required_workspace)):
+    """A supplier's billed line items, as a CSV or Excel file."""
+    from urllib.parse import quote
+
+    from merchant.purchase_import import parse_line_items
+
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not getattr(upload, "filename", ""):
+        return RedirectResponse(
+            "/agents/vendor-terms/without-api?error="
+            + quote("Choose a file first."), status_code=303)
+
+    data = await upload.read()
+    if len(data) > VT_CSV_MAX_BYTES:
+        return RedirectResponse(
+            "/agents/vendor-terms/without-api?error="
+            + quote(f"{upload.filename} is over 12 MB."), status_code=303)
+
+    result = parse_line_items(data, upload.filename)
+    if not result.ok:
+        return RedirectResponse(
+            "/agents/vendor-terms/without-api?error="
+            + quote(f"Could not read {upload.filename}. Missing columns: "
+                    f"{', '.join(result.missing_columns) or 'none named'}."),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        for invoice in result.invoices:
+            purchase_id = f"pur_upload_{secrets.token_hex(6)}"
+            led.import_purchase_line_items(
+                purchase_id, supplier_name=invoice.supplier_name,
+                supplier_gstin=invoice.supplier_gstin,
+                invoice_number=invoice.invoice_number,
+                invoice_date=invoice.invoice_date,
+                items=[{"description": i.description,
+                       "quantity_x100": i.quantity_x100,
+                       "unit_price_paise": i.unit_price_paise,
+                       "line_total_paise": i.line_total_paise}
+                      for i in invoice.items])
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=upload.filename,
+            detail=f"uploaded {result.n_items} billed line items for the "
+                   f"vendor invoice auditor")
+
+    message = (f"{result.n_items} line items read from {upload.filename}, "
+              f"across {len(result.invoices)} invoices.")
+    if result.rows_skipped:
+        message += f" {len(result.rows_skipped)} rows were skipped."
+    return RedirectResponse(
+        "/agents/vendor-terms/without-api?ok=" + quote(message),
+        status_code=303)
+
+
+@app.post("/agents/vendor-terms/rate")
+async def set_vendor_rate_route(request: Request,
+                                ws: Workspace = Depends(required_workspace)):
+    """One rate-card row, entered by the merchant."""
+    from urllib.parse import quote
+
+    form = await request.form()
+    gstin = str(form.get("supplier_gstin") or "").strip()
+    description = str(form.get("description") or "").strip()
+    back_to = str(form.get("back_to") or "/agents/vendor-terms/rates")
+
+    try:
+        price = int(round(float(form.get("price_rupees") or 0) * 100))
+    except ValueError:
+        price = 0
+
+    if not gstin or not description or price <= 0:
+        return RedirectResponse(
+            back_to + "?error=" + quote("A supplier, an item and a positive "
+                                        "price are all required."),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        led.set_vendor_rate(gstin, description, price,
+                            source=str(form.get("source") or "").strip())
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=gstin, detail=f"set the vendor rate for {description}")
+
+    return RedirectResponse(
+        back_to + "?ok=" + quote(f"Rate set for {description}."),
+        status_code=303)
+
+
+@app.get("/agents/vendor-terms/rates", response_class=HTMLResponse)
+def vendor_rates_page(ws: Workspace = Depends(required_workspace),
+                      error: str = "", ok: str = ""):
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "vendor_terms", "")
+        rows = led.vendor_rate_rows()
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    body = head + banner + views.vendor_rate_card_screen(rows)
+    return HTMLResponse(views.page("Vendor rate card", body,
+                                   "agent:vendor_terms", **shell))
+
+
+@app.post("/agents/vendor-terms/run")
+async def run_vendor_terms(request: Request,
+                           ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "vendor_terms"):
+            return RedirectResponse(
+                "/agents/vendor-terms?error="
+                + quote("This agent is switched off for this business. "
+                        "Turn it on from Agents."), status_code=303)
+
+    form = await request.form()
+    tab = str(form.get("tab") or "demo")
+    source = "demo" if tab == "demo" else "connected"
+
+    key = f"vendorterms_{int(time.time() * 1000)}"
+    with _lock:
+        RUNS[key] = {"state": "running", "source": tab,
+                    "phase": "Checking your billed line items", "done": 0,
+                    "total": 0, "lines": [], "results": [],
+                    "agent": "Vendor Invoice Auditor", "started": time.time()}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail=f"ran a vendor invoice audit ({tab})")
+
+    ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
+                       target_id=key, use_agent=(form.get("use_agent") == "yes"),
+                       progress=_progress(key), source=source)
+    threading.Thread(target=_run_agent, args=("vendor_terms", ctx),
+                     daemon=True).start()
+
+    landing = {"demo": "/agents/vendor-terms",
+              "without-api": "/agents/vendor-terms/without-api",
+              "with-api": "/agents/vendor-terms/with-api"}.get(
+                  tab, "/agents/vendor-terms")
+    return RedirectResponse(f"{landing}?key={key}", status_code=303)
+
+
+def _vendor_terms_running(state: dict, head: str, shell: dict) -> str:
+    phase = state.get("phase") or "Starting"
+    found = [l for l in state.get("lines", [])
+            if l.get("kind") in ("finding", "total", "rules", "queued")]
+    rows = "".join(
+        f'<div class="found-line">{views.esc(l.get("text", ""))}</div>'
+        for l in found)
+
+    failed = state.get("state") == "failed"
+    body = f"""
+{head}
+<div class="card">
+  <div style="display:flex;align-items:center;gap:11px">
+    {'' if failed else '<span class="spinner"></span>'}
+    <div>
+      <div style="font-weight:580">
+        {views.esc("Could not finish" if failed else "Checking your billed line items against the contracted price")}</div>
+      <div class="sub" style="margin-top:2px">{views.esc(phase)}</div>
+    </div>
+  </div>
+  {f'<div class="found">{rows}</div>' if rows else ''}
+</div>
+{'' if failed else '<meta http-equiv="refresh" content="1">'}"""
+    return views.page("Checking", body, "agent:vendor_terms", **shell)
+
+
+@app.get("/vendor-terms/{run_id}", response_class=HTMLResponse)
+def vendor_terms_run_page(run_id: str, ws: Workspace = Depends(required_workspace),
+                          error: str = "", ok: str = ""):
+    with _lock:
+        state = dict(RUNS.get(run_id) or {})
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "vendor_terms", "")
+
+        run = led.conn.execute(
+            "SELECT * FROM business_vendor_terms_runs WHERE run_id = ?"
+            " AND business_id = ?", (run_id, ws.business_id)).fetchone()
+
+        running = state.get("state") == "running"
+        if running or run is None:
+            return HTMLResponse(_vendor_terms_running(state, head, shell))
+
+        findings = led.vendor_terms_findings(run_id)
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    body = head + banner + views.vendor_terms_results(run, findings)
+    return HTMLResponse(views.page("Vendor invoice auditor", body,
+                                   "agent:vendor_terms", **shell))
+
+
+# --- chargeback defence assembler (chargeback) ------------------------------
+#
+# Same three-tab shape as vendor_terms/gst_itc, with one deliberate
+# asymmetry (see merchant/nav.py's own comment): the dispute NOTICE is real
+# on With API, but the EVIDENCE behind it is merchant-entered on every tab,
+# since no API anywhere supplies delivery proof or a customer's chat log.
+
+CB_TAB_DEMO = "demo"
+CB_TAB_WITHOUT_API = "without-api"
+CB_TAB_WITH_API = "with-api"
+
+
+def _chargeback_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
+    from merchant.sources import Sources, SourceKind
+
+    slug = "" if tab == CB_TAB_DEMO else tab
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "chargeback", slug)
+        latest = led.latest_chargeback_run()
+        pending = led.unreconciled_disputes()
+        row = Sources(led.conn).get(ws.business_id)
+        source_kind = row["kind"] if row else None
+        has_secret = (source_kind == str(SourceKind.RAZORPAY)
+                     and Sources(led.conn).stored_secret(ws.business_id) is not None)
+
+    with _lock:
+        state = dict(RUNS.get(key) or {}) if key else {}
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    if state.get("state") == "running":
+        return HTMLResponse(_chargeback_running(state, head, shell))
+    if state.get("state") == "error":
+        from urllib.parse import quote
+
+        landing = {"demo": "/agents/chargeback",
+                  "without-api": "/agents/chargeback/without-api",
+                  "with-api": "/agents/chargeback/with-api"}.get(
+                      state.get("source", "demo"), "/agents/chargeback")
+        return RedirectResponse(
+            f"{landing}?error="
+            f"{quote(state.get('phase', 'Something went wrong.'))}",
+            status_code=303)
+
+    run_id = state.get("run_id")
+    if run_id:
+        return RedirectResponse(f"/chargeback/{run_id}", status_code=303)
+
+    latest_link = ""
+    if latest:
+        latest_link = (f'<p class="sub" style="margin-top:10px">'
+                       f'<a href="/chargeback/{views.esc(latest["run_id"])}">'
+                       f'See your last run &rarr;</a></p>')
+
+    if tab == CB_TAB_WITHOUT_API:
+        body = views.chargeback_manual_screen(pending, latest_link)
+    elif tab == CB_TAB_WITH_API:
+        body = views.chargeback_connected_screen(
+            pending, source_kind, has_secret, latest_link)
+    else:
+        body = views.chargeback_demo_screen(latest_link)
+
+    return HTMLResponse(views.page("Chargeback defence", head + banner + body,
+                                   "agent:chargeback", **shell))
+
+
+@app.get("/agents/chargeback", response_class=HTMLResponse)
+def chargeback_page(ws: Workspace = Depends(required_workspace),
+                    key: str = "", error: str = "", ok: str = ""):
+    return _chargeback_page(ws, CB_TAB_DEMO, key, error, ok)
+
+
+@app.get("/agents/chargeback/without-api", response_class=HTMLResponse)
+def chargeback_without_api(ws: Workspace = Depends(required_workspace),
+                           key: str = "", error: str = "", ok: str = ""):
+    return _chargeback_page(ws, CB_TAB_WITHOUT_API, key, error, ok)
+
+
+@app.get("/agents/chargeback/with-api", response_class=HTMLResponse)
+def chargeback_with_api(ws: Workspace = Depends(required_workspace),
+                        key: str = "", error: str = "", ok: str = ""):
+    return _chargeback_page(ws, CB_TAB_WITH_API, key, error, ok)
+
+
+@app.post("/agents/chargeback/manual")
+async def record_manual_dispute_route(request: Request,
+                                      ws: Workspace = Depends(required_workspace)):
+    """A dispute notice the merchant typed in themselves - there is no
+    register concept for this the way there is for a purchase invoice."""
+    from datetime import date, datetime, timezone
+    from urllib.parse import quote
+
+    form = await request.form()
+    payment_id = str(form.get("payment_id") or "").strip()
+    reason_code = str(form.get("reason_code") or "").strip()
+    reason_description = str(form.get("reason_description") or "").strip()
+    respond_by_date = str(form.get("respond_by_date") or "").strip()
+
+    try:
+        amount_paise = int(round(float(form.get("amount_rupees") or 0) * 100))
+    except ValueError:
+        amount_paise = 0
+
+    if not payment_id or not reason_code or amount_paise <= 0 or not respond_by_date:
+        return RedirectResponse(
+            "/agents/chargeback/without-api?error="
+            + quote("A payment reference, reason code, amount and "
+                    "response deadline are all required."), status_code=303)
+
+    try:
+        deadline = datetime.combine(
+            date.fromisoformat(respond_by_date), datetime.min.time(),
+            tzinfo=timezone.utc)
+    except ValueError:
+        return RedirectResponse(
+            "/agents/chargeback/without-api?error="
+            + quote("That deadline is not a valid date."), status_code=303)
+
+    with ledger(ws.business_id) as led:
+        dispute_id = led.record_manual_dispute(
+            payment_id=payment_id, amount_paise=amount_paise,
+            reason_code=reason_code, reason_description=reason_description,
+            respond_by=int(deadline.timestamp()))
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=dispute_id, detail=f"recorded a dispute for {payment_id}")
+
+    return RedirectResponse(
+        "/agents/chargeback/without-api?ok="
+        + quote(f"Dispute recorded. Add evidence below before running."),
+        status_code=303)
+
+
+@app.post("/agents/chargeback/evidence")
+async def set_dispute_evidence(request: Request,
+                               ws: Workspace = Depends(required_workspace)):
+    """One or more evidence types for one dispute, entered together - a
+    dispute has at most a handful of required types, so one form covers
+    all of them rather than the vendor rate card's one-row-at-a-time shape."""
+    from urllib.parse import quote
+
+    from engine.chargeback.rules import REASON_CODE_EVIDENCE
+
+    form = await request.form()
+    dispute_id = str(form.get("dispute_id") or "").strip()
+    reason_code = str(form.get("reason_code") or "").strip()
+    back_to = str(form.get("back_to") or "/agents/chargeback/without-api")
+
+    if not dispute_id:
+        return RedirectResponse(
+            back_to + "?error=" + quote("No dispute given."), status_code=303)
+
+    required = REASON_CODE_EVIDENCE.get(reason_code, ())
+    saved = 0
+    with ledger(ws.business_id) as led:
+        for evidence_type in required:
+            detail = str(form.get(f"evidence_{evidence_type}") or "").strip()
+            if detail:
+                led.record_evidence_item(dispute_id, evidence_type, detail)
+                saved += 1
+        if saved:
+            AccessLog(led.conn).record(
+                Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+                target=dispute_id, detail=f"added {saved} evidence item(s)")
+
+    message = (f"{saved} evidence item(s) saved." if saved
+              else "Nothing entered - add at least one detail.")
+    return RedirectResponse(back_to + "?ok=" + quote(message), status_code=303)
+
+
+@app.post("/agents/chargeback/sync-disputes")
+async def sync_chargeback_disputes(request: Request,
+                                   ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    from merchant.sources import Razorpay, Sources
+
+    form = await request.form()
+    with ledger(ws.business_id) as led:
+        sources = Sources(led.conn)
+        row = sources.get(ws.business_id)
+        if row is None or not row["razorpay_key_id"]:
+            return RedirectResponse("/agents/chargeback/with-api", status_code=303)
+        secret = (form.get("key_secret") or "").strip() \
+            or sources.stored_secret(ws.business_id)
+        if not secret:
+            return RedirectResponse(
+                "/agents/chargeback/with-api?error="
+                + quote("No stored secret. Enter it to sync."), status_code=303)
+        try:
+            client = Razorpay(row["razorpay_key_id"], secret)
+        except ValueError as exc:
+            return RedirectResponse(
+                f"/agents/chargeback/with-api?error={quote(str(exc))}",
+                status_code=303)
+
+        result = client.disputes()
+        if not result.ok:
+            return RedirectResponse(
+                f"/agents/chargeback/with-api?error={quote(result.message)}",
+                status_code=303)
+
+        outcome = led.import_razorpay_disputes(result.raw)
+
+    message = f"{outcome['imported']} dispute(s) imported."
+    if outcome["skipped"]:
+        reasons = "; ".join(f"{did}: {why}"
+                            for did, why in outcome["skipped"][:3])
+        more = len(outcome["skipped"]) - 3
+        message += (f" {len(outcome['skipped'])} skipped - {reasons}"
+                    f"{f' (+{more} more)' if more > 0 else ''}.")
+    if not result.raw:
+        message = result.message
+    return RedirectResponse(f"/agents/chargeback/with-api?ok={quote(message)}",
+                            status_code=303)
+
+
+@app.post("/agents/chargeback/run")
+async def run_chargeback(request: Request,
+                         ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        if not led.businesses.agent_enabled(ws.business_id, "chargeback"):
+            return RedirectResponse(
+                "/agents/chargeback?error="
+                + quote("This agent is switched off for this business. "
+                        "Turn it on from Agents."), status_code=303)
+
+    form = await request.form()
+    tab = str(form.get("tab") or "demo")
+    source = "demo" if tab == "demo" else "connected"
+
+    key = f"chargeback_{int(time.time() * 1000)}"
+    with _lock:
+        RUNS[key] = {"state": "running", "source": tab,
+                    "phase": "Checking your disputes", "done": 0,
+                    "total": 0, "lines": [], "results": [],
+                    "agent": "Chargeback Defence Assembler", "started": time.time()}
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=key, detail=f"ran a chargeback defence check ({tab})")
+
+    ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
+                       target_id=key, use_agent=(form.get("use_agent") == "yes"),
+                       progress=_progress(key), source=source)
+    threading.Thread(target=_run_agent, args=("chargeback", ctx),
+                     daemon=True).start()
+
+    landing = {"demo": "/agents/chargeback",
+              "without-api": "/agents/chargeback/without-api",
+              "with-api": "/agents/chargeback/with-api"}.get(
+                  tab, "/agents/chargeback")
+    return RedirectResponse(f"{landing}?key={key}", status_code=303)
+
+
+def _chargeback_running(state: dict, head: str, shell: dict) -> str:
+    phase = state.get("phase") or "Starting"
+    found = [l for l in state.get("lines", [])
+            if l.get("kind") in ("finding", "total", "rules", "queued")]
+    rows = "".join(
+        f'<div class="found-line">{views.esc(l.get("text", ""))}</div>'
+        for l in found)
+
+    failed = state.get("state") == "failed"
+    body = f"""
+{head}
+<div class="card">
+  <div style="display:flex;align-items:center;gap:11px">
+    {'' if failed else '<span class="spinner"></span>'}
+    <div>
+      <div style="font-weight:580">
+        {views.esc("Could not finish" if failed else "Checking your disputes against the real evidence requirements")}</div>
+      <div class="sub" style="margin-top:2px">{views.esc(phase)}</div>
+    </div>
+  </div>
+  {f'<div class="found">{rows}</div>' if rows else ''}
+</div>
+{'' if failed else '<meta http-equiv="refresh" content="1">'}"""
+    return views.page("Checking", body, "agent:chargeback", **shell)
+
+
+@app.get("/chargeback/{run_id}", response_class=HTMLResponse)
+def chargeback_run_page(run_id: str, ws: Workspace = Depends(required_workspace),
+                        error: str = "", ok: str = ""):
+    with _lock:
+        state = dict(RUNS.get(run_id) or {})
+
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "chargeback", "")
+
+        run = led.conn.execute(
+            "SELECT * FROM business_chargeback_runs WHERE run_id = ?"
+            " AND business_id = ?", (run_id, ws.business_id)).fetchone()
+
+        running = state.get("state") == "running"
+        if running or run is None:
+            return HTMLResponse(_chargeback_running(state, head, shell))
+
+        findings = led.chargeback_findings(run_id)
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
+    elif ok:
+        banner = f'<div class="banner brand"><span>{views.esc(ok)}</span></div>'
+
+    body = head + banner + views.chargeback_results(run, findings)
+    return HTMLResponse(views.page("Chargeback defence", body,
+                                   "agent:chargeback", **shell))
+
+
 # --- GST output tax (gst_filing) -------------------------------------------
 #
 # Four layers, one workspace - see engine/gst_filing/taxonomy.py and
@@ -2258,11 +2899,17 @@ def payout_timing_run_page(run_id: str, ws: Workspace = Depends(required_workspa
 
 @app.get("/agents/gst-filing", response_class=HTMLResponse)
 def gst_filing_page(ws: Workspace = Depends(required_workspace),
-                    key: str = "", error: str = ""):
+                    key: str = "", error: str = "", ok: str = ""):
+    from merchant.sources import SourceKind, Sources
+
     with ledger(ws.business_id) as led:
         shell = _shell_for(led, ws)
         head = _workspace_head(led, ws, "gst_filing", "")
         latest = led.latest_gstr1_run()
+        profile = led.gst_profile()
+        source_kind = Sources(led.conn).kind(ws.business_id)
+        n_pulled = (led.unfiled_razorpay_invoice_count()
+                   if source_kind == str(SourceKind.RAZORPAY) else 0)
 
     if key:
         with _lock:
@@ -2290,17 +2937,89 @@ def gst_filing_page(ws: Workspace = Depends(required_workspace),
                        f'{views.esc(latest["run_id"])}">'
                        f'See your last run &rarr;</a></p>')
 
+    ok_banner = (f'<div class="banner brand" style="margin-bottom:16px">'
+                f'{views.esc(ok)}</div>') if ok else ""
+
+    connected_card = ""
+    if source_kind == str(SourceKind.RAZORPAY):
+        with ledger(ws.business_id) as led:
+            has_secret = Sources(led.conn).stored_secret(ws.business_id) is not None
+        field = ('<div><label>Key secret</label>'
+                 '<input name="key_secret" type="password" required></div>'
+                 if not has_secret else
+                 '<div class="sub" style="margin:0 0 10px">The secret is '
+                 'stored encrypted, so this can run unattended.</div>')
+        run_button = (
+            f'<form method="post" action="/agents/gst-filing/demo">'
+            f'<input type="hidden" name="use_agent" value="yes">'
+            f'<input type="hidden" name="source" value="connected">'
+            f'<button class="btn">Run against {n_pulled} pulled '
+            f'invoice{"" if n_pulled == 1 else "s"}</button></form>'
+            if n_pulled else
+            '<p class="sub" style="margin:0">Nothing pulled yet.</p>')
+        connected_card = f"""
+<div class="card" style="margin-bottom:16px">
+  <h2>Pull invoices from Razorpay</h2>
+  <p class="sub" style="margin:6px 0 12px">Reads your real Invoices - GSTIN,
+     HSN/SAC code and tax rate are only populated when you entered them
+     yourself through the Razorpay Dashboard (the API cannot set them), so
+     an invoice missing any of that is classified honestly, never guessed.
+     Alongside Demo Mode, never instead of it - everything past layer 1
+     runs exactly the same either way.</p>
+  <form method="post" action="/agents/gst-filing/sync-invoices">
+    <div class="row">
+      {field}
+      <div style="flex:0"><button>Sync</button></div>
+    </div>
+  </form>
+  {run_button}
+</div>"""
+    elif source_kind:
+        connected_card = f"""
+<div class="card tint" style="margin-bottom:16px">
+  <p class="sub" style="margin:0">Your data source is
+     {views.esc(source_kind)}, not Razorpay - connect Razorpay on the
+     <a href="/data">data source page</a> to pull real invoices here.</p>
+</div>"""
+
     body = f"""
 {head}
 {error_banner}
+{ok_banner}
+{connected_card}
+<div class="card tint" style="margin-bottom:16px">
+  <h2 style="font-size:14px">Your GST registration</h2>
+  <p class="sub" style="margin:4px 0 12px">Needed to fill SellerDtls in the
+     real GSTR-1 and e-invoice JSON exports - this system has never had
+     anywhere else to get your GSTIN or registered address from. Nothing
+     is verified against the GSTN registry; this is you telling the export
+     what to say about you.</p>
+  <form method="post" action="/agents/gst-filing/profile">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <input name="gstin" placeholder="GSTIN, e.g. 27ABCDE1234F1Z5"
+        value="{views.esc(profile['gstin'])}">
+      <input name="legal_name" placeholder="Legal name"
+        value="{views.esc(profile['legal_name'])}">
+      <input name="trade_name" placeholder="Trade name (optional)"
+        value="{views.esc(profile['trade_name'])}">
+      <input name="address_line1" placeholder="Address line 1"
+        value="{views.esc(profile['address_line1'])}">
+      <input name="location" placeholder="City/town"
+        value="{views.esc(profile['location'])}">
+      <input name="pincode" placeholder="PIN code"
+        value="{views.esc(profile['pincode'])}">
+    </div>
+    <button class="btn ghost small" style="margin-top:10px">Save</button>
+  </form>
+</div>
 <div class="card">
   <h2>Demo Mode</h2>
   <p class="sub" style="margin:6px 0 14px">A generated month of outward
      sales, classified into B2B, B2CL and B2CS, with a missing e-invoice IRN
      and an unconfigured HSN rate both planted so you can see how each is
-     handled - plus three prior filing periods, one clean, one locked with
-     an ordinary shortfall, one locked with wrongly-claimed ITC. One click
-     builds all of it.</p>
+     handled - plus four prior filing periods, one clean, two locked (an
+     ordinary shortfall and wrongly-claimed ITC), one locked and large
+     enough to breach Rule 88C. One click builds all of it.</p>
   <form method="post" action="/agents/gst-filing/demo">
     <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
       color:var(--muted);margin-bottom:12px">
@@ -2313,6 +3032,24 @@ def gst_filing_page(ws: Workspace = Depends(required_workspace),
 </div>"""
     return HTMLResponse(views.page("GST output tax", body,
                                    "agent:gst_filing", **shell))
+
+
+@app.post("/agents/gst-filing/profile")
+async def set_gst_profile(request: Request,
+                          ws: Workspace = Depends(required_workspace)):
+    form = await request.form()
+    with ledger(ws.business_id) as led:
+        led.set_gst_profile(
+            gstin=(form.get("gstin") or "").strip().upper(),
+            legal_name=(form.get("legal_name") or "").strip(),
+            trade_name=(form.get("trade_name") or "").strip(),
+            address_line1=(form.get("address_line1") or "").strip(),
+            location=(form.get("location") or "").strip(),
+            pincode=(form.get("pincode") or "").strip())
+    from urllib.parse import quote
+
+    return RedirectResponse(
+        "/agents/gst-filing?ok=" + quote("Saved."), status_code=303)
 
 
 @app.post("/agents/gst-filing/demo")
@@ -2328,23 +3065,73 @@ async def run_gst_filing_demo(request: Request,
                         "Turn it on from Agents."), status_code=303)
 
     form = await request.form()
+    source = "connected" if form.get("source") == "connected" else "demo"
     key = f"gstf_{int(time.time() * 1000)}"
     with _lock:
-        RUNS[key] = {"state": "running", "phase": "Recording demo sales",
+        RUNS[key] = {"state": "running",
+                    "phase": ("Reading your pulled invoices" if source == "connected"
+                             else "Recording demo sales"),
                     "done": 0, "total": 0, "lines": [], "results": [],
                     "agent": "GST Output Tax Reconciler", "started": time.time()}
 
     with ledger(ws.business_id) as led:
         AccessLog(led.conn).record(
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
-            target=key, detail="ran the GST output-tax pipeline on demo data")
+            target=key,
+            detail=f"ran the GST output-tax pipeline on {source} data")
 
     ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
                        target_id=key, use_agent=(form.get("use_agent") == "yes"),
-                       progress=_progress(key))
+                       progress=_progress(key), source=source)
     threading.Thread(target=_run_agent, args=("gst_filing", ctx),
                      daemon=True).start()
     return RedirectResponse(f"/agents/gst-filing?key={key}", status_code=303)
+
+
+@app.post("/agents/gst-filing/sync-invoices")
+async def sync_gst_filing_invoices(request: Request,
+                                   ws: Workspace = Depends(required_workspace)):
+    from urllib.parse import quote
+
+    from merchant.sources import Razorpay, Sources
+
+    form = await request.form()
+    with ledger(ws.business_id) as led:
+        sources = Sources(led.conn)
+        row = sources.get(ws.business_id)
+        if row is None or not row["razorpay_key_id"]:
+            return RedirectResponse("/agents/gst-filing", status_code=303)
+        secret = (form.get("key_secret") or "").strip() \
+            or sources.stored_secret(ws.business_id)
+        if not secret:
+            return RedirectResponse(
+                "/agents/gst-filing?error="
+                + quote("No stored secret. Enter it to sync."), status_code=303)
+        try:
+            client = Razorpay(row["razorpay_key_id"], secret)
+        except ValueError as exc:
+            return RedirectResponse(
+                f"/agents/gst-filing?error={quote(str(exc))}", status_code=303)
+
+        result = client.invoices()
+        if not result.ok:
+            return RedirectResponse(
+                f"/agents/gst-filing?error={quote(result.message)}",
+                status_code=303)
+
+        outcome = led.import_razorpay_invoices(result.raw)
+
+    message = f"{outcome['imported']} invoice(s) imported."
+    if outcome["skipped"]:
+        reasons = "; ".join(f"{sid}: {why}"
+                            for sid, why in outcome["skipped"][:3])
+        more = len(outcome["skipped"]) - 3
+        message += (f" {len(outcome['skipped'])} skipped - {reasons}"
+                    f"{f' (+{more} more)' if more > 0 else ''}.")
+    if not result.raw:
+        message = result.message
+    return RedirectResponse(f"/agents/gst-filing?ok={quote(message)}",
+                            status_code=303)
 
 
 def _gst_filing_running(state: dict, head: str, shell: dict) -> str:
@@ -2439,9 +3226,11 @@ def gst_filing_run_page(run_id: str, ws: Workspace = Depends(required_workspace)
 <div class="card" style="border-left:3px solid var(--warn);margin-top:16px">
   <h2 style="font-size:15px">Missing an e-invoice IRN</h2>
   <p class="sub" style="margin:6px 0 10px">These B2B invoices need an IRN
-     before they can be filed. Raise them through the e-invoice portal - this
-     tool does not construct an e-invoice submission payload; the IRP's own
-     schema was not verified field-for-field this session.</p>
+     before they can be filed. The IRN-generation request JSON is below
+     (download link above) - real INV-01 field names, cross-checked against
+     a live IRP request/response fixture. Buyer address fields are not on
+     file for any invoice and are named, not guessed - fill them in before
+     submitting through the e-invoice portal or a GSP.</p>
   {rows}
 </div>"""
 
@@ -2461,9 +3250,12 @@ def gst_filing_run_page(run_id: str, ws: Workspace = Depends(required_workspace)
 {head}
 
 <div class="banner brand" style="margin-bottom:16px">
-  <span><b>Nothing here has been filed.</b> This is a draft, laid out like
-  the GSTR-1 return - not the GSTN offline-utility JSON, and not
-  upload-ready. Copy the figures into the portal or your filing software.</span>
+  <span><b>Nothing here has been filed.</b> The JSON below matches the
+  GSTN offline-utility's own field names and structure - cross-checked
+  against a certified GSP's API docs and a production GST-filing tool,
+  not our own shape any more. It has not been tested against a live
+  portal upload; treat it as a strong draft to review before you file,
+  not a claim that GSTN has accepted it.</span>
 </div>
 
 <div class="card" style="padding:0;overflow:hidden">
@@ -2476,6 +3268,13 @@ def gst_filing_run_page(run_id: str, ws: Workspace = Depends(required_workspace)
     <div class="stat"><b style="color:var(--warn)">{run["n_missing_irn"]}</b>
       <span>missing an IRN</span></div>
   </div>
+  <div style="padding:12px 16px;border-top:1px solid var(--line-2);
+    display:flex;gap:10px">
+    <a class="btn ghost small" href="/agents/gst-filing/run/{views.esc(run_id)}/gstr1.json">
+      Download GSTR-1 JSON</a>
+    <a class="btn ghost small" href="/agents/gst-filing/run/{views.esc(run_id)}/einvoice.json">
+      Download e-invoice batch JSON</a>
+  </div>
 </div>
 
 {missing_irn_card}
@@ -2486,6 +3285,68 @@ def gst_filing_run_page(run_id: str, ws: Workspace = Depends(required_workspace)
 """
     return HTMLResponse(views.page("GST output tax", body,
                                    "agent:gst_filing", **shell))
+
+
+def _classified_from_rows(rows) -> list:
+    """live_sale_invoices rows, as already classified and persisted by
+    commit_gstr1_run, back into the ClassifiedInvoice shape
+    gstn_export.py's functions take - never re-classifies, just reshapes
+    what was already decided."""
+    from datetime import date as _date
+
+    from engine.gst_filing.classifier import ClassifiedInvoice
+
+    return [ClassifiedInvoice(
+        invoice_id=r["invoice_id"], invoice_number=r["invoice_number"],
+        invoice_date=_date.fromisoformat(r["invoice_date"]),
+        buyer_name=r["buyer_name"], buyer_gstin=r["buyer_gstin"] or None,
+        place_of_supply=r["place_of_supply"], hsn_code=r["hsn_code"],
+        taxable_value=r["taxable_value"], cgst=r["cgst"] or 0,
+        sgst=r["sgst"] or 0, igst=r["igst"] or 0,
+        invoice_type=r["invoice_type"], irn=r["irn"] or None,
+        code=r["code"]) for r in rows]
+
+
+@app.get("/agents/gst-filing/run/{run_id}/gstr1.json")
+def gst_filing_gstr1_json(run_id: str, ws: Workspace = Depends(required_workspace)):
+    from engine.gst_filing.classifier import assemble_gstr1
+    from engine.gst_filing.gstn_export import to_gstr1_json
+
+    with ledger(ws.business_id) as led:
+        run = led.conn.execute(
+            "SELECT * FROM business_gstr1_runs WHERE run_id = ?"
+            " AND business_id = ?", (run_id, ws.business_id)).fetchone()
+        if not run:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        rows = led.sale_invoices_in_run(run_id)
+        profile = led.gst_profile()
+
+    classified = _classified_from_rows(rows)
+    draft = assemble_gstr1(classified, period=run["period"] or "")
+    return JSONResponse(to_gstr1_json(draft, gstin=profile["gstin"],
+                                      home_state="27"))
+
+
+@app.get("/agents/gst-filing/run/{run_id}/einvoice.json")
+def gst_filing_einvoice_json(run_id: str,
+                             ws: Workspace = Depends(required_workspace)):
+    from engine.gst_filing.classifier import assemble_gstr1
+    from engine.gst_filing.gstn_export import to_einvoice_batch
+
+    with ledger(ws.business_id) as led:
+        run = led.conn.execute(
+            "SELECT * FROM business_gstr1_runs WHERE run_id = ?"
+            " AND business_id = ?", (run_id, ws.business_id)).fetchone()
+        if not run:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        rows = led.sale_invoices_in_run(run_id)
+        profile = led.gst_profile()
+
+    classified = _classified_from_rows(rows)
+    draft = assemble_gstr1(classified, period=run["period"] or "")
+    batch = to_einvoice_batch(draft.missing_irn, seller=profile,
+                              home_state="27")
+    return JSONResponse({"invoices": batch})
 
 
 @app.get("/agents/gst-filing/corrections", response_class=HTMLResponse)
@@ -2555,7 +3416,10 @@ def gst_filing_corrections_page(ws: Workspace = Depends(required_workspace)):
       <tr><td><b>Amendment</b></td>
         <td class="r"><b>{views.esc(d["amendment_display"])}</b></td></tr>
     </tbody>
-  </table>"""
+  </table>
+  <a class="btn ghost small" style="margin-top:8px"
+    href="/agents/gst-filing/corrections/{views.esc(r["period"])}/gstr1a.json">
+    Download GSTR-1A JSON</a>"""
         elif code == "LOCKED_NEEDS_DRC03" and r["drc03_draft"]:
             d = json.loads(r["drc03_draft"])
             detail = f"""
@@ -2590,6 +3454,33 @@ def gst_filing_corrections_page(ws: Workspace = Depends(required_workspace)):
 {''.join(cards)}"""
     return HTMLResponse(views.page("GST output tax", body,
                                    "agent:gst_filing", **shell))
+
+
+@app.get("/agents/gst-filing/corrections/{period}/gstr1a.json")
+def gst_filing_gstr1a_json(period: str,
+                           ws: Workspace = Depends(required_workspace)):
+    import json as _json
+
+    from engine.gst_filing.gstn_export import to_gstr1a_json
+
+    with ledger(ws.business_id) as led:
+        latest = led.latest_gstr1_run()
+        if not latest:
+            return JSONResponse({"error": "no run yet"}, status_code=404)
+        row = led.conn.execute(
+            "SELECT gstr1a_draft FROM gst_correction_findings"
+            " WHERE business_id = ? AND run_id = ? AND period = ?"
+            " AND exception_code = 'CORRECTABLE_VIA_1A'",
+            (ws.business_id, latest["run_id"], period)).fetchone()
+        profile = led.gst_profile()
+
+    if not row or not row["gstr1a_draft"]:
+        return JSONResponse({"error": "no open GSTR-1A amendment for "
+                             + period}, status_code=404)
+
+    g1a = _json.loads(row["gstr1a_draft"])
+    return JSONResponse(to_gstr1a_json(g1a, gstin=profile["gstin"],
+                                       period=period, home_state="27"))
 
 
 @app.get("/agents/gst-filing/offset", response_class=HTMLResponse)
@@ -2762,10 +3653,51 @@ def gst_filing_qrmp_page(ws: Workspace = Depends(required_workspace),
      window - it is covered by the quarter's own regular GSTR-1.</p>
 </div>"""
 
+    quarterly_card = ""
+    if finding["eligible"] and finding["quarterly_gstr3b"]:
+        import json as _json
+
+        q = _json.loads(finding["quarterly_gstr3b"])
+        r = q["reconciliation"]
+        osup = q["sup_details"]["osup_det"]
+        settled = (
+            f'<b style="color:var(--warn)">'
+            f'{rules_gstf.rupees(r["balance_due_paise"])} due</b> with the '
+            f'quarterly GSTR-3B' if r["balance_due_paise"] else
+            f'<b style="color:var(--good)">'
+            f'{rules_gstf.rupees(r["credit_carried_forward_paise"])} '
+            f'credit</b> carried forward')
+        quarterly_card = f"""
+<div class="card" style="margin-top:14px">
+  <h2 style="font-size:14px">Month 3 - quarterly close</h2>
+  <p class="sub" style="margin:4px 0 10px">Months 1 and 3 are estimates
+     (see the Overview tab's own disclaimer) - only month 2 is layer 1's
+     real per-head liability. {settled}.</p>
+  <table>
+    <thead><tr><th></th><th class="r">Month 1</th><th class="r">Month 2</th>
+      <th class="r">Month 3</th><th class="r">Total</th></tr></thead>
+    <tbody>
+      <tr><td>Liability</td>
+        <td class="r">{rules_gstf.rupees(r["month1_liability_paise"])}</td>
+        <td class="r">{rules_gstf.rupees(r["month2_liability_paise"])}</td>
+        <td class="r">{rules_gstf.rupees(r["month3_liability_paise"])}</td>
+        <td class="r"><b>{rules_gstf.rupees(r["grand_total_liability_paise"])}</b></td></tr>
+      <tr><td>PMT-06 advances already paid</td>
+        <td class="r" colspan="3"></td>
+        <td class="r">{rules_gstf.rupees(r["prior_pmt06_advances_paise"])}</td></tr>
+    </tbody>
+  </table>
+  <p class="sub" style="margin-top:8px">GSTR-3B outward liability, real
+     field names (sup_details.osup_det): IGST {rules_gstf.rupees(osup["iamt"])}
+     · CGST {rules_gstf.rupees(osup["camt"])}
+     · SGST {rules_gstf.rupees(osup["samt"])}.</p>
+</div>"""
+
     body = f"""
 {head}
 {error_banner}
 {card}
+{quarterly_card}
 {materiality_form}"""
     return HTMLResponse(views.page("GST output tax", body,
                                    "agent:gst_filing", **shell))
@@ -5054,6 +5986,16 @@ def _agent_state(led, ws, spec, source_kind) -> str:
         if not led.latest_gstr1_run():
             return ui.STATE_SETUP
         return ui.STATE_DEMO
+    if spec.id == "vendor_terms":
+        run = led.latest_vendor_terms_run()
+        if not run:
+            return ui.STATE_SETUP
+        return (ui.STATE_DEMO if run["source"] == "demo" else ui.STATE_ACTIVE)
+    if spec.id == "chargeback":
+        run = led.latest_chargeback_run()
+        if not run:
+            return ui.STATE_SETUP
+        return (ui.STATE_DEMO if run["source"] == "demo" else ui.STATE_ACTIVE)
     return ui.STATE_SETUP
 
 
@@ -5102,6 +6044,26 @@ def _agent_metrics(led, ws, spec) -> list:
             return []
         return [(str(latest["n_invoices"]), "invoices"),
                 (rules_gstf.rupees(latest["total_tax"] or 0), "output tax")]
+    if spec.id == "vendor_terms":
+        latest = led.latest_vendor_terms_run()
+        if not latest:
+            return []
+        stake = led.conn.execute(
+            "SELECT COALESCE(SUM(money_at_stake_paise),0) s FROM"
+            " vendor_terms_findings WHERE run_id = ?",
+            (latest["run_id"],)).fetchone()["s"]
+        return [(str(latest["n_items"]), "line items"),
+                (rupees(stake or 0), "overbilled")]
+    if spec.id == "chargeback":
+        latest = led.latest_chargeback_run()
+        if not latest:
+            return []
+        stake = led.conn.execute(
+            "SELECT COALESCE(SUM(amount_paise),0) s FROM chargeback_findings"
+            " WHERE run_id = ? AND action = 'draft_evidence_pack'",
+            (latest["run_id"],)).fetchone()["s"]
+        return [(str(latest["n_disputes"]), "disputes"),
+                (rupees(stake or 0), "evidence drafted")]
     return []
 
 

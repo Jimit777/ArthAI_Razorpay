@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from merchant.vault import Vault  # noqa: E402
 from merchant.zoho import (DEFAULT_REGION, REGIONS, SCOPES,  # noqa: E402
                            ZohoBooks, ZohoConnections, ZohoError,
-                           authorise_url, importable, to_purchase)
+                           authorise_url, importable, to_line_items, to_purchase)
 
 
 class Reply:
@@ -179,6 +179,39 @@ def test_an_interstate_bill_lands_in_igst():
     purchase = to_purchase(bill)
     assert purchase["igst"] == 4_171_788
     assert purchase["cgst"] == purchase["sgst"] == 0
+
+
+def test_line_items_read_description_quantity_and_rate():
+    bill = {**BILL, "line_items": [
+        {"name": "Cotton Fabric - per metre", "quantity": 60, "rate": 145.0,
+         "item_total": 8700.0}]}
+    items = to_line_items(bill)
+    assert len(items) == 1
+    assert items[0]["description"] == "Cotton Fabric - per metre"
+    assert items[0]["quantity_x100"] == 60_00
+    assert items[0]["unit_price_paise"] == 14_500
+    assert items[0]["line_total_paise"] == 870_000
+
+
+def test_a_bill_with_no_line_items_yields_an_empty_list():
+    assert to_line_items(BILL) == []
+
+
+def test_a_line_missing_quantity_or_rate_is_skipped_not_guessed():
+    bill = {**BILL, "line_items": [
+        {"name": "Mystery Item", "quantity": None, "rate": 100.0},
+        {"name": "Zero Rate Item", "quantity": 5, "rate": 0},
+        {"name": "Valid Item", "quantity": 2, "rate": 50.0}]}
+    items = to_line_items(bill)
+    assert len(items) == 1
+    assert items[0]["description"] == "Valid Item"
+
+
+def test_a_missing_item_total_is_computed_not_left_blank():
+    bill = {**BILL, "line_items": [
+        {"name": "Widget", "quantity": 3, "rate": 100.0}]}
+    items = to_line_items(bill)
+    assert items[0]["line_total_paise"] == 300_00
 
 
 def test_a_gstin_on_the_vendor_is_used_when_the_bill_has_none():

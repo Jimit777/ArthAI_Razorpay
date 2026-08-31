@@ -641,6 +641,8 @@ CREATE TABLE IF NOT EXISTS gst_qrmp_findings (                -- layer 4, per qu
   iff_used_month1     INTEGER,
   iff_used_month2     INTEGER,
   reasoning           TEXT,
+  quarterly_gstr3b    TEXT,           -- JSON: month-3 aggregation, see
+                                       -- engine.gst_filing.qrmp.build_quarterly_gstr3b
   created_at          INTEGER
 );
 
@@ -654,11 +656,169 @@ CREATE TABLE IF NOT EXISTS business_qrmp_settings (
   iff_materiality_paise  INTEGER NOT NULL
 );
 
+-- What the real GSTR-1/e-invoice exports need and this system never had
+-- anywhere else: the business's own GSTIN and registered address. Merchant-
+-- entered, same shape as business_hsn_rate_card - no real API for a
+-- business's own registration details exists anywhere in this codebase.
+CREATE TABLE IF NOT EXISTS business_gst_profile (
+  business_id     TEXT PRIMARY KEY,
+  gstin           TEXT,
+  legal_name      TEXT,
+  trade_name      TEXT,
+  address_line1   TEXT,
+  location        TEXT,
+  pincode         TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sale_invoices_biz ON live_sale_invoices(business_id);
 CREATE INDEX IF NOT EXISTS idx_gstr1_runs_biz ON business_gstr1_runs(business_id);
 CREATE INDEX IF NOT EXISTS idx_gst_correction_findings_run ON gst_correction_findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_gst_offset_findings_run ON gst_offset_findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_gst_qrmp_findings_run ON gst_qrmp_findings(run_id);
+
+-- --- the vendor invoice auditor -----------------------------------------
+--
+-- The purchase-side commercial fields live_purchases never carried, because
+-- ITC reconciliation only ever needed the GST columns. A child table rather
+-- than widening live_purchases: a purchase imported for ITC alone (no line
+-- items known) stays a valid row with nothing here referencing it, and a
+-- CSV/Zoho pull that DOES carry line items adds rows here without touching
+-- the ITC path at all.
+CREATE TABLE IF NOT EXISTS live_purchase_line_items (
+  line_item_id      TEXT PRIMARY KEY,
+  purchase_id       TEXT NOT NULL,
+  business_id       TEXT NOT NULL,
+  supplier_name     TEXT,
+  supplier_gstin    TEXT,
+  invoice_number    TEXT,
+  invoice_date      TEXT,
+  description       TEXT,
+  item_key          TEXT,             -- normalise_item_key() of description;
+                                       -- the rate-card join key
+  quantity_x100     INTEGER,          -- integer hundredths, not a float
+  unit_price_paise  INTEGER,
+  line_total_paise  INTEGER,
+  recorded_at       INTEGER,
+  reconciled_run    TEXT
+);
+
+-- The merchant's own negotiated price per item per supplier. No real API
+-- for this exists anywhere (the same honest gap business_hsn_rate_card and
+-- business_gst_profile document above) - merchant-entered, one row per
+-- (supplier, item) pair.
+CREATE TABLE IF NOT EXISTS business_vendor_rate_card (
+  business_id                   TEXT,
+  supplier_gstin                TEXT,
+  item_key                      TEXT,
+  description                   TEXT,
+  contracted_unit_price_paise   INTEGER,
+  source                        TEXT,
+  PRIMARY KEY (business_id, supplier_gstin, item_key)
+);
+
+CREATE TABLE IF NOT EXISTS business_vendor_terms_runs (
+  run_id       TEXT PRIMARY KEY,
+  business_id  TEXT NOT NULL,
+  n_items      INTEGER,
+  source       TEXT DEFAULT 'demo',
+  created_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS vendor_terms_findings (
+  id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id                        TEXT,
+  business_id                   TEXT NOT NULL,
+  line_item_id                  TEXT,
+  purchase_id                   TEXT,
+  supplier_name                 TEXT,
+  supplier_gstin                TEXT,
+  invoice_number                TEXT,
+  invoice_date                  TEXT,
+  description                   TEXT,
+  quantity_x100                 INTEGER,
+  unit_price_paise              INTEGER,
+  contracted_unit_price_paise   INTEGER,
+  money_at_stake_paise          INTEGER,
+  code                          TEXT,
+  action                        TEXT,
+  confidence                    REAL,
+  reasoning                     TEXT,
+  decided_by                    TEXT,
+  queued_for_human              INTEGER,
+  credit_note_text              TEXT,
+  created_at                    INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_purchase_line_items_biz
+  ON live_purchase_line_items(business_id);
+CREATE INDEX IF NOT EXISTS idx_vendor_terms_findings_run
+  ON vendor_terms_findings(run_id);
+
+-- --- the chargeback defence assembler -----------------------------------
+--
+-- The dispute notice itself is real and pullable (Razorpay's own
+-- GET /v1/disputes) - the evidence behind it is not, anywhere. Evidence
+-- stays a separate child table, text only in v1 (no Documents API wiring
+-- yet - see agent/chargeback_documents.py's own docstring for why a file
+-- blob would be an unscoped abstraction right now).
+CREATE TABLE IF NOT EXISTS live_disputes (
+  dispute_id         TEXT PRIMARY KEY,   -- disp_... from Razorpay, or a local id
+  business_id        TEXT NOT NULL,
+  payment_id         TEXT,
+  amount_paise       INTEGER,
+  reason_code        TEXT,
+  reason_description TEXT,
+  phase              TEXT,
+  status             TEXT,
+  respond_by         INTEGER,            -- unix ts, the real deadline
+  source             TEXT,               -- 'demo' | 'manual' | 'razorpay'
+  recorded_at        INTEGER,
+  reconciled_run     TEXT
+);
+
+-- What the merchant actually has, one row per (dispute, evidence type).
+-- evidence_type matches the real Contest API's own field names exactly -
+-- see engine/chargeback/rules.py's own docstring on why.
+CREATE TABLE IF NOT EXISTS dispute_evidence_items (
+  dispute_id     TEXT NOT NULL,
+  business_id    TEXT NOT NULL,
+  evidence_type  TEXT NOT NULL,
+  detail         TEXT,
+  recorded_at    INTEGER,
+  PRIMARY KEY (business_id, dispute_id, evidence_type)
+);
+
+CREATE TABLE IF NOT EXISTS business_chargeback_runs (
+  run_id       TEXT PRIMARY KEY,
+  business_id  TEXT NOT NULL,
+  n_disputes   INTEGER,
+  source       TEXT DEFAULT 'demo',
+  created_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS chargeback_findings (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id              TEXT,
+  business_id         TEXT NOT NULL,
+  dispute_id          TEXT,
+  reason_code         TEXT,
+  amount_paise        INTEGER,
+  respond_by          INTEGER,
+  code                TEXT,
+  action              TEXT,
+  confidence          REAL,
+  reasoning           TEXT,
+  decided_by          TEXT,
+  queued_for_human    INTEGER,
+  evidence_pack_json  TEXT,       -- {"summary": "...", "explanation_letter": "..."}
+  created_at          INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_disputes_biz ON live_disputes(business_id);
+CREATE INDEX IF NOT EXISTS idx_dispute_evidence_biz
+  ON dispute_evidence_items(business_id, dispute_id);
+CREATE INDEX IF NOT EXISTS idx_chargeback_findings_run
+  ON chargeback_findings(run_id);
 """
 
 
@@ -688,6 +848,10 @@ class Ledger:
         # exactly the leak this platform's scoping exists to prevent.
         _add_column(self.store.conn, "resolution_memory",
                     "business_id", "TEXT DEFAULT ''")
+        # gst_qrmp_findings predates the month-3 quarterly aggregation -
+        # same trap as above, caught a third time now.
+        _add_column(self.store.conn, "gst_qrmp_findings",
+                    "quarterly_gstr3b", "TEXT")
         self.store.conn.commit()
         from merchant.businesses import Businesses
 
@@ -1099,6 +1263,51 @@ class Ledger:
         self.conn.commit()
         return len(invoices), truth
 
+    def import_razorpay_invoices(self, raw_items: list) -> dict:
+        """
+        Real outward invoices, pulled from Razorpay - alongside
+        seed_gst_filing_demo(), never instead of it. Does NOT touch the HSN
+        rate card the way the demo seeder does: a real business's rate card
+        is its own configured contract, not something to overwrite with
+        demo rates. Returns {"imported": n, "skipped": [(id, reason), ...]}
+        - see engine.gst_filing.razorpay_import for what gets skipped and
+        why.
+        """
+        import time
+
+        from engine.gst_filing.razorpay_import import from_razorpay_batch
+
+        invoices, skipped = from_razorpay_batch(raw_items)
+        business_id = self._scoped()
+        now = int(time.time())
+
+        # OR REPLACE: re-syncing the same invoice from Razorpay (an edit, or
+        # just running sync again) should refresh the row, not collide with
+        # it - same reasoning as the demo seeder's own OR REPLACE.
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO live_sale_invoices (invoice_id,"
+            " business_id, invoice_number, invoice_date, buyer_name,"
+            " buyer_gstin, place_of_supply, hsn_code, taxable_value, irn,"
+            " period, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(inv.invoice_id, business_id, inv.invoice_number,
+              str(inv.invoice_date), inv.buyer_name, inv.buyer_gstin or "",
+              inv.place_of_supply, inv.hsn_code, inv.taxable_value,
+              inv.irn or "", str(inv.invoice_date)[:7], now)
+             for inv in invoices])
+        self.conn.commit()
+        return {"imported": len(invoices), "skipped": skipped}
+
+    def unfiled_razorpay_invoice_count(self) -> int:
+        """Real, unfiled invoices pulled from Razorpay - never counts a
+        Demo Mode row. The two never collide on invoice_id (Razorpay's own
+        ids start "inv_"; the demo generator's start "INV-"), so the split
+        is exact, not a guess."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) n FROM live_sale_invoices WHERE business_id = ?"
+            " AND filed_run IS NULL AND invoice_id LIKE 'inv\\_%' ESCAPE '\\'",
+            (self._scoped(),)).fetchone()
+        return row["n"] if row else 0
+
     def unfiled_sale_invoices(self) -> list:
         return self.conn.execute(
             "SELECT * FROM live_sale_invoices WHERE business_id = ?"
@@ -1388,21 +1597,54 @@ class Ledger:
             (self._scoped(), paise))
         self.conn.commit()
 
-    def record_qrmp_finding(self, run_id: str, finding) -> None:
-        """`finding` is an engine.gst_filing.qrmp.QRMPFinding."""
+    def set_gst_profile(self, *, gstin: str = "", legal_name: str = "",
+                        trade_name: str = "", address_line1: str = "",
+                        location: str = "", pincode: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO business_gst_profile (business_id, gstin,"
+            " legal_name, trade_name, address_line1, location, pincode)"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT (business_id) DO UPDATE SET"
+            " gstin = excluded.gstin, legal_name = excluded.legal_name,"
+            " trade_name = excluded.trade_name,"
+            " address_line1 = excluded.address_line1,"
+            " location = excluded.location, pincode = excluded.pincode",
+            (self._scoped(), gstin, legal_name, trade_name, address_line1,
+             location, pincode))
+        self.conn.commit()
+
+    def gst_profile(self) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM business_gst_profile WHERE business_id = ?",
+            (self._scoped(),)).fetchone()
+        if not row:
+            return {"gstin": "", "legal_name": "", "trade_name": "",
+                   "address_line1": "", "location": "", "pincode": ""}
+        return {k: (row[k] or "") for k in
+               ("gstin", "legal_name", "trade_name", "address_line1",
+                "location", "pincode")}
+
+    def record_qrmp_finding(self, run_id: str, finding,
+                            quarterly_gstr3b: Optional[dict] = None) -> None:
+        """`finding` is an engine.gst_filing.qrmp.QRMPFinding.
+        `quarterly_gstr3b` is build_quarterly_gstr3b()'s own dict, only
+        present when the quarter was eligible."""
+        import json
         import time
 
         self.conn.execute(
             "INSERT INTO gst_qrmp_findings (run_id, business_id, quarter,"
             " turnover_paise, eligible, method, fixed_sum_paise,"
             " self_assessed_paise, month1_pmt06, month2_pmt06,"
-            " iff_used_month1, iff_used_month2, reasoning, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " iff_used_month1, iff_used_month2, reasoning, quarterly_gstr3b,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (run_id, self._scoped(), finding.quarter, finding.turnover_paise,
              int(finding.is_eligible), finding.method, finding.fixed_sum_paise,
              finding.self_assessed_paise, finding.month1_pmt06,
              finding.month2_pmt06, finding.iff_used_month1,
-             finding.iff_used_month2, finding.reasoning, int(time.time())))
+             finding.iff_used_month2, finding.reasoning,
+             json.dumps(quarterly_gstr3b) if quarterly_gstr3b else None,
+             int(time.time())))
         self.conn.commit()
 
     def qrmp_finding_for_run(self, run_id: str):
@@ -2225,6 +2467,430 @@ class Ledger:
             "SELECT * FROM live_purchases WHERE business_id = ?"
             " AND reconciled_run = ? ORDER BY recorded_at",
             (self._scoped(), run_id)).fetchall()
+
+    # --- vendor invoice auditor --------------------------------------------
+
+    def set_vendor_rate(self, supplier_gstin: str, description: str,
+                        contracted_unit_price_paise: int, source: str = ""
+                        ) -> None:
+        from engine.vendor_terms.rules import normalise_item_key
+
+        self.conn.execute(
+            "INSERT INTO business_vendor_rate_card (business_id,"
+            " supplier_gstin, item_key, description,"
+            " contracted_unit_price_paise, source) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT (business_id, supplier_gstin, item_key) DO UPDATE"
+            " SET description = excluded.description,"
+            " contracted_unit_price_paise = excluded.contracted_unit_price_paise,"
+            " source = excluded.source",
+            (self._scoped(), supplier_gstin.strip().upper(),
+             normalise_item_key(description), description.strip(),
+             contracted_unit_price_paise, source))
+        self.conn.commit()
+
+    def vendor_rate_card(self) -> dict:
+        """(supplier_gstin, item_key) -> contracted price, the shape
+        engine.vendor_terms.detector wants."""
+        rows = self.conn.execute(
+            "SELECT * FROM business_vendor_rate_card WHERE business_id = ?",
+            (self._scoped(),)).fetchall()
+        return {(r["supplier_gstin"], r["item_key"]):
+               r["contracted_unit_price_paise"] for r in rows}
+
+    def vendor_rate_rows(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM business_vendor_rate_card WHERE business_id = ?"
+            " ORDER BY supplier_gstin, description", (self._scoped(),)).fetchall()
+
+    def seed_vendor_terms_demo(self, n: int = 40, seed: Optional[int] = None
+                               ) -> tuple[int, dict]:
+        """Plant a demo line-item batch and its matching rate card, in one
+        call - same trick every other demo seeder in this codebase uses."""
+        import time
+
+        from engine.vendor_terms.generator import generate_line_items
+
+        business_id = self._scoped()
+        kwargs = {"n": n}
+        if seed is not None:
+            kwargs["seed"] = seed
+        items, truth, rate_card = generate_line_items(**kwargs)
+        now = int(time.time())
+
+        # OR REPLACE, not a plain INSERT: the demo batch is built from a
+        # fixed default seed, so running Demo Mode a second time for the
+        # same business regenerates the same line_item_ids - a fresh,
+        # unreconciled row each time is what "run it again" should mean,
+        # not a UNIQUE-constraint crash. Same fix seed_gst_filing_demo
+        # already applies for the identical reason.
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO live_purchase_line_items (line_item_id,"
+            " purchase_id, business_id, supplier_name, supplier_gstin,"
+            " invoice_number, invoice_date, description, item_key,"
+            " quantity_x100, unit_price_paise, line_total_paise, recorded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(i.line_item_id, i.purchase_id, business_id, i.supplier_name,
+              i.supplier_gstin, i.invoice_number, str(i.invoice_date),
+              i.description, i.item_key, i.quantity_x100, i.unit_price_paise,
+              i.line_total_paise, now) for i in items])
+        # A human-readable description per item_key, read off the billed
+        # items themselves rather than the normalised key - "cement opc 53
+        # grade bag" is a valid join key but not something a merchant wants
+        # to read on their own rate card.
+        descriptions = {i.item_key: i.description for i in items}
+        self.conn.executemany(
+            "INSERT INTO business_vendor_rate_card (business_id,"
+            " supplier_gstin, item_key, description,"
+            " contracted_unit_price_paise, source) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT (business_id, supplier_gstin, item_key) DO NOTHING",
+            [(business_id, gstin, item_key,
+              descriptions.get(item_key, item_key), price, "demo contract")
+             for (gstin, item_key), price in rate_card.items()])
+        self.conn.commit()
+        return len(items), truth
+
+    def import_purchase_line_items(self, purchase_id: str, *,
+                                   supplier_name: str, supplier_gstin: str,
+                                   invoice_number: str, invoice_date: str,
+                                   items: list[dict]) -> int:
+        """
+        Record real line items pulled from a CSV/Excel upload or Zoho -
+        `items` is a list of {description, quantity_x100, unit_price_paise,
+        line_total_paise}, already parsed. Used by merchant/purchase_import.py
+        and merchant/zoho.py; this method only ever writes what it is handed,
+        never invents a quantity or price.
+        """
+        import time
+
+        from engine.vendor_terms.rules import normalise_item_key
+
+        business_id = self._scoped()
+        now = int(time.time())
+        rows = [(f"li_{secrets.token_hex(6)}", purchase_id, business_id,
+                 supplier_name, supplier_gstin.strip().upper(), invoice_number,
+                 invoice_date, item["description"],
+                 normalise_item_key(item["description"]),
+                 item["quantity_x100"], item["unit_price_paise"],
+                 item["line_total_paise"], now) for item in items]
+        self.conn.executemany(
+            "INSERT INTO live_purchase_line_items (line_item_id, purchase_id,"
+            " business_id, supplier_name, supplier_gstin, invoice_number,"
+            " invoice_date, description, item_key, quantity_x100,"
+            " unit_price_paise, line_total_paise, recorded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def unreconciled_line_items(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_purchase_line_items WHERE business_id = ?"
+            " AND reconciled_run IS NULL ORDER BY recorded_at",
+            (self._scoped(),)).fetchall()
+
+    def line_items(self, limit: int = 1_000) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_purchase_line_items WHERE business_id = ?"
+            " ORDER BY recorded_at DESC LIMIT ?",
+            (self._scoped(), limit)).fetchall()
+
+    def build_vendor_terms_batch(self, only_unreconciled: bool = True):
+        """Assemble real line items into the shape engine.vendor_terms
+        already takes, so nothing in engine/vendor_terms had to change to
+        run on live data rather than a generated batch."""
+        from engine.vendor_terms.detector import LineItem
+
+        rows = (self.unreconciled_line_items() if only_unreconciled
+               else self.line_items())
+        if not rows:
+            return None
+
+        def as_date(text):
+            return date.fromisoformat(text) if text else date.today()
+
+        return [LineItem(
+            line_item_id=r["line_item_id"], purchase_id=r["purchase_id"],
+            supplier_name=r["supplier_name"] or "", supplier_gstin=(
+                r["supplier_gstin"] or "").strip().upper(),
+            invoice_number=r["invoice_number"] or "",
+            invoice_date=as_date(r["invoice_date"]),
+            description=r["description"] or "", item_key=r["item_key"] or "",
+            quantity_x100=r["quantity_x100"], unit_price_paise=r["unit_price_paise"],
+            line_total_paise=r["line_total_paise"]) for r in rows]
+
+    def commit_vendor_terms_run(self, items, source: str = "demo") -> str:
+        import time
+
+        run_id = f"vt_{secrets.token_hex(6)}"
+        business_id = self._scoped()
+        self.conn.execute(
+            "INSERT INTO business_vendor_terms_runs (run_id, business_id,"
+            " n_items, source, created_at) VALUES (?,?,?,?,?)",
+            (run_id, business_id, len(items), source, int(time.time())))
+        self.conn.executemany(
+            "UPDATE live_purchase_line_items SET reconciled_run = ?"
+            " WHERE line_item_id = ?",
+            [(run_id, i.line_item_id) for i in items])
+        self.conn.commit()
+        return run_id
+
+    def record_vendor_terms_findings(self, run_id: str, classified,
+                                     decisions, credit_notes=None) -> None:
+        import time
+
+        credit_notes = credit_notes or {}
+        decision_by_supplier = {d.supplier_gstin: d for d in decisions}
+        now = int(time.time())
+        rows = []
+        for item in classified:
+            decision = decision_by_supplier.get(item.supplier_gstin)
+            action = decision.action if decision else item.action
+            confidence = decision.confidence if decision else 1.0
+            decided_by = decision.decided_by if decision else "calculator"
+            queued = bool(decision.queued_for_human) if decision else False
+            rows.append((
+                run_id, self._scoped(), item.line_item_id, item.purchase_id,
+                item.supplier_name, item.supplier_gstin, item.invoice_number,
+                str(item.invoice_date), item.description, item.quantity_x100,
+                item.unit_price_paise, item.contracted_unit_price_paise,
+                item.money_at_stake_paise, item.code, action, confidence,
+                item.reasoning, decided_by, int(queued),
+                credit_notes.get(item.supplier_gstin), now))
+        self.conn.executemany(
+            "INSERT INTO vendor_terms_findings (run_id, business_id,"
+            " line_item_id, purchase_id, supplier_name, supplier_gstin,"
+            " invoice_number, invoice_date, description, quantity_x100,"
+            " unit_price_paise, contracted_unit_price_paise,"
+            " money_at_stake_paise, code, action, confidence, reasoning,"
+            " decided_by, queued_for_human, credit_note_text, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def vendor_terms_findings(self, run_id: str, needing_action: bool = False
+                              ) -> list:
+        sql = ("SELECT * FROM vendor_terms_findings"
+              " WHERE business_id = ? AND run_id = ?")
+        params = [self._scoped(), run_id]
+        if needing_action:
+            sql += " AND action != 'none'"
+        return self.conn.execute(
+            sql + " ORDER BY money_at_stake_paise DESC", params).fetchall()
+
+    def latest_vendor_terms_run(self):
+        return self.conn.execute(
+            "SELECT * FROM business_vendor_terms_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
+
+    # --- chargeback defence assembler --------------------------------------
+
+    def record_evidence_item(self, dispute_id: str, evidence_type: str,
+                             detail: str) -> None:
+        import time
+
+        self.conn.execute(
+            "INSERT INTO dispute_evidence_items (dispute_id, business_id,"
+            " evidence_type, detail, recorded_at) VALUES (?,?,?,?,?)"
+            " ON CONFLICT (business_id, dispute_id, evidence_type) DO UPDATE"
+            " SET detail = excluded.detail, recorded_at = excluded.recorded_at",
+            (dispute_id, self._scoped(), evidence_type, detail.strip(),
+             int(time.time())))
+        self.conn.commit()
+
+    def dispute_evidence(self, dispute_id: str) -> list:
+        return self.conn.execute(
+            "SELECT * FROM dispute_evidence_items WHERE business_id = ?"
+            " AND dispute_id = ? ORDER BY evidence_type",
+            (self._scoped(), dispute_id)).fetchall()
+
+    def evidence_by_dispute(self, dispute_ids: list[str]) -> dict[str, set]:
+        """dispute_id -> the set of evidence_type keys on file - the shape
+        engine.chargeback.detector.detect_batch() wants."""
+        if not dispute_ids:
+            return {}
+        placeholders = ",".join("?" * len(dispute_ids))
+        rows = self.conn.execute(
+            f"SELECT dispute_id, evidence_type FROM dispute_evidence_items"
+            f" WHERE business_id = ? AND dispute_id IN ({placeholders})",
+            (self._scoped(), *dispute_ids)).fetchall()
+        out: dict[str, set] = {did: set() for did in dispute_ids}
+        for r in rows:
+            out[r["dispute_id"]].add(r["evidence_type"])
+        return out
+
+    def seed_chargeback_demo(self, n: int = 30, seed: Optional[int] = None
+                             ) -> tuple[int, dict]:
+        """Plant a demo dispute batch and its matching evidence, in one
+        call - same trick every other demo seeder in this codebase uses."""
+        import time
+
+        from engine.chargeback.generator import generate_disputes
+
+        business_id = self._scoped()
+        kwargs = {"n": n}
+        if seed is not None:
+            kwargs["seed"] = seed
+        disputes, evidence_by_dispute, truth = generate_disputes(**kwargs)
+        now = int(time.time())
+
+        # OR REPLACE, not a plain INSERT: the demo batch is built from a
+        # fixed default seed, so running Demo Mode a second time for the
+        # same business regenerates the same dispute_ids - a fresh,
+        # unreconciled row each time is what "run it again" should mean,
+        # not a UNIQUE-constraint crash. Same fix seed_vendor_terms_demo
+        # and seed_gst_filing_demo already apply for the identical reason.
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO live_disputes (dispute_id, business_id,"
+            " payment_id, amount_paise, reason_code, reason_description,"
+            " phase, status, respond_by, source, recorded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [(d.dispute_id, business_id, d.payment_id, d.amount_paise,
+              d.reason_code, d.reason_description, d.phase, d.status,
+              d.respond_by, "demo", now) for d in disputes])
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO dispute_evidence_items (dispute_id,"
+            " business_id, evidence_type, detail, recorded_at)"
+            " VALUES (?,?,?,?,?)",
+            [(did, business_id, etype, "planted demo evidence", now)
+             for did, types in evidence_by_dispute.items() for etype in types])
+        self.conn.commit()
+        return len(disputes), truth
+
+    def record_manual_dispute(self, *, payment_id: str, amount_paise: int,
+                              reason_code: str, respond_by: int,
+                              reason_description: str = "") -> str:
+        """A dispute the merchant typed in themselves - the Without API
+        path, since there's no register concept for a chargeback notice
+        the way there is for a purchase invoice."""
+        import time
+
+        dispute_id = f"disp_manual_{secrets.token_hex(6)}"
+        self.conn.execute(
+            "INSERT INTO live_disputes (dispute_id, business_id, payment_id,"
+            " amount_paise, reason_code, reason_description, phase, status,"
+            " respond_by, source, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (dispute_id, self._scoped(), payment_id, amount_paise,
+             reason_code.strip(), reason_description.strip(), "chargeback",
+             "open", respond_by, "manual", int(time.time())))
+        self.conn.commit()
+        return dispute_id
+
+    def import_razorpay_disputes(self, raw_items: list) -> dict:
+        """Real disputes, pulled from Razorpay - alongside
+        seed_chargeback_demo(), never instead of it. Returns
+        {"imported": n, "skipped": [(id, reason), ...]}."""
+        import time
+
+        from engine.chargeback.razorpay_import import from_razorpay_batch
+
+        disputes, skipped = from_razorpay_batch(raw_items)
+        business_id = self._scoped()
+        now = int(time.time())
+
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO live_disputes (dispute_id, business_id,"
+            " payment_id, amount_paise, reason_code, reason_description,"
+            " phase, status, respond_by, source, recorded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [(d.dispute_id, business_id, d.payment_id, d.amount_paise,
+              d.reason_code, d.reason_description, d.phase, d.status,
+              d.respond_by, "razorpay", now) for d in disputes])
+        self.conn.commit()
+        return {"imported": len(disputes), "skipped": skipped}
+
+    def unreconciled_disputes(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_disputes WHERE business_id = ?"
+            " AND reconciled_run IS NULL ORDER BY respond_by",
+            (self._scoped(),)).fetchall()
+
+    def disputes(self, limit: int = 1_000) -> list:
+        return self.conn.execute(
+            "SELECT * FROM live_disputes WHERE business_id = ?"
+            " ORDER BY recorded_at DESC LIMIT ?",
+            (self._scoped(), limit)).fetchall()
+
+    def build_chargeback_batch(self, only_unreconciled: bool = True):
+        """Assemble real disputes into the shape engine.chargeback already
+        takes, so nothing in engine/chargeback had to change to run on live
+        data rather than a generated batch. Returns
+        (disputes, evidence_by_dispute) or None if there is nothing to check."""
+        from engine.chargeback.detector import Dispute
+
+        rows = (self.unreconciled_disputes() if only_unreconciled
+               else self.disputes())
+        if not rows:
+            return None
+
+        disputes = [Dispute(
+            dispute_id=r["dispute_id"], payment_id=r["payment_id"] or "",
+            amount_paise=r["amount_paise"], reason_code=r["reason_code"] or "",
+            reason_description=r["reason_description"] or "",
+            phase=r["phase"] or "", status=r["status"] or "",
+            respond_by=r["respond_by"]) for r in rows]
+        evidence = self.evidence_by_dispute([d.dispute_id for d in disputes])
+        return disputes, evidence
+
+    def commit_chargeback_run(self, disputes, source: str = "demo") -> str:
+        import time
+
+        run_id = f"cb_{secrets.token_hex(6)}"
+        business_id = self._scoped()
+        self.conn.execute(
+            "INSERT INTO business_chargeback_runs (run_id, business_id,"
+            " n_disputes, source, created_at) VALUES (?,?,?,?,?)",
+            (run_id, business_id, len(disputes), source, int(time.time())))
+        self.conn.executemany(
+            "UPDATE live_disputes SET reconciled_run = ? WHERE dispute_id = ?",
+            [(run_id, d.dispute_id) for d in disputes])
+        self.conn.commit()
+        return run_id
+
+    def record_chargeback_findings(self, run_id: str, classified, decisions,
+                                   evidence_packs=None) -> None:
+        import json
+        import time
+
+        evidence_packs = evidence_packs or {}
+        decision_by_id = {d.dispute_id: d for d in decisions}
+        now = int(time.time())
+        rows = []
+        for d in classified:
+            decision = decision_by_id.get(d.dispute_id)
+            action = decision.action if decision else d.action
+            confidence = decision.confidence if decision else 1.0
+            decided_by = decision.decided_by if decision else "calculator"
+            queued = bool(decision.queued_for_human) if decision else False
+            reasoning = (decision.case_reasoning if decision and
+                        decision.case_reasoning else d.reasoning)
+            pack = evidence_packs.get(d.dispute_id)
+            rows.append((
+                run_id, self._scoped(), d.dispute_id, d.reason_code,
+                d.amount_paise, d.respond_by, d.code, action, confidence,
+                reasoning, decided_by, int(queued),
+                json.dumps(pack) if pack else None, now))
+        self.conn.executemany(
+            "INSERT INTO chargeback_findings (run_id, business_id,"
+            " dispute_id, reason_code, amount_paise, respond_by, code,"
+            " action, confidence, reasoning, decided_by, queued_for_human,"
+            " evidence_pack_json, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def chargeback_findings(self, run_id: str, needing_action: bool = False
+                            ) -> list:
+        sql = ("SELECT * FROM chargeback_findings"
+              " WHERE business_id = ? AND run_id = ?")
+        params = [self._scoped(), run_id]
+        if needing_action:
+            sql += " AND action != 'none'"
+        return self.conn.execute(
+            sql + " ORDER BY respond_by ASC", params).fetchall()
+
+    def latest_chargeback_run(self):
+        return self.conn.execute(
+            "SELECT * FROM business_chargeback_runs WHERE business_id = ?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (self._scoped(),)).fetchone()
 
     # --- the journey ------------------------------------------------------
 

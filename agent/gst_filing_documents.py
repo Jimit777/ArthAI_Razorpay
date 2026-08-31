@@ -14,13 +14,18 @@ truthful: the facts and the citations are the useful part of a document with
 a clock on it, and a merchant answering a DRC-01B needs the numbers far more
 than a well-turned sentence.
 
-## Only Rule 88C, s.50 and s.73/74 are cited
+## What is cited, and why it stops where it stops
 
-No circular number is invented for this rule set - unlike
-agent/vendor_documents.py's Circular 183/193 (a real, findable circular for
-that specific mismatch), no comparable circular was found or previously
-cited anywhere in this codebase for a Rule 88C response. Citing an invented
-circular would be a worse failure than citing none - CLAUDE.md section 16.
+No CBIC *circular* specifically interpreting Rule 88C/DRC-01B was found -
+unlike agent/vendor_documents.py's Circular 183/193, a real, findable
+circular for that different mismatch. What was found and is cited instead:
+CBIC Instruction No. 01/2022-GST (7 January 2022) - "Guidelines for
+recovery proceedings under section 79" - which predates Rule 88C itself
+(inserted December 2022) but establishes the exact underlying principle
+Rule 88C's DRC-01B process now runs automatically: a taxpayer must be
+given the chance to explain a GSTR-1/GSTR-3B difference before recovery
+action is taken. It is cited precisely as an Instruction, not relabelled
+as a circular - CLAUDE.md section 16: a wrong citation is worse than none.
 """
 
 from __future__ import annotations
@@ -36,6 +41,11 @@ DEFAULT_EFFORT = "medium"
 MAX_TOKENS = 1_200
 
 SOURCE_SECTION_73 = "CGST Act s.73 - determination absent fraud or wilful misstatement"
+SOURCE_INSTRUCTION_01_2022 = (
+    "CBIC Instruction No. 01/2022-GST dated 7 January 2022 - guidelines for "
+    "recovery proceedings under s.79, establishing that a registered person "
+    "must be given the opportunity to explain a GSTR-1/GSTR-3B difference "
+    "before recovery action is initiated")
 
 
 @dataclass
@@ -81,7 +91,8 @@ We refer to the intimation issued in Form GST DRC-01B and submit as follows.
    not under Section 74.
 
 4. We rely on {finding.rule_cited}, and on {rules.SOURCE_INTEREST_NORMAL}
-   for the interest computed on the amount now being paid voluntarily.
+   for the interest computed on the amount now being paid voluntarily. We
+   further rely on {SOURCE_INSTRUCTION_01_2022}.
 
 5. We accordingly request that the difference of
    {rules.rupees(finding.breach_amount)} over the Rule 88C threshold be

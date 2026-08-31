@@ -55,3 +55,12 @@ def test_a_supplied_case_is_used_verbatim_and_marks_written_by_agent(breach):
     doc = drc01b_response(breach, case="A short paragraph the model wrote.")
     assert doc.written_by == "agent"
     assert "A short paragraph the model wrote." in doc.body
+
+
+def test_the_real_instruction_is_cited_precisely_as_an_instruction(breach):
+    """CBIC Instruction No. 01/2022-GST, found this session, is the real
+    authority behind "explain before recovery" - cited by its real name,
+    never relabelled as a circular."""
+    doc = drc01b_response(breach)
+    assert "Instruction No. 01/2022-GST" in doc.body
+    assert "7 January 2022" in doc.body

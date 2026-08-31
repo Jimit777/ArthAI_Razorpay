@@ -231,19 +231,25 @@ def plant_qrmp_quarter(current_period: str, current_month_taxable_paise: int,
     compare against the fixed-sum safe harbour, so month 1 here is an
     ESTIMATE built from the one real month (85% of it, for a plausible
     month-to-month dip), never a second month of fabricated invoices.
-    Turnover is likewise a naive x12 annualisation of the one real month's
-    taxable value, clearly a demo stand-in - no real API for a business's
-    own annual turnover exists anywhere in this codebase (same honest-gap
-    shape as live_gst_ledger_balances).
+    Month 3 (returned as "month3_liability_paise", for
+    qrmp.build_quarterly_gstr3b - not consumed by build_qrmp_plan) is a
+    second, independent estimate (110% of the real month) for the same
+    reason. Turnover is likewise a naive x12 annualisation of the one real
+    month's taxable value, clearly a demo stand-in - no real API for a
+    business's own annual turnover exists anywhere in this codebase (same
+    honest-gap shape as live_gst_ledger_balances).
 
-    Returns the keyword arguments engine.gst_filing.qrmp.build_qrmp_plan()
-    takes, so the caller can inspect or override any of them before
-    building the plan.
+    Returns (kwargs, month3_liability_paise): `kwargs` are exactly what
+    engine.gst_filing.qrmp.build_qrmp_plan() takes (spread it with **,
+    nothing extra to pop off first); `month3_liability_paise` is a second,
+    independent estimate for qrmp.build_quarterly_gstr3b, which
+    build_qrmp_plan() itself never touches.
     """
     quarter, month_in_quarter = quarter_of(current_period)
     month1_estimate = (current_month_self_assessed_paise * 85) // 100
+    month3_estimate = (current_month_self_assessed_paise * 110) // 100
 
-    return {
+    kwargs = {
         "quarter": quarter,
         "turnover_paise": current_month_taxable_paise * 12,
         "previous_quarter_cash_paise": current_month_self_assessed_paise * 3,
@@ -253,3 +259,4 @@ def plant_qrmp_quarter(current_period: str, current_month_taxable_paise: int,
                                           # estimated month - see docstring
         "month2_iff_invoices": list(current_month_b2b_tax_paise),
     }
+    return kwargs, month3_estimate

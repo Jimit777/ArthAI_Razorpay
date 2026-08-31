@@ -106,6 +106,8 @@ class SyncResult:
     message: str
     settlements_found: int = 0
     payments_found: int = 0
+    invoices_found: int = 0
+    disputes_found: int = 0
     raw: list = field(default_factory=list)
 
 
@@ -173,9 +175,67 @@ class Razorpay:
                 f"Connected, but {month:02d}/{year} has no settlement lines. "
                 f"Razorpay test mode does not settle, so this is expected - "
                 f"the connector works, there is simply nothing behind it.",
-                0, 0, [])
+                0, 0, 0, 0, [])
         return SyncResult(True, f"Read {len(rows)} settlement lines.",
-                          len(settlements), len(payments), rows)
+                          len(settlements), len(payments), 0, 0, rows)
+
+    def invoices(self, count: int = 100) -> SyncResult:
+        """
+        Pull real outward invoices for the GST output-tax reconciler -
+        alongside settlements(), never replacing it; a different Razorpay
+        product (Invoices, not the settlement recon report) feeding a
+        different agent (gst_filing's layer 1, not settlement_audit).
+
+        GSTIN, HSN/SAC code and tax rate are real, documented fields on
+        this endpoint, but Razorpay's own API can only CREATE an invoice
+        without them - a person fills them in through the Dashboard. A
+        merchant who never has is not a connector failure; it is read the
+        same way engine.gst_filing.razorpay_import already reads it: never
+        guessed, always named to the merchant. See that module's docstring.
+        """
+        status, body = self.get(f"/invoices?count={min(count, 100)}")
+        if status != 200:
+            description = body.get("error", {}).get("description", str(status))
+            return SyncResult(False, f"Could not read invoices: {description}")
+
+        rows = body.get("items", [])
+        if not rows:
+            return SyncResult(
+                True,
+                f"Connected, but no invoices came back. Razorpay test mode "
+                f"has no real invoices unless some were created by hand "
+                f"through the test-mode Dashboard - this is expected, the "
+                f"connector works, there is simply nothing behind it.",
+                0, 0, 0, 0, [])
+        return SyncResult(True, f"Read {len(rows)} invoices.", 0, 0,
+                          len(rows), 0, rows)
+
+    def disputes(self, count: int = 100) -> SyncResult:
+        """
+        Pull real chargebacks for the chargeback defence assembler -
+        alongside settlements()/invoices(), a third Razorpay product (the
+        Disputes API), feeding a third agent. Unlike a rate card or a
+        vendor's contracted price, the dispute NOTICE itself - reason code,
+        amount, deadline - genuinely is real and fetchable here; it is only
+        the EVIDENCE behind it (delivery proof, a customer's chat log) that
+        no API anywhere supplies. See engine/chargeback/razorpay_import.py's
+        docstring for the exact field names this reads.
+        """
+        status, body = self.get(f"/disputes?count={min(count, 100)}")
+        if status != 200:
+            description = body.get("error", {}).get("description", str(status))
+            return SyncResult(False, f"Could not read disputes: {description}")
+
+        rows = body.get("items", [])
+        if not rows:
+            return SyncResult(
+                True,
+                f"Connected, but no disputes came back. Razorpay test mode "
+                f"does not generate real chargebacks - this is expected, "
+                f"the connector works, there is simply nothing behind it.",
+                0, 0, 0, 0, [])
+        return SyncResult(True, f"Read {len(rows)} disputes.", 0, 0, 0,
+                          len(rows), rows)
 
 
 class Sources:

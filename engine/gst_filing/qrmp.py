@@ -44,6 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from engine.gst_filing import rules
+from engine.gst_filing.offset import HeadAmounts
 from engine.gst_filing.taxonomy import QRMPMethod
 
 
@@ -109,6 +110,62 @@ class QRMPFinding:
             "iff_used_month2": self.iff_used_month2,
             "reasoning": self.reasoning,
         }
+
+
+def build_quarterly_gstr3b(quarter: str, *, month1_liability_paise: int,
+                           month2_liability: HeadAmounts,
+                           month3_liability_paise: int,
+                           prior_advances_paise: int, gstin: str,
+                           ret_period: str) -> dict:
+    """
+    Month 3 of the quarter: aggregates the 3 months' outward liability into
+    the real GSTR-3B JSON shape (sup_details.osup_det, cross-checked this
+    session against resilient-tech/india-compliance's own
+    gstr_3b_report_template.json - a real, production template file), then
+    nets the total against what was already deposited via PMT-06 in months
+    1 and 2 under QRMP.
+
+    Month 2 is layer 1's own real per-head (IGST/CGST/SGST) split. Months 1
+    and 3 are scalar estimates (see generator.plant_qrmp_quarter for why -
+    this demo only ever has one real month of classified invoices), so
+    their combined contribution is apportioned across IGST/CGST/SGST using
+    month 2's OWN real ratio, applied once to the 3-month total rather than
+    guessed separately for each estimated month - one layer of estimation,
+    not three.
+    """
+    month2_total = (month2_liability.igst + month2_liability.cgst
+                    + month2_liability.sgst)
+    grand_total = (month1_liability_paise + month2_total
+                   + month3_liability_paise)
+    estimated_total = month1_liability_paise + month3_liability_paise
+
+    if month2_total:
+        igst = (month2_liability.igst * grand_total) // month2_total
+        cgst = (month2_liability.cgst * grand_total) // month2_total
+        sgst = grand_total - igst - cgst
+    else:
+        igst, cgst, sgst = grand_total, 0, 0
+
+    balance_due = grand_total - prior_advances_paise
+
+    return {
+        "gstin": gstin, "ret_period": ret_period,
+        "sup_details": {
+            "osup_det": {"txval": 0, "iamt": igst, "camt": cgst,
+                        "samt": sgst, "csamt": 0},
+        },
+        "reconciliation": {
+            "quarter": quarter,
+            "month1_liability_paise": month1_liability_paise,
+            "month2_liability_paise": month2_total,
+            "month3_liability_paise": month3_liability_paise,
+            "estimated_of_3_months_paise": estimated_total,
+            "grand_total_liability_paise": grand_total,
+            "prior_pmt06_advances_paise": prior_advances_paise,
+            "balance_due_paise": max(0, balance_due),
+            "credit_carried_forward_paise": max(0, -balance_due),
+        },
+    }
 
 
 def build_qrmp_plan(quarter: str, turnover_paise: int,
