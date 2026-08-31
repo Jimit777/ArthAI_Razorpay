@@ -1,0 +1,71 @@
+# Deployment for Render (https://render.com).
+#
+# Why Render and not a serverless host: this app keeps two things that
+# serverless platforms take away. Its database is a single SQLite file, and
+# every agent run is a background thread reporting progress into an
+# in-process dict (app.py's RUNS / CASH_RUNS / RECON_RUNS) that the browser
+# polls. A serverless function loses the filesystem between requests, kills
+# background threads as soon as the response is sent, and cuts requests off
+# after a fixed timeout - which is precisely the "watch it classify 60
+# records" moment this product is demonstrated by. Render runs one ordinary
+# long-lived process, so none of that has to be rebuilt.
+
+services:
+  - type: web
+    name: ledgerline
+    runtime: python
+    plan: free                 # see the `disk` note below before a real demo
+    region: singapore          # closest to India; keeps the Anthropic hop short
+    buildCommand: pip install -r requirements.txt
+    # Render assigns the port and expects the app to bind it. Binding
+    # 0.0.0.0 rather than localhost is what makes it reachable at all.
+    startCommand: uvicorn merchant.app:app --host 0.0.0.0 --port $PORT
+    # A dedicated endpoint that opens the database, so a deploy that cannot
+    # reach its storage fails the check and rolls back instead of going live
+    # broken. /login is NOT usable here: it redirects to /signup while no
+    # account exists, so a fresh instance would look unhealthy.
+    healthCheckPath: /healthz
+    envVars:
+      # 3.13, not the 3.14 used locally: verified by running the full suite
+      # against 3.13 before pinning it here.
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+
+      # Where the SQLite file lives. On the free plan this path is on the
+      # instance's own temporary disk and its contents do NOT survive a
+      # restart, a redeploy, or the free plan's inactivity sleep. Attach the
+      # disk below (paid) if the data must persist between sessions.
+      - key: AUDITOR_DB
+        value: /var/data/merchant.db
+
+      # Set these in the Render dashboard, never here - this file is public.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LEDGERLINE_SECRET_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      # Must match an Authorised redirect URI on the Google OAuth client
+      # exactly, including https and the hostname Render assigns.
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+
+      # The session cookie is set without Secure (see merchant/app.py). Render
+      # terminates TLS in front of the app, so this tells the rate limiter to
+      # read the forwarded client address rather than the proxy's own.
+      - key: LEDGERLINE_BEHIND_PROXY
+        value: "1"
+
+    # A persistent disk keeps merchant.db across restarts and redeploys.
+    # Render does not offer disks on the free plan, so this stays commented
+    # out: uncomment it AND change `plan` above to `starter` together, or the
+    # deploy is rejected. Without it the app still runs perfectly - it simply
+    # starts empty each time it wakes, which is fine for a live demo that
+    # creates its own data and wrong for anything meant to persist.
+    #
+    # disk:
+    #   name: ledgerline-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

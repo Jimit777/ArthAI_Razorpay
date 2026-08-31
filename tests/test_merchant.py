@@ -1367,6 +1367,22 @@ def test_the_setup_tab_folded_into_the_tab_it_configures(client):
     assert "Connect a GST filing-status API" in page
 
 
+def test_the_health_check_answers_on_a_brand_new_instance(client):
+    """
+    The host restarts the service on a failing health check, so this must be
+    200 on an instance with an empty database and nobody signed up yet.
+    /login is not usable for this - it redirects to /signup while no account
+    exists, which would read as unhealthy.
+    """
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert client.get("/login", follow_redirects=False).status_code == 303, (
+        "if /login stops redirecting on an empty database, this test's "
+        "reason for existing has changed")
+
+
 def test_a_returning_user_with_no_cookie_still_lands_in_their_business(client):
     """
     Regression, and an expensive one. The current business lived only in a

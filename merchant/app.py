@@ -73,6 +73,13 @@ from merchant import nav, ui
 from merchant.ledger import Ledger
 
 DB = os.environ.get("AUDITOR_DB", str(Path(__file__).parent.parent / "merchant.db"))
+
+# AUDITOR_DB may point somewhere that does not exist yet - a mounted disk on
+# a host, or a directory the deploy created empty. SQLite will not create a
+# missing parent directory, and the failure surfaces as a bare "unable to
+# open database file" on the first request rather than at startup.
+Path(DB).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
 COOKIE = "business_id"
 
 app = FastAPI(title="Ledgerline")
@@ -316,6 +323,30 @@ def _resolve(business_id: Optional[str]) -> Optional[str]:
 
 
 # --- signing in ------------------------------------------------------------
+
+@app.get("/healthz")
+def healthz():
+    """
+    Is this instance actually able to serve? Used by the host's health
+    check (see render.yaml).
+
+    It touches the database rather than only returning 200, because the
+    interesting failure on a fresh deploy is a database path that cannot be
+    opened - an instance that answers but cannot read its own storage is
+    not healthy, and saying so here is what makes a bad deploy roll back
+    instead of going live broken.
+
+    Deliberately not pointed at /login: that redirects to /signup while no
+    account exists yet, so a brand-new instance would look unhealthy for
+    the wrong reason.
+    """
+    try:
+        with ledger() as led:
+            led.conn.execute("SELECT 1").fetchone()
+    except Exception as exc:  # noqa: BLE001 - any failure here means unhealthy
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+    return {"ok": True}
+
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: str = "", user: Optional[User] = Depends(maybe_user)):
