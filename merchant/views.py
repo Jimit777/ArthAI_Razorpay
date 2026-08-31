@@ -56,7 +56,12 @@ a { color:var(--brand-ink); text-decoration:none }
 """
 
 SHELL = """/* --- frame ------------------------------------------------------------ */
-.app { display:grid; grid-template-columns:216px 1fr; min-height:100vh }
+/* minmax(0,1fr), not a bare 1fr: a bare 1fr floors at the track's
+   min-content width, so main's 1120px cap plus the 216px rail forced a
+   1336px page and every narrower viewport - 1280 and 1366 laptops
+   included - scrolled sideways on every page. */
+.app { display:grid; grid-template-columns:216px minmax(0,1fr);
+  min-height:100vh }
 .rail { background:var(--surface); border-right:1px solid var(--line);
   display:flex; flex-direction:column; position:sticky; top:0; height:100vh }
 .rail .logo { display:flex; align-items:center; gap:8px; padding:14px 14px 10px;
@@ -586,6 +591,37 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
   </aside>"""
 
 
+def google_button(label: str = "Continue with Google") -> str:
+    """
+    Google's sign-in button, plus the "or" divider under it.
+
+    The mark is inlined as SVG rather than loaded from Google's CDN: this
+    page is served to a signed-out visitor, and a remote asset on it would
+    tell Google someone is looking at the login screen before they have
+    chosen to involve Google at all. It is also the only way the button
+    renders offline. The four brand colours are Google's own and are
+    deliberately literal hex values, not theme tokens - the mark is a
+    trademark and does not re-colour with our palette.
+    """
+    mark = (
+        '<svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">'
+        '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85'
+        'C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19'
+        'C12.43 13.72 17.74 9.5 24 9.5z"/>'
+        '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02'
+        'h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 '
+        '7.09-17.65z"/>'
+        '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-'
+        '3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 '
+        '10.78l7.97-6.19z"/>'
+        '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6'
+        'c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19'
+        'C6.51 42.62 14.62 48 24 48z"/></svg>')
+    return f"""
+    <a class="btn-google" href="/login/google">{mark}<span>{esc(label)}</span></a>
+    <div class="auth-or"><span>or</span></div>"""
+
+
 def auth_page(title: str, subtitle: str, body: str, footer: str = "") -> str:
     """The signed-out shell. No rail, no business - there is no context yet."""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -740,6 +776,389 @@ def checklist(steps) -> str:
         {button}
       </li>""")
     return f'<ul class="steps">{"".join(out)}</ul>'
+
+
+# --- the Home dashboard's hero row -----------------------------------------
+#
+# Pure CSS bars, the same "chart" language cash_curve() already established
+# for this codebase (hand-rolled, zero external dependencies) - just simpler,
+# since a four-stage drop-off needs no curve fitting.
+
+def dashboard_waterfall(summary: dict, ask_embed: str = "") -> str:
+    """
+    The hero card: gross sales through gateway deductions to what should
+    have landed, then what actually did - the product's own pitch, made
+    visible rather than only claimed. `ask_embed` is the settlement-scoped
+    ask box, rendered by the caller and slotted in at the bottom exactly
+    the way the reference design floats its command bar inside the chart
+    card, not a separate one below it.
+
+    Each bar is the RUNNING BALANCE at that stage, not the stage's own
+    amount. That matters: gateway fees and GST are ~1.7% of gross, so
+    drawing them as their own bars on a shared axis produced two invisible
+    slivers and a hole in the middle of the chart. Running balance gives
+    every stage a real bar, descends like a funnel, and - most importantly -
+    is honest: the gentle slope IS the finding. Almost everything got
+    through. The amount removed at each step is stated as a figure beneath
+    the bar rather than implied by a height nobody can see.
+    """
+    gross = summary.get("gross_paise", 0)
+    fee = summary.get("fee_paise", 0)
+    tax = summary.get("tax_paise", 0)
+
+    # (label, running balance after this stage, amount removed at this stage)
+    stages = (
+        ("Gross Sales", gross, 0),
+        ("After Gateway Fees", gross - fee, fee),
+        ("After GST on Fees", gross - fee - tax, tax),
+        ("Net Settled", summary.get("net_paise", 0), 0),
+    )
+    tallest = max((balance for _l, balance, _d in stages), default=0) or 1
+
+    bars = []
+    for i, (label, balance, removed) in enumerate(stages):
+        height_pct = max(2, round(abs(balance) / tallest * 100))
+        last = i == len(stages) - 1
+        tone = " net" if last else ""
+        # The two middle stages are the deductions; the reference ghosts
+        # its non-focal columns the same way, so the eye lands on the
+        # start and the end - which is the comparison that matters.
+        if 0 < i < len(stages) - 1:
+            tone += " ghost"
+        delta = (f'<div class="bar-delta">− {esc(rupees(removed))}</div>'
+                 if removed else '<div class="bar-delta"></div>')
+        bars.append(f"""
+      <div class="waterfall-bar{tone}">
+        <div class="bar-val">{esc(rupees(balance))}</div>
+        <div class="bar-fill" style="height:{height_pct}%"></div>
+        <div class="bar-label">{esc(label)}</div>
+        {delta}
+      </div>""")
+
+    gap = summary.get("net_paise", 0) - summary.get("bank_credited_paise", 0)
+    if summary.get("bank_credited_paise"):
+        compare = f"""
+    <div class="waterfall-compare">
+      <span>Actually credited to your bank: <b>{esc(rupees(summary["bank_credited_paise"]))}</b></span>
+      {f'<span style="color:var(--danger)">Rs {abs(gap) / 100:,.2f} unexplained</span>'
+       if abs(gap) > 100 else '<span style="color:var(--good)">Matches, to the paise</span>'}
+    </div>"""
+    else:
+        compare = ""
+
+    # The method mix strip - one segment per instrument, widths by share of
+    # payment count. Real counts off the payments table, no estimation.
+    mix = summary.get("method_mix") or []
+    total_n = sum(n for _m, n in mix) or 1
+    segs = "".join(
+        f'<span class="mix-seg mix-{esc(str(method))}"'
+        f' style="width:{n / total_n * 100:.2f}%"'
+        f' title="{esc(str(method))}: {n}"></span>'
+        for method, n in mix)
+    keys = "".join(
+        f'<span class="mix-key"><i class="mix-{esc(str(method))}"></i>'
+        f'{esc(str(method))} <b>{n}</b></span>' for method, n in mix)
+    mix_strip = (f'<div class="mix-strip">{segs}</div>'
+                 f'<div class="mix-keys">{keys}</div>') if mix else ""
+
+    return f"""
+<div class="card dash-card">
+  <div class="dash-head">
+    <div>
+      <h2 style="margin:0 0 4px">Payments</h2>
+      <p class="sub" style="margin:0">Every rupee, from what customers paid to
+         what actually reached your account.</p>
+    </div>
+    <span class="pill-count">{summary.get("payment_count", 0)} payments</span>
+  </div>
+  {mix_strip}
+  <div class="waterfall-wrap">
+    <div class="waterfall">{"".join(bars)}</div>
+    {compare}
+    {ask_embed}
+  </div>
+</div>"""
+
+
+def dashboard_ask_embed(audited_count: int, findings: int, actionable: int,
+                        instrument_count: int) -> str:
+    """
+    The settlement auditor's real /ask box, embedded - not a rewrite, and
+    not pretending it can answer for every agent. The .scope line stays
+    exactly as visible here as it is on the standalone /agents/settlement/ask
+    page, so Home never implies a wider reach than the box actually has.
+    """
+    from merchant.ask import SUGGESTIONS
+
+    chips = "".join(
+        f'<button type="button" class="chip" data-q="{esc(q)}">{esc(q)}</button>'
+        for q in SUGGESTIONS[:4])
+
+    return f"""
+<div class="ask-embed">
+  <form method="post" action="/ask" id="dash-ask-form">
+    <div class="row">
+      <div><input name="question" id="dash-ask-input" maxlength="500" required
+        autocomplete="off" placeholder="What would you like to explore next?"></div>
+      <div style="flex:0"><button id="dash-ask-go">Ask</button></div>
+    </div>
+  </form>
+  <div style="margin-top:10px">{chips}</div>
+  <div class="scope" style="margin-top:12px">
+    <span>It can see <b>{audited_count}</b> audited settlement(s)</span>
+    <span><b>{findings}</b> records, <b>{actionable}</b> with findings</span>
+    <span>your rate card (<b>{instrument_count}</b> instruments)</span>
+    <span style="color:var(--faint)">settlement questions only, nothing else</span>
+  </div>
+  <div id="dash-ask-thread"></div>
+</div>
+<script>
+(function () {{
+  var form = document.getElementById('dash-ask-form');
+  var input = document.getElementById('dash-ask-input');
+  var go = document.getElementById('dash-ask-go');
+  var thread = document.getElementById('dash-ask-thread');
+
+  document.querySelectorAll('.ask-embed .chip').forEach(function (chip) {{
+    chip.onclick = function () {{ input.value = chip.dataset.q; submit(); }};
+  }});
+
+  function block(cls, html) {{
+    var el = document.createElement('div');
+    el.className = cls;
+    el.innerHTML = html;
+    return el;
+  }}
+
+  function submit(ev) {{
+    if (ev) ev.preventDefault();
+    var question = input.value.trim();
+    if (!question) return;
+
+    go.disabled = true;
+    input.value = '';
+
+    var pending = block('qa', '');
+    var q = block('qa-q', '<span class="qa-who">You</span>' +
+                          '<span class="qa-text"></span>');
+    q.querySelector('.qa-text').textContent = question;
+    var a = block('qa-a', '<span class="qa-thinking">Reading your settlements' +
+                          '<span class="qa-dots"></span></span>');
+    pending.appendChild(q); pending.appendChild(a);
+    thread.insertBefore(pending, thread.firstChild);
+
+    fetch('/ask', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/x-www-form-urlencoded',
+                 'Accept': 'application/json'}},
+      body: 'question=' + encodeURIComponent(question)
+    }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (d) {{ pending.outerHTML = d.html; }})
+      .catch(function () {{
+        a.innerHTML = '<p style="color:var(--danger)">Could not reach the ' +
+                      'agent. The answer was not lost - try again.</p>';
+      }})
+      .finally(function () {{ go.disabled = false; input.focus(); }});
+  }}
+
+  form.onsubmit = submit;
+}})();
+</script>"""
+
+
+def dashboard_side_panel(summary: dict) -> str:
+    """
+    The gross-volume side card: one big number, then three unrelated
+    figures shown together because they're the three worth a glance, not
+    because they sum to anything - see .vol-bar-row's own CSS comment.
+    """
+    rows = [
+        ("ITC safe to claim", summary.get("itc_safe_paise", 0), "good"),
+        ("ITC at risk", summary.get("itc_at_risk_paise", 0), "danger"),
+        ("Recoverable overcharges", summary.get("recoverable_paise", 0), "brand"),
+    ]
+    tallest = max((v for _l, v, _t in rows), default=0) or 1
+
+    bars = "".join(f"""
+    <div class="vol-bar-row">
+      <div class="vol-bar-head"><span>{esc(label)}</span><b>{esc(rupees(value))}</b></div>
+      <div class="vol-bar-track"><div class="vol-bar-fill {tone}"
+        style="width:{max(2, round(value / tallest * 100)) if value else 0}%"></div></div>
+    </div>""" for label, value, tone in rows)
+
+    # The reference puts a trend pill beside its big number. There is no
+    # prior period to trend against here, so this states the share that
+    # survived deductions instead - a real ratio off the same two figures,
+    # not a growth number we cannot compute.
+    gross = summary.get("gross_paise", 0)
+    kept = (f'<span class="trend-pill">{summary.get("net_paise", 0) / gross * 100:.1f}% kept</span>'
+            if gross else "")
+
+    return f"""
+<div class="card dash-card">
+  <h2 style="margin:0 0 2px">Gross Volume</h2>
+  <div class="big-figure">
+    <span class="figure-num">{esc(rupees(gross))}</span>{kept}
+  </div>
+  <p class="sub" style="margin:0">across every settlement audited</p>
+  {bars}
+  <p class="sub" style="margin-top:16px;font-size:11px">Three separate
+     figures from two agents, shown together because they're worth a
+     glance - not parts of one total.</p>
+</div>"""
+
+
+def stat_card(title: str, value: str, sub: str, dots: int = 0,
+              filled: int = 0, tone: str = "brand", href: str = "") -> str:
+    """
+    One small counting card - Transactions, Customers, Vendors.
+
+    `dots`/`filled` draw the reference's little dot-matrix: `dots` cells,
+    the first `filled` of them lit. Both are real counts passed in by the
+    caller; when there is nothing to count the card says so plainly rather
+    than drawing an empty grid that looks like a loading state.
+    """
+    matrix = ""
+    if dots:
+        cells = "".join(
+            f'<i class="{"on" if i < filled else ""}"></i>' for i in range(dots))
+        matrix = f'<div class="dotgrid tone-{esc(tone)}">{cells}</div>'
+
+    inner = f"""
+  <div class="stat-head">{esc(title)}</div>
+  <div class="stat-value">{esc(value)}</div>
+  {matrix}
+  <div class="stat-sub">{esc(sub)}</div>"""
+
+    if href:
+        return (f'<a class="card stat-card" href="{esc(href)}"'
+                f' style="text-decoration:none;color:inherit">{inner}</a>')
+    return f'<div class="card stat-card">{inner}</div>'
+
+
+def dashboard_bottom(summary: dict, candidates: list) -> str:
+    """
+    The reference's second row: a few counting cards on the left, and the
+    tall glossy Insights panel on the right.
+
+    Every card here is a real count off a real table (see
+    Ledger.dashboard_summary). A business that has never run the agent
+    owning a table gets a 0 and an explicit "nothing here yet" line -
+    never a placeholder number, and never a card implying data we do not
+    have.
+    """
+    txns = summary.get("payment_count", 0)
+    methods = summary.get("method_count", 0)
+    customers = summary.get("customer_count", 0)
+    registered = summary.get("customer_registered", 0)
+    vendors = summary.get("vendor_count", 0)
+    overbilled = summary.get("vendor_overbilled_paise", 0)
+
+    cards = [
+        stat_card(
+            "Transactions", f"{txns:,}",
+            (f"across {methods} payment method{'s' if methods != 1 else ''}"
+             if txns else "no settlements recorded yet"),
+            dots=min(txns, 24), filled=min(txns, 24), tone="brand",
+            href="/agents/settlement"),
+        stat_card(
+            "Customers", f"{customers:,}",
+            (f"{registered} GST-registered, {customers - registered} not"
+             if customers else "no sales invoices loaded yet"),
+            dots=min(customers, 24), filled=min(registered, 24), tone="good",
+            href="/agents/gst-filing"),
+        stat_card(
+            "Vendors", f"{vendors:,}",
+            (f"{rupees(overbilled)} overbilled" if overbilled
+             else ("all within agreed terms" if vendors
+                   else "no supplier invoices checked yet")),
+            dots=min(vendors, 24), filled=min(vendors, 24),
+            tone="danger" if overbilled else "good",
+            href="/agents/vendor-terms"),
+    ]
+
+    return f"""
+<div class="dash-row2">
+  <div class="stat-stack">{"".join(cards)}</div>
+  {insights_panel(candidates)}
+</div>"""
+
+
+def insights_panel(candidates: list) -> str:
+    """
+    The tall glossy Insights card - the single most urgent agent finding,
+    with the runners-up listed beneath it.
+
+    The headline is still that agent's own real number and its own
+    reasoning; the gloss is visual weight earned by rank, never a
+    fabricated score standing in for one. With nothing to report the panel
+    says exactly that, because "no agent has anything for you" is a real
+    and reassuring answer, not an empty state to hide.
+    """
+    if not candidates:
+        return """
+  <div class="card insights-panel quiet">
+    <div class="insight-agent">Insights</div>
+    <div class="insights-quiet-head">Nothing is waiting on you.</div>
+    <p class="sub" style="margin:0">No agent has found anything worth your
+       attention in what it has been given so far.</p>
+  </div>"""
+
+    head, rest = candidates[0], candidates[1:]
+    more = "".join(f"""
+      <a class="insights-more-row" href="{esc(c["href"])}">
+        <span class="im-agent">{esc(c["agent"])}</span>
+        <span class="im-head">{esc(c["headline"])}</span>
+      </a>""" for c in rest)
+
+    # The panel is a <div>, not an <a>: the runner-up rows below are
+    # themselves links, and an <a> inside an <a> is invalid HTML - the
+    # parser closes the outer one early and throws the rest of the card
+    # out of it. The headline gets its own link instead.
+    return f"""
+  <div class="card insights-panel tone-{esc(head["tone"])}">
+    <a class="insights-lead" href="{esc(head["href"])}">
+      <span class="insight-agent">Insights · {esc(head["agent"])}</span>
+      <span class="insights-headline">{esc(head["headline"])}</span>
+      <span class="insights-sub">{esc(head["subtext"])}</span>
+    </a>
+    {f'<div class="insights-more">{more}</div>' if more else ""}
+  </div>"""
+
+
+def insight_row(candidates: list) -> str:
+    """
+    Up to four agents' own headline figures, worst-first - see
+    app.py's _insight_candidates() for how the list is built and ranked.
+    Renders nothing when there is nothing worth flagging, rather than a
+    row of empty placeholders. The single most urgent one gets the big
+    gloss treatment (`.insight-hero`); it is still that agent's own real
+    number and reasoning, just given the visual weight its rank earns it -
+    not a fabricated score standing in for one.
+    """
+    if not candidates:
+        return ""
+
+    head, rest = candidates[0], candidates[1:]
+
+    hero = f"""
+    <a class="insight-card insight-hero tone-{head["tone"]}" href="{esc(head["href"])}"
+       style="display:block;text-decoration:none;color:inherit">
+      <div class="insight-agent">{esc(head["agent"])}</div>
+      <div class="insight-headline">{esc(head["headline"])}</div>
+      <div class="insight-subtext">{esc(head["subtext"])}</div>
+    </a>"""
+
+    cards = "".join(f"""
+    <a class="insight-card tone-{c["tone"]}" href="{esc(c["href"])}"
+       style="display:block;text-decoration:none;color:inherit">
+      <div class="insight-agent">{esc(c["agent"])}</div>
+      <div class="insight-headline">{esc(c["headline"])}</div>
+      <div class="insight-subtext">{esc(c["subtext"])}</div>
+    </a>""" for c in rest)
+
+    return f'<div class="insight-row" style="margin-top:16px">{hero}{cards}</div>'
 
 
 def error_page(title: str, message: str, action: str = "", href: str = "") -> str:
@@ -2525,6 +2944,230 @@ COMPONENTS += """
 .needs span { font-size:11.3px; color:var(--ink-2); line-height:1.45 }
 .needs .have { border-color:var(--good); background:var(--good-wash) }
 @media (max-width:720px) { .needs { grid-template-columns:1fr } }
+
+/* --- the Home dashboard's hero row --------------------------------------
+   .dash-grid collapses under the same 900px breakpoint SHELL already
+   defines for .app, so it needs no media query of its own here. Colors
+   throughout this block are still only --brand/--good/--danger/--warn and
+   their washes - richer gradients and textures are those same tokens
+   layered or darkened with color-mix(), never a new hex value. */
+.dash-grid { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr);
+  gap:16px }
+@media (max-width:900px) { .dash-grid { grid-template-columns:1fr } }
+
+/* --- Google sign-in ------------------------------------------------------ */
+.btn-google { display:flex; align-items:center; justify-content:center;
+  gap:10px; width:100%; padding:11px 14px; border-radius:9px;
+  border:1px solid var(--line); background:var(--surface); color:var(--ink);
+  font-size:13.5px; font-weight:600; text-decoration:none; cursor:pointer }
+.btn-google:hover { background:var(--line-2) }
+.btn-google svg { flex:none; display:block }
+.auth-or { display:flex; align-items:center; gap:10px; margin:16px 0;
+  color:var(--faint); font-size:11.5px }
+.auth-or::before, .auth-or::after { content:""; flex:1; height:1px;
+  background:var(--line) }
+
+.dash-card { padding:26px 28px 22px; border-radius:18px }
+.dash-card h2 { font-size:17px; font-weight:700; letter-spacing:-.015em }
+.dash-head { display:flex; justify-content:space-between; align-items:flex-start;
+  gap:12px }
+.pill-count { flex:none; font-size:11.5px; font-weight:650; color:var(--ink-2);
+  background:var(--line-2); border-radius:999px; padding:5px 11px;
+  font-variant-numeric:tabular-nums }
+
+/* Big number + its ratio pill, the reference's own pairing. */
+.big-figure { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+  margin:10px 0 4px }
+/* Targets the number by class, not by element - .trend-pill is a sibling
+   span, and a bare `.big-figure > span` sets its size too. */
+.big-figure > .figure-num { font-size:38px; font-weight:780;
+  letter-spacing:-.025em; font-variant-numeric:tabular-nums; line-height:1 }
+.trend-pill { font-size:11.5px; font-weight:700; color:var(--good);
+  background:var(--good-wash); border-radius:999px; padding:4px 9px;
+  white-space:nowrap }
+
+/* Instrument mix: one segment per method, width = share of payment count. */
+.mix-strip { display:flex; gap:3px; height:8px; margin:16px 0 9px;
+  border-radius:999px; overflow:hidden }
+.mix-seg { display:block; height:100%; border-radius:999px; min-width:3px;
+  background:var(--brand) }
+.mix-seg.mix-card { background:color-mix(in srgb, var(--brand) 60%, white) }
+.mix-seg.mix-netbanking { background:color-mix(in srgb, var(--brand) 34%, white) }
+.mix-seg.mix-wallet { background:color-mix(in srgb, var(--brand) 20%, white) }
+.mix-keys { display:flex; gap:14px; flex-wrap:wrap; font-size:11.3px;
+  color:var(--ink-2); margin-bottom:2px }
+.mix-key { display:inline-flex; align-items:center; gap:5px }
+.mix-key i { width:8px; height:8px; border-radius:3px; background:var(--brand) }
+.mix-key i.mix-card { background:color-mix(in srgb, var(--brand) 60%, white) }
+.mix-key i.mix-netbanking { background:color-mix(in srgb, var(--brand) 34%, white) }
+.mix-key i.mix-wallet { background:color-mix(in srgb, var(--brand) 20%, white) }
+.mix-key b { font-variant-numeric:tabular-nums; color:var(--ink) }
+
+.waterfall { display:flex; align-items:flex-end; gap:22px; height:210px;
+  padding:26px 4px 0 }
+.waterfall-bar { flex:1; min-width:0; display:flex; flex-direction:column;
+  align-items:center; height:100%; justify-content:flex-end }
+.waterfall-bar .bar-val { font-size:17px; font-weight:750; color:var(--ink);
+  font-variant-numeric:tabular-nums; margin-bottom:8px; text-align:center;
+  letter-spacing:-.01em }
+@media (max-width:520px) {
+  .waterfall-bar .bar-val { font-size:13px }
+  .waterfall { gap:10px }
+}
+.waterfall-bar .bar-fill { width:100%; max-width:72px; border-radius:10px 10px 3px 3px;
+  min-height:3px; position:relative; overflow:hidden;
+  background:
+    repeating-linear-gradient(-45deg, rgba(255,255,255,.32) 0 3px, transparent 3px 9px),
+    linear-gradient(180deg, var(--brand) 0%, var(--brand-ink) 100%);
+  box-shadow:0 10px 18px -10px color-mix(in srgb, var(--brand) 70%, transparent) }
+.waterfall-bar.net .bar-fill {
+  background:
+    repeating-linear-gradient(-45deg, rgba(255,255,255,.32) 0 3px, transparent 3px 9px),
+    linear-gradient(180deg, var(--good) 0%, color-mix(in srgb, var(--good) 100%, black 20%) 100%);
+  box-shadow:0 10px 18px -10px color-mix(in srgb, var(--good) 70%, transparent) }
+.waterfall-bar .bar-label { font-size:11.5px; color:var(--muted); margin-top:10px;
+  text-align:center; line-height:1.3; font-weight:560 }
+/* The amount removed at this stage, stated rather than drawn - the bars
+   carry the running balance, and at ~1.7% of gross these deductions have
+   no legible height of their own. See dashboard_waterfall()'s docstring. */
+.waterfall-bar .bar-delta { font-size:11.5px; font-weight:700; margin-top:3px;
+  color:var(--danger); font-variant-numeric:tabular-nums; min-height:15px;
+  text-align:center }
+/* Non-focal middle stages, ghosted the way the reference ghosts its own,
+   so the eye lands on where the money started and where it ended. */
+.waterfall-bar.ghost .bar-val { color:var(--muted); font-weight:650 }
+.waterfall-bar.ghost .bar-fill { opacity:.42 }
+.waterfall-compare { display:flex; justify-content:space-between; gap:12px;
+  padding:14px 6px; margin-top:6px; border-top:1px solid var(--line-2);
+  font-size:12.5px; color:var(--ink-2) }
+.waterfall-compare b { color:var(--ink); font-variant-numeric:tabular-nums }
+
+/* The reference design floats its command bar so it overlaps the base of
+   the chart rather than sitting in normal document flow below a divider -
+   same idea here, pulled up over the compare line's empty space so the
+   bars and their values (the actual data) stay fully readable above it. */
+.waterfall-wrap { position:relative }
+.ask-embed { position:relative; margin:-14px 2px 0; padding:16px 18px 18px;
+  background:color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter:blur(6px); border:1px solid var(--line);
+  border-radius:16px; box-shadow:0 14px 28px -14px rgba(16,24,40,.22),
+  0 2px 8px rgba(16,24,40,.06); z-index:2 }
+.ask-embed .row input { font-size:13.5px }
+.ask-embed .row button { border-radius:10px; padding:9px 18px; font-weight:600 }
+
+/* Three unrelated figures shown together, not parts of one whole - see
+   dashboard_side_panel()'s own docstring. Track height and pill radius
+   deliberately larger than .progress's thin 6px shape: this stack is the
+   card's main content, not a background indicator. */
+.vol-bar-row { margin-top:18px }
+.vol-bar-row .vol-bar-head { display:flex; justify-content:space-between;
+  font-size:13px; margin-bottom:6px }
+.vol-bar-row .vol-bar-head span { color:var(--ink-2); font-weight:560 }
+.vol-bar-row .vol-bar-head b { font-variant-numeric:tabular-nums; font-size:13.5px }
+.vol-bar-track { height:10px; background:var(--line-2); border-radius:999px;
+  overflow:hidden }
+.vol-bar-fill { height:100%; border-radius:999px; min-width:5px }
+.vol-bar-fill.good { background:var(--good) }
+.vol-bar-fill.danger, .vol-bar-fill.brand {
+  background-image:
+    repeating-linear-gradient(-45deg, rgba(255,255,255,.4) 0 3px, transparent 3px 7px),
+    linear-gradient(90deg, currentColor, currentColor) }
+.vol-bar-fill.danger { color:var(--danger) }
+.vol-bar-fill.brand { color:var(--brand) }
+
+/* --- the counting cards + the tall Insights panel ----------------------- */
+.dash-row2 { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);
+  gap:16px; margin-top:16px; align-items:stretch }
+@media (max-width:900px) { .dash-row2 { grid-template-columns:1fr } }
+
+.stat-stack { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+  gap:16px; align-content:start }
+.stat-card { padding:20px 22px; border-radius:18px; display:block }
+.stat-head { font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+  color:var(--faint); font-weight:700 }
+.stat-value { font-size:34px; font-weight:780; letter-spacing:-.025em;
+  margin-top:6px; font-variant-numeric:tabular-nums; line-height:1.05 }
+.stat-sub { font-size:11.8px; color:var(--ink-2); margin-top:8px; line-height:1.4 }
+
+/* The reference's dot matrix. Cells are a real count, capped at 24 so a
+   large batch stays one tidy block rather than an unreadable field. */
+.dotgrid { display:flex; flex-wrap:wrap; gap:4px; margin-top:12px; max-width:150px }
+.dotgrid i { width:8px; height:8px; border-radius:2.5px; background:var(--line-2) }
+.dotgrid.tone-brand i.on { background:var(--brand) }
+.dotgrid.tone-good i.on { background:var(--good) }
+.dotgrid.tone-danger i.on { background:var(--danger) }
+
+.insights-panel { position:relative; overflow:hidden; border-radius:18px;
+  padding:26px 28px; color:#fff; display:flex; flex-direction:column;
+  border:none; box-shadow:0 18px 38px -18px rgba(16,24,40,.42);
+  background:linear-gradient(135deg, var(--brand-ink), var(--brand)) }
+.insights-panel.tone-danger { background:linear-gradient(135deg,
+  color-mix(in srgb, var(--danger) 100%, black 30%), var(--danger)) }
+.insights-panel.tone-warn { background:linear-gradient(135deg,
+  color-mix(in srgb, var(--warn) 100%, black 30%), var(--warn)) }
+/* The reference's glossy sweep - a light source in the top-right corner. */
+.insights-panel::after { content:""; position:absolute; inset:0;
+  pointer-events:none;
+  background:radial-gradient(130% 130% at 100% 0%, rgba(255,255,255,.30),
+    rgba(255,255,255,.06) 45%, transparent 70%) }
+.insights-panel > * { position:relative; z-index:1 }
+.insights-panel .insight-agent { font-size:11px; text-transform:uppercase;
+  letter-spacing:.07em; color:rgba(255,255,255,.78); font-weight:700 }
+.insights-lead { display:block; text-decoration:none; color:inherit }
+.insights-headline { display:block; font-size:36px; font-weight:780;
+  letter-spacing:-.03em; margin-top:10px; line-height:1.08;
+  font-variant-numeric:tabular-nums }
+.insights-sub { display:block; font-size:12.8px; line-height:1.5;
+  margin:10px 0 0; color:rgba(255,255,255,.9) }
+.insights-more { margin-top:auto; padding-top:18px; display:grid; gap:1px }
+.insights-more-row { display:flex; justify-content:space-between; gap:10px;
+  padding:9px 0; border-top:1px solid rgba(255,255,255,.22);
+  text-decoration:none; color:#fff; font-size:12.2px }
+.insights-more-row .im-agent { color:rgba(255,255,255,.8) }
+.insights-more-row .im-head { font-weight:680; text-align:right;
+  font-variant-numeric:tabular-nums }
+.insights-panel.quiet { background:var(--surface); color:var(--ink);
+  border:1px solid var(--line); box-shadow:var(--shadow) }
+.insights-panel.quiet::after { display:none }
+.insights-panel.quiet .insight-agent { color:var(--faint) }
+.insights-quiet-head { font-size:20px; font-weight:720; margin:10px 0 6px;
+  letter-spacing:-.015em }
+
+.insight-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+  gap:14px; align-items:stretch }
+.insight-card { border-radius:14px; padding:16px 18px; box-shadow:var(--shadow);
+  background:var(--surface); border:1px solid var(--line);
+  border-top:3px solid var(--line-2) }
+.insight-card.tone-danger { border-top-color:var(--danger) }
+.insight-card.tone-warn { border-top-color:var(--warn) }
+.insight-card .insight-agent { font-size:10.8px; text-transform:uppercase;
+  letter-spacing:.06em; color:var(--faint); font-weight:700 }
+.insight-card .insight-headline { font-size:23px; font-weight:750; margin-top:5px;
+  font-variant-numeric:tabular-nums; letter-spacing:-.01em }
+.insight-card .insight-subtext { font-size:12px; color:var(--ink-2);
+  margin-top:3px; line-height:1.4 }
+
+/* The one glossy standout - reserved for whichever agent's own number is
+   the most urgent this run (see app.py's _insight_candidates ranking).
+   Gradient stops are still only the tone's own token, darkened with
+   color-mix rather than a hand-picked second hex. */
+.insight-hero { border-radius:16px; padding:22px 24px; color:#fff;
+  position:relative; overflow:hidden; box-shadow:0 16px 32px -16px rgba(16,24,40,.35);
+  grid-column:span 2 }
+.insight-hero::after { content:""; position:absolute; inset:0;
+  background:radial-gradient(120% 140% at 100% 0%, rgba(255,255,255,.22), transparent 60%) }
+.insight-hero.tone-brand { background:linear-gradient(135deg, var(--brand-ink), var(--brand)) }
+.insight-hero.tone-danger { background:linear-gradient(135deg,
+  color-mix(in srgb, var(--danger) 100%, black 25%), var(--danger)) }
+.insight-hero.tone-warn { background:linear-gradient(135deg,
+  color-mix(in srgb, var(--warn) 100%, black 25%), var(--warn)) }
+.insight-hero .insight-agent { position:relative; font-size:11px; text-transform:uppercase;
+  letter-spacing:.07em; color:rgba(255,255,255,.75); font-weight:700 }
+.insight-hero .insight-headline { position:relative; font-size:34px; font-weight:780;
+  margin-top:8px; font-variant-numeric:tabular-nums; letter-spacing:-.02em }
+.insight-hero .insight-subtext { position:relative; font-size:13px;
+  color:rgba(255,255,255,.88); margin-top:8px; line-height:1.5; max-width:46ch }
+@media (max-width:560px) { .insight-hero { grid-column:span 1 } }
 """
 
 CSS = TOKENS + SHELL + COMPONENTS

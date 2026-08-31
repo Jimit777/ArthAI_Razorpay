@@ -102,25 +102,16 @@ def all_agents() -> list[AgentSpec]:
 # side, an actual number on the other, and no routine check between them.
 # None of them are built.
 
-PLANNED = [
-    AgentSpec(
-        id="tds_credit",
-        name="TDS Credit Tracker",
-        short_name="TDS credit",
-        tagline="Checks that tax withheld from you actually reached the department.",
-        question="Was TDS deducted from my payouts, and did it show up as my credit?",
-        status="planned",
-        reads=["Form 26AS", "Form 168", "settlement reports"],
-        produces=["missing credit claims", "corrected section codes"],
-        authority="Income Tax Act 2025 s.393 - and the 1 April 2026 code change",
-        why_unbuilt="Razorpay's settlement report carries no TDS line - the "
-                    "only real documents are a quarterly Form 16A certificate "
-                    "and Form 26AS/168, neither with an API. Testing this "
-                    "against real data would mean a merchant manually "
-                    "cross-referencing both documents before the tool ever "
-                    "runs, which does the tool's one job for them.",
-    ),
-]
+# Nothing is currently advertised as planned. The TDS Credit Tracker used to
+# sit here; it was withdrawn rather than shipped as a roadmap promise, because
+# neither side of that reconciliation has an API and there was no honest path
+# to testing it against real data. Its run logic, engine and tests remain in
+# the tree (merchant/agents/tds_credit.py, engine/tds/) as unwired groundwork,
+# so re-advertising it later is a registration rather than a rebuild.
+#
+# The list and the registration loop below stay deliberately: "what is coming"
+# is a real product concept, and an empty roadmap is a truthful answer to it.
+PLANNED: list[AgentSpec] = []
 
 for _spec in PLANNED:
     register(_spec)

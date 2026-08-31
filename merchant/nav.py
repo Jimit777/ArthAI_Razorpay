@@ -259,7 +259,6 @@ FLOWS: tuple[Flow, ...] = (
         FlowStage("Payout", agent_id="payout_timing"),
         FlowStage("Refund/Dispute", agent_id="chargeback"),
         FlowStage("Reconcile", agent_id="three_way_recon"),
-        FlowStage("Report", agent_id="tds_credit"),
     )),
     Flow("vendor", "Vendor Management", (
         FlowStage("Purchase", agent_id="vendor_terms"),

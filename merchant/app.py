@@ -36,8 +36,20 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Cookie, Depends, FastAPI, Form, Request
+from fastapi import Cookie, Depends, FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+# Load .env before anything reads os.environ, so secrets set there reach the
+# modules that look them up (google_auth, vault, the Anthropic key). Real
+# environment variables still win - load_dotenv does not override them - so
+# an explicit `GOOGLE_CLIENT_SECRET=... uvicorn ...` beats the file, and CI,
+# which has no .env, is unaffected.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover - python-dotenv is an optional convenience
+    pass
 
 import merchant.agents.gst  # noqa: F401  - registers the live agent
 import merchant.agents.recon  # noqa: F401  - registers the live agent
@@ -48,7 +60,7 @@ import merchant.agents.gst_filing  # noqa: F401  - registers the live agent
 import merchant.agents.vendor_terms  # noqa: F401  - registers the live agent
 import merchant.agents.chargeback  # noqa: F401  - registers the live agent
 from engine.expected_value import rupees
-from merchant import catalog, views
+from merchant import catalog, google_auth, views
 from merchant.accesslog import ACTION_LABEL, AccessLog, Action
 from merchant.auth import SESSION_COOKIE, Auth, Role, User
 from merchant.catalog import AgentContext
@@ -208,22 +220,62 @@ class Workspace:
                 f"findings off. You are signed in as staff.")
 
 
-def workspace(request: Request, user: User = Depends(current_user),
-              business_id: Optional[str] = Cookie(None)) -> Optional[Workspace]:
-    """The current workspace, or None when the user has not picked one."""
-    if not business_id:
+def _fallback_workspace(led, user: User) -> Optional[Workspace]:
+    """
+    A business this user actually belongs to, for when the cookie cannot
+    supply one.
+
+    This exists because the cookie is a CONVENIENCE, not the record of what
+    somebody owns - membership is. Treating a missing cookie as "this user
+    has no businesses" was a real bug: a new browser, cleared cookies, a
+    private window, an expired cookie or a first sign-in through Google all
+    arrive with no cookie, and the front door then offered its only
+    affordance - "create your first business" - to people who already had
+    several. The duplicates that produced are the evidence.
+
+    Oldest first, matching the order the Businesses page lists them in, so
+    the default is stable rather than whichever row the database happened
+    to return.
+    """
+    mine = Auth(led.conn).businesses_for(user)
+    if not mine:
         return None
+    row = mine[0]
+    return Workspace(user, row["business_id"], Role(row["role"]))
+
+
+def workspace(response: Response, request: Request,
+              user: User = Depends(current_user),
+              business_id: Optional[str] = Cookie(None)) -> Optional[Workspace]:
+    """
+    The current workspace.
+
+    None only when this user is in no business at all - never merely because
+    the browser did not send a cookie. See _fallback_workspace.
+    """
+    if not business_id:
+        with ledger() as led:
+            picked = _fallback_workspace(led, user)
+        if picked is not None:
+            # Remember it, so the rest of the session is a plain cookie read
+            # and the selector agrees with what is on screen.
+            response.set_cookie(COOKIE, picked.business_id,
+                                max_age=60 * 60 * 24 * 365,
+                                httponly=True, samesite="lax")
+        return picked
     with ledger() as led:
         auth = Auth(led.conn)
         row = led.businesses.get(business_id)
-        if row is None:
-            return None
-        if row["archived_at"]:
-            # Put away on purpose. Its books stay exactly as they were and
-            # nothing may be added to them until somebody restores it.
-            return None
-        role = auth.role_in(user, business_id)
-        if role is None:
+
+        # A cookie that cannot be honoured - deleted, archived, or one this
+        # user is not a member of - falls back to a business they DO belong
+        # to rather than stranding them on "create your first business".
+        # The cookie is stale in every one of these cases; the membership
+        # table is not.
+        stale = row is None or bool(row["archived_at"])
+
+        role = None if stale else auth.role_in(user, business_id)
+        if not stale and role is None:
             # Someone holding a cookie for a business they are not in. Routine
             # after a membership is removed, and exactly the event an operator
             # would want to see if it is not routine.
@@ -233,8 +285,19 @@ def workspace(request: Request, user: User = Depends(current_user),
                 Action.SWITCH_BUSINESS, user=user, business_id=business_id,
                 address=client_address(request),
                 detail="held a cookie for a business they are not a member of")
-    if role is None:
-        return None                     # not a member: as good as not existing
+
+        if role is None:
+            picked = _fallback_workspace(led, user)
+            if picked is not None:
+                response.set_cookie(COOKIE, picked.business_id,
+                                    max_age=60 * 60 * 24 * 365,
+                                    httponly=True, samesite="lax")
+            else:
+                # Nothing to fall back to: clear the misleading cookie so the
+                # next request does not repeat this lookup.
+                response.delete_cookie(COOKIE)
+            return picked
+
     return Workspace(user, business_id, role)
 
 
@@ -268,6 +331,8 @@ def login_page(error: str = "", user: Optional[User] = Depends(maybe_user)):
               if error else "")
     return HTMLResponse(views.auth_page("Sign in", "Welcome back.", f"""
     {banner}
+    {views.google_button("Continue with Google")
+     if google_auth.is_configured() else ""}
     <form method="post" action="/login">
       <div style="margin-bottom:11px"><label>Email</label>
         <input name="email" type="email" required autofocus></div>
@@ -313,6 +378,77 @@ def do_login(request: Request, email: str = Form(...), password: str = Form(...)
     return response
 
 
+# --- sign in with Google ----------------------------------------------------
+#
+# Two routes: one sends the browser to Google's consent screen, the other
+# receives it back. The `state` parameter is the CSRF defence - a random
+# value put in an HttpOnly cookie on the way out and required to match on
+# the way back, so a callback the user did not start cannot log anyone in.
+
+
+@app.get("/login/google")
+def google_start(request: Request):
+    from urllib.parse import quote
+
+    if not google_auth.is_configured():
+        return RedirectResponse(
+            f"/login?error={quote('Google sign-in is not set up on this server.')}",
+            status_code=303)
+
+    state = secrets.token_urlsafe(32)
+    try:
+        destination = google_auth.authorize_url(state, str(request.base_url))
+    except google_auth.GoogleAuthError as exc:
+        return RedirectResponse(f"/login?error={quote(str(exc))}", status_code=303)
+
+    response = RedirectResponse(destination, status_code=303)
+    response.set_cookie(google_auth.STATE_COOKIE, state,
+                        max_age=google_auth.STATE_MAX_AGE,
+                        httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = "",
+                    error: str = ""):
+    from urllib.parse import quote
+
+    def refuse(message: str):
+        # The half-finished state cookie goes whatever the outcome, so a
+        # failed attempt cannot be replayed.
+        out = RedirectResponse(f"/login?error={quote(message)}", status_code=303)
+        out.delete_cookie(google_auth.STATE_COOKIE)
+        return out
+
+    if error:
+        # The usual one is access_denied - the person pressed Cancel, which
+        # is not an error worth shouting about.
+        return refuse("Google sign-in was cancelled.")
+
+    expected = request.cookies.get(google_auth.STATE_COOKIE) or ""
+    if not expected or not state or not secrets.compare_digest(state, expected):
+        return refuse("That sign-in link did not come from here. Try again.")
+
+    if not code:
+        return refuse("Google did not return a sign-in code.")
+
+    try:
+        identity = google_auth.exchange_code(code, str(request.base_url))
+    except google_auth.GoogleAuthError as exc:
+        return refuse(str(exc))
+
+    with ledger() as led:
+        user = Auth(led.conn).upsert_google_user(
+            identity["sub"], identity["email"], identity.get("name", ""))
+        token = Auth(led.conn).start_session(user.user_id)
+
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(SESSION_COOKIE, token, max_age=30 * 86_400,
+                        httponly=True, samesite="lax")
+    response.delete_cookie(google_auth.STATE_COOKIE)
+    return response
+
+
 @app.get("/signup", response_class=HTMLResponse)
 def signup_page(error: str = "", user: Optional[User] = Depends(maybe_user)):
     if user is not None:
@@ -333,6 +469,8 @@ def signup_page(error: str = "", user: Optional[User] = Depends(maybe_user)):
         "Create an account", "Ledgerline audits what your gateway deducted.",
         f"""
     {note}{banner}
+    {views.google_button("Sign up with Google")
+     if google_auth.is_configured() else ""}
     <form method="post" action="/signup">
       <div style="margin-bottom:11px"><label>Your name</label>
         <input name="name" autofocus></div>
@@ -741,9 +879,24 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
 
 
 def _welcome(user: User) -> str:
-    """Signed in, but not in any business yet."""
+    """
+    Signed in, but not in any business yet.
+
+    This screen has to answer a question it used to leave hanging: WHICH
+    account is this? An empty workspace is almost always a different
+    identity rather than a lost one - somebody picks a second Google
+    account at the consent screen, lands here, and sees a "create your
+    first business" wall where their data used to be. Naming the signed-in
+    address, and offering the door back out, turns a dead end into an
+    obvious "ah, wrong account".
+    """
     live = [a for a in catalog.all_agents() if a.is_live]
     planned = [a for a in catalog.all_agents() if not a.is_live]
+
+    agents = "".join(
+        f'<li><b>{views.esc(a.name)}</b> &mdash; {views.esc(a.tagline)}</li>'
+        for a in live)
+
     return views.page("Ledgerline", f"""
 <div class="card" style="padding:34px">
   <h1>Welcome, {views.esc(user.name)}</h1>
@@ -751,10 +904,20 @@ def _welcome(user: User) -> str:
     Your money already flows through your payment gateway. Ledgerline reads what
     the gateway <i>did</i> to it &mdash; and tells you which parts were wrong.
     It is not where sales happen. It is where they get checked afterwards.</p>
+
+  <div class="banner brand" style="margin-top:18px;max-width:620px">
+    <b>Signed in as {views.esc(user.email)}</b>
+    <span>This account has no businesses yet. If you expected to see your
+      books here, you are probably signed in with a different account than
+      the one that owns them &mdash; businesses belong to one account and are
+      never shared automatically.
+      <a href="/logout">Sign out and use a different account</a>.</span>
+  </div>
+
   <form method="post" action="/businesses" style="margin-top:20px">
     <div class="row" style="max-width:520px">
-      <div><label>Set up your first business</label>
-        <input name="name" placeholder="Meera&rsquo;s Boutique" required autofocus></div>
+      <div><label>Or set up your first business</label>
+        <input name="name" placeholder="Meera&rsquo;s Boutique" required></div>
       <div style="flex:0"><button>Get started</button></div>
     </div>
   </form>
@@ -764,10 +927,12 @@ def _welcome(user: User) -> str:
 </div>
 <div class="card">
   <h2>Available now</h2>
-  <p class="sub">{views.esc(live[0].name) if live else '-'} &mdash;
-     {views.esc(live[0].tagline) if live else ''}</p>
-  <h2 style="margin-top:16px">On the roadmap, not yet built</h2>
-  <p class="sub" style="margin:0">{views.esc(', '.join(a.name for a in planned))}</p>
+  <p class="sub" style="margin:2px 0 8px">{len(live)} agents run the moment a
+     business exists.</p>
+  <ul class="sub" style="margin:0;padding-left:18px;line-height:1.7">{agents}</ul>
+  {f'''<h2 style="margin-top:16px">On the roadmap, not yet built</h2>
+  <p class="sub" style="margin:0">{views.esc(", ".join(a.name for a in planned))}</p>'''
+   if planned else ""}
 </div>""", viewer=user)
 
 
@@ -793,21 +958,16 @@ def overview_page(user: User = Depends(current_user),
         source = sources.get(resolved)
         runs = led.settlements()
         totals = [led.store.totals(r["run_id"]) for r in runs]
-        credited_by = {r["run_id"]: led.conn.execute(
-            "SELECT COALESCE(SUM(amount),0) a FROM bank_credits WHERE run_id = ?",
-            (r["run_id"],)).fetchone()["a"] for r in runs}
-        open_findings = []
-        for run in runs:
-            for f in led.store.findings(run["run_id"], queued_only=True):
-                open_findings.append((run["run_id"], f))
+        _has_vendor_terms = led.latest_vendor_terms_run()
+        _has_chargeback = led.latest_chargeback_run()
+        _has_payout_timing = led.latest_payout_timing_run()
+        _has_gst_filing = led.latest_gstr1_run()
 
     if source is None:
         return RedirectResponse("/data", status_code=303)
 
     audited = [r for r in runs if r["findings"]]
-    recoverable = sum(t["recoverable_paise"] for t in totals)
     records = sum(t["n"] for t in totals)
-    queued = sum(t["queued"] for t in totals)
 
     # --- nothing to show yet -----------------------------------------------
     #
@@ -819,9 +979,13 @@ def overview_page(user: User = Depends(current_user),
     # had already run a cash forecast or a reconciliation - real work, with a
     # real decision waiting - was told "nothing has been settled yet" and
     # never saw it, because this screen only knew how to look for one agent.
+    # Widened again here to the four agents added since: a business that has
+    # only ever run vendor_terms/chargeback/payout_timing/gst_filing demo
+    # data has real work waiting too.
     _, _has_cash = _latest_cash_run(resolved)
     _, _has_recon = _latest_recon_run(resolved)
-    if not runs and not _has_cash and not _has_recon:
+    if not (runs or _has_cash or _has_recon or _has_vendor_terms
+           or _has_chargeback or _has_payout_timing or _has_gst_filing):
         simulated = source["kind"] == str(SourceKind.SIMULATOR)
         steps = [
             ("done", "Business created",
@@ -878,25 +1042,24 @@ def overview_page(user: User = Depends(current_user),
     with ledger(resolved) as led:
         picture = _agent_picture(led, ws)
         decisions = _open_decisions(led, ws)
-
-    recoverable = sum(t["recoverable_paise"] for t in totals)
-    records = sum(t["n"] for t in totals)
-    itc_exposed = 0
-    last_check = None
-    with ledger(resolved) as led:
-        last_check = led.last_check()
-    if last_check:
-        itc_exposed = last_check["exposed_paise"]
+        summary = led.dashboard_summary()
+        candidates = _insight_candidates(led, ws, summary)
+        card = led.rate_card()
+        actionable = sum(
+            1 for r in audited for f in led.store.findings(r["run_id"])
+            if f["exception_code"] != "CLEAN")
 
     live_count = sum(1 for spec, _r, _st, _m in picture if spec.is_live)
 
-    metrics = ui.metric_bar([
-        (rupees(recoverable), "recoverable from your gateway"),
-        (rupees(itc_exposed), "input credit at risk"),
-        (f"{records:,}", "records audited"),
-        (str(len(decisions)), "waiting on you"),
-        (str(live_count), "agents running"),
-    ])
+    ask_embed = views.dashboard_ask_embed(
+        len(audited), records, actionable, len(card["instruments"])
+    ) if audited else ""
+    dashboard = f"""
+<div class="dash-grid">
+  {views.dashboard_waterfall(summary, ask_embed)}
+  {views.dashboard_side_panel(summary)}
+</div>
+{views.dashboard_bottom(summary, candidates)}"""
 
     # --- one queue, all agents ---------------------------------------------
     if decisions:
@@ -938,7 +1101,7 @@ def overview_page(user: User = Depends(current_user),
 <p class="sub">Everything running across your books, and what is waiting on
    you.</p>
 
-{metrics}
+{dashboard}
 
 {_flow_sections(picture)}
 
@@ -1019,6 +1182,108 @@ def _open_decisions(led, ws) -> list:
 
     out.sort(key=lambda d: -d["amount"])
     return out
+
+
+def _insight_candidates(led, ws, summary: dict) -> list:
+    """
+    Up to four agents' own headline figures, ranked by money or time at
+    stake - the Home dashboard's insight row.
+
+    Reuses `summary` (from `led.dashboard_summary()`) for the two agents
+    whose totals it already carries, and each other agent's own
+    `latest_*_run()`/`_latest_cash_run`/`_latest_recon_run` accessor for the
+    rest - never a second copy of arithmetic another accessor already owns.
+    An agent that has never run, or ran and found nothing worth a number,
+    contributes no candidate - there is no placeholder card for an agent
+    that simply has nothing to say yet.
+    """
+    from merchant.nav import route_for
+
+    out = []
+
+    if led.settlements() and summary["recoverable_paise"] > 0:
+        out.append({
+            "agent": "Settlement", "headline": rupees(summary["recoverable_paise"]),
+            "subtext": "recoverable overcharges", "tone": "danger",
+            "href": route_for("settlement_audit").href,
+            "urgency": summary["recoverable_paise"],
+        })
+
+    if led.last_check() and summary["itc_at_risk_paise"] > 0:
+        out.append({
+            "agent": "Suppliers", "headline": rupees(summary["itc_at_risk_paise"]),
+            "subtext": "input credit at risk", "tone": "danger",
+            "href": route_for("gst_itc").href,
+            "urgency": summary["itc_at_risk_paise"],
+        })
+
+    vt_run = led.latest_vendor_terms_run()
+    if vt_run:
+        overbilled = led.conn.execute(
+            "SELECT COALESCE(SUM(money_at_stake_paise),0) s FROM"
+            " vendor_terms_findings WHERE run_id = ? AND code = 'OVERBILLED'",
+            (vt_run["run_id"],)).fetchone()["s"]
+        if overbilled:
+            out.append({
+                "agent": "Vendor terms", "headline": rupees(overbilled),
+                "subtext": "overbilled by suppliers", "tone": "warn",
+                "href": route_for("vendor_terms").href, "urgency": overbilled,
+            })
+
+    cb_run = led.latest_chargeback_run()
+    if cb_run:
+        drafted = led.conn.execute(
+            "SELECT COALESCE(SUM(amount_paise),0) s FROM chargeback_findings"
+            " WHERE run_id = ? AND action = 'draft_evidence_pack'",
+            (cb_run["run_id"],)).fetchone()["s"]
+        if drafted:
+            out.append({
+                "agent": "Chargebacks", "headline": rupees(drafted),
+                "subtext": "in drafted representments", "tone": "warn",
+                "href": route_for("chargeback").href, "urgency": drafted,
+            })
+
+    pt_run = led.latest_payout_timing_run()
+    if pt_run and (pt_run["total_float_cost"] or 0) > 0:
+        out.append({
+            "agent": "Payout timing", "headline": rupees(pt_run["total_float_cost"]),
+            "subtext": "float cost from late settlement", "tone": "warn",
+            "href": route_for("payout_timing").href,
+            "urgency": pt_run["total_float_cost"],
+        })
+
+    _recon_key, recon = _latest_recon_run(ws.business_id)
+    if recon:
+        at_stake = ((recon.get("payload") or {}).get("match_metrics") or {}
+                   ).get("at_stake", 0)
+        if at_stake:
+            out.append({
+                "agent": "Three-way recon", "headline": rupees(at_stake),
+                "subtext": "unreconciled across sources", "tone": "warn",
+                "href": route_for("three_way_recon").href, "urgency": at_stake,
+            })
+
+    cash_key, cash = _latest_cash_run(ws.business_id)
+    if cash:
+        forecast = (cash.get("payload") or {}).get("forecast") or {}
+        trough = forecast.get("trough") or {}
+        shortfall = trough.get("shortfall", 0)
+        # Same gate _open_decisions applies to this same forecast: the
+        # mechanical action, not the raw shortfall number, decides whether
+        # this is still worth a card - a trough the agent (or the arithmetic)
+        # has already called "none"/"watch" is not this dashboard's business
+        # to re-raise as urgent.
+        if shortfall and forecast.get("action", "none") not in ("none", "watch"):
+            out.append({
+                "agent": "Cash forecast",
+                "headline": f"Day {trough.get('day', '?')}",
+                "subtext": f"short by {rupees(shortfall)}", "tone": "danger",
+                "href": f"/agents/cash-forecaster?key={cash_key}",
+                "urgency": shortfall,
+            })
+
+    out.sort(key=lambda d: -d["urgency"])
+    return out[:4]
 
 
 
@@ -6138,17 +6403,19 @@ def agents_hub(ws: Workspace = Depends(required_workspace)):
     body = f"""
 <h1>Agents</h1>
 <p class="sub">Each one audits a different thing somebody else calculated for
-   you, grouped by the process it belongs to. {len(live)} running,
-   {len(planned)} on the way.</p>
+   you, grouped by the process it belongs to. {len(live)} running{
+     f", {len(planned)} on the way" if planned else ""}.</p>
 
 {_flow_sections(picture, with_controls=True)}
 
 <div class="card tint" style="margin-top:22px">
   <h2>Why these and not others</h2>
   <p class="sub" style="margin:4px 0 0">Every agent here audits a number
-     somebody else worked out and had no reason to check. A planned one has no
-     implementation and cannot be switched on for anyone &mdash; a convincing
-     mock of a working reconciler is not a roadmap.</p>
+     somebody else worked out and had no reason to check, and every one of
+     them actually runs. Nothing is listed as coming soon: an agent with no
+     implementation would be shown as unavailable and could not be switched
+     on for anyone &mdash; a convincing mock of a working reconciler is not
+     a roadmap.</p>
 </div>"""
     return views.page("Agents", body, "agents", **shell)
 

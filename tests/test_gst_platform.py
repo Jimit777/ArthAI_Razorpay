@@ -669,3 +669,69 @@ def test_no_settlement_means_no_gateway_fee_credit_card(shop):
 
     page = shop.get(f"/itc/{key}").text
     assert "Also claimable: GST paid to Razorpay" not in page
+
+
+def test_dashboard_summary_matches_hand_computed_totals(shop):
+    """
+    The Home page's hero card and side panel read this one method - if the
+    numbers here are wrong, every merchant's first screen is wrong. Checked
+    against a real settlement (sold and audited) plus a clean and an
+    at-risk ITC purchase, not a mocked total.
+    """
+    import merchant.app as appmod
+
+    _sold_and_audited(shop)
+    _buy(shop, "Anand Textiles", rupees="1200.00", behaviour="correct")
+    _buy(shop, "Deepak Enterprises", rupees="800.00", behaviour="not_filed")
+    _reconcile(shop)
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        summary = led.dashboard_summary()
+
+        gross = led.conn.execute(
+            "SELECT COALESCE(SUM(p.amount),0) p FROM payments p"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " WHERE br.business_id = ?", (led.business_id,)).fetchone()["p"]
+        claimed_clean = led.conn.execute(
+            "SELECT COALESCE(SUM(claimed_tax),0) c FROM itc_findings"
+            " WHERE business_id = ? AND exception_code = 'CLAIM_CLEAN'",
+            (led.business_id,)).fetchone()["c"]
+        at_risk = led.conn.execute(
+            "SELECT COALESCE(SUM(money_at_stake),0) m FROM itc_findings"
+            " WHERE business_id = ? AND exception_code = 'SUPPLIER_NOT_FILED'",
+            (led.business_id,)).fetchone()["m"]
+
+    assert summary["gross_paise"] == gross > 0
+    assert summary["net_paise"] == (summary["gross_paise"] - summary["fee_paise"]
+                                    - summary["tax_paise"])
+    assert summary["itc_safe_paise"] == claimed_clean > 0
+    assert summary["itc_at_risk_paise"] == at_risk > 0
+
+
+def test_dashboard_summary_is_scoped_to_one_business(tmp_path):
+    """A second business with no runs at all must see zeros, not the first
+    business's totals - the same scoping guarantee every other cross-run
+    query in this file carries."""
+    from merchant.ledger import Ledger
+
+    led = Ledger(str(tmp_path / "two.db"))
+    first = led.businesses.create("Shop One")
+    second = led.businesses.create("Shop Two")
+
+    led.business_id = first
+    summary_first_empty = led.dashboard_summary()
+    led.business_id = second
+    summary_second = led.dashboard_summary()
+    led.close()
+
+    assert summary_first_empty == summary_second == {
+        "gross_paise": 0, "fee_paise": 0, "tax_paise": 0, "net_paise": 0,
+        "bank_credited_paise": 0, "recoverable_paise": 0,
+        "itc_safe_paise": 0, "itc_at_risk_paise": 0,
+        # The counting cards' figures, zero for a business with no runs -
+        # a real zero, which the card renders as "nothing here yet".
+        "payment_count": 0, "method_count": 0, "method_mix": [],
+        "customer_count": 0, "customer_registered": 0,
+        "vendor_count": 0, "vendor_overbilled_paise": 0,
+    }

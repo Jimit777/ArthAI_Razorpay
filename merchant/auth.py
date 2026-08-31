@@ -93,7 +93,12 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   salt          TEXT NOT NULL,
   is_operator   INTEGER DEFAULT 0,
-  created_at    INTEGER
+  created_at    INTEGER,
+  -- 'password' or 'google'. A Google account has no password anyone can
+  -- use: password_hash holds random bytes no scrypt digest will ever match,
+  -- so the ordinary login path fails closed for it without a special case.
+  auth_provider TEXT DEFAULT 'password',
+  google_sub    TEXT
 );
 
 -- Only the HASH of a session token is stored, for the same reason the password
@@ -139,6 +144,17 @@ def verify_password(password: str, expected_hash: str, salt: str) -> bool:
     return hmac.compare_digest(candidate, expected_hash)
 
 
+def _add_column(conn, table: str, column: str, ddl: str) -> None:
+    """
+    Add a column to an existing table, once. Same helper, same reasoning as
+    businesses.py's - duplicated rather than imported to keep the auth
+    layer free of a dependency on the business layer.
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -149,6 +165,14 @@ class Auth:
     def __init__(self, conn):
         self.conn = conn
         self.conn.executescript(AUTH_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS silently does nothing on a database that
+        # predates these two columns, so they are added separately - and
+        # before the index that depends on one of them exists.
+        _add_column(conn, "users", "auth_provider", "TEXT DEFAULT 'password'")
+        _add_column(conn, "users", "google_sub", "TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub"
+            " ON users(google_sub) WHERE google_sub IS NOT NULL")
         self.conn.commit()
 
     # --- accounts ---------------------------------------------------------
@@ -187,6 +211,64 @@ class Auth:
         self.conn.commit()
         return User(user_id, email, name.strip() or email.split("@")[0],
                     bool(is_operator))
+
+    def upsert_google_user(self, sub: str, email: str, name: str = "") -> User:
+        """
+        Find or create the account behind a verified Google identity.
+
+        Three cases, in order:
+
+        1. We have seen this Google `sub` before - that is the account, even
+           if the person has since changed the email address on it. `sub` is
+           Google's stable identifier; email is not.
+        2. A password account already exists on that email address. It gets
+           LINKED, not duplicated. This is only safe because the caller has
+           already established `email_verified` (google_auth.validate_claims
+           refuses otherwise): Google has proved the person controls that
+           mailbox, which is the same bar a password reset would clear. An
+           unverified address here would be an account-takeover hole.
+        3. Nobody matches - create a new account.
+
+        The created account gets random bytes for password_hash and salt, so
+        no password can ever authenticate as it. That is deliberate: the
+        ordinary login path then fails closed for Google accounts with no
+        special-casing in login() to forget.
+        """
+        email = (email or "").strip().lower()
+        sub = (sub or "").strip()
+        if not sub or not email:
+            raise ValueError("a Google identity needs both a sub and an email")
+
+        row = self.conn.execute(
+            "SELECT * FROM users WHERE google_sub = ?", (sub,)).fetchone()
+        if row is not None:
+            return self._user(row)
+
+        existing = self.by_email(email)
+        if existing is not None:
+            self.conn.execute(
+                "UPDATE users SET google_sub = ? WHERE user_id = ?",
+                (sub, existing["user_id"]))
+            self.conn.commit()
+            return self._user(self.conn.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (existing["user_id"],)).fetchone())
+
+        # First account on a fresh install still becomes the operator, the
+        # same rule register() applies - somebody has to be able to reach
+        # /admin, and signing in with Google is no different.
+        is_operator = not self.any_users()
+        user_id = f"usr_{secrets.token_hex(6)}"
+        unusable_hash, unusable_salt = secrets.token_hex(32), secrets.token_hex(16)
+        display = (name or "").strip() or email.split("@")[0]
+        self.conn.execute(
+            "INSERT INTO users (user_id, email, name, password_hash, salt,"
+            " is_operator, created_at, auth_provider, google_sub)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (user_id, email, display, unusable_hash, unusable_salt,
+             int(is_operator), int(time.time()), "google", sub))
+        self.conn.commit()
+        return User(user_id, email, display, bool(is_operator))
 
     def by_email(self, email: str):
         return self.conn.execute(

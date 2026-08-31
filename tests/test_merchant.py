@@ -596,7 +596,11 @@ def test_the_live_agents_are_exactly_the_implemented_ones():
     from merchant.catalog import all_agents, live_agents
 
     assert {a.id for a in live_agents()} == IMPLEMENTED
-    assert len(all_agents()) > len(IMPLEMENTED), "the roadmap should be visible"
+    # Nothing is advertised as planned any more - the TDS Credit Tracker was
+    # withdrawn rather than shipped as a roadmap promise. Every catalogued
+    # agent must therefore be one that actually runs.
+    assert {a.id for a in all_agents()} == IMPLEMENTED, (
+        "a catalogued agent has no implementation behind it")
 
 
 def test_a_live_agent_actually_has_something_to_run():
@@ -764,27 +768,57 @@ def test_the_overview_is_not_a_form(client):
     client.post("/settle")
 
     page = client.get("/").text
-    assert "recoverable from your gateway" in page
+    # The hero card's own final stage - distinctive to the waterfall, where
+    # a bare "Payments" (its heading) also appears in navigation and prose.
+    assert "Net Settled" in page
     assert "Needs your decision" in page
     assert "Take payment" not in page
 
 
 def test_the_front_door_belongs_to_no_single_agent(client):
     """
-    It used to carry an "Ask the auditor" box and a table of settlements -
-    the settlement agent's dashboard wearing the name "Overview". With a
-    second agent live that stopped being a simplification.
+    It used to carry an unconditional "Ask the auditor" box and a table of
+    settlements - the settlement agent's dashboard wearing the name
+    "Overview". With a second agent live that stopped being a simplification.
+    The embedded ask box has since come back deliberately (see the test
+    below), but only once there is something audited for it to answer from,
+    and visibly scoped to settlements alone - it still does not own the page.
     """
     _start(client)
     client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
     client.post("/settle")
 
     page = client.get("/").text
-    assert "Ask the auditor" not in page, "an agent-specific tool on the hub"
+    # No audit has run yet, so the (settlement-only) ask box has nothing to
+    # answer from and stays off the page entirely - never a box promising an
+    # answer it cannot give.
     assert 'action="/ask"' not in page
     # Both agents are represented, neither owns the page.
     assert "Settlement Deduction Auditor" in page
     assert "GST Input Credit Reconciler" in page
+
+
+def test_the_ask_box_appears_once_something_is_audited_and_stays_scoped(client):
+    """The other half of the story above: once a real audit exists, the
+    embedded box does appear - but its own scope line says plainly it only
+    answers settlement questions, so Home never implies a wider reach than
+    the box actually has."""
+    _start(client)
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    run_id = client.post("/settle", follow_redirects=False
+                         ).headers["location"].rsplit("/", 1)[-1]
+    client.post(f"/audit/{run_id}", data={})
+    import time as _time
+
+    deadline = _time.time() + 30
+    while _time.time() < deadline:
+        if client.get(f"/audit/{run_id}/status").json().get("state") != "running":
+            break
+        _time.sleep(0.05)
+
+    page = client.get("/").text
+    assert 'action="/ask"' in page
+    assert "settlement questions only" in page
 
 
 # --- the four business-process flows --------------------------------------
@@ -1333,12 +1367,107 @@ def test_the_setup_tab_folded_into_the_tab_it_configures(client):
     assert "Connect a GST filing-status API" in page
 
 
-def test_the_hub_shows_planned_agents_without_pretending(client):
+def test_a_returning_user_with_no_cookie_still_lands_in_their_business(client):
+    """
+    Regression, and an expensive one. The current business lived only in a
+    cookie, so a new browser, a private window, cleared cookies or a first
+    sign-in through Google all arrived with none - and the front door read
+    that as "this user has no businesses" and offered to create one. People
+    with several businesses were shown "create your first business" and made
+    duplicates, which is exactly what happened in the real database.
+    """
+    _start(client)  # signs up and creates "Test Shop"
+
+    # Same signed-in user, brand-new browser: session intact, no business
+    # cookie. This is the exact shape of the bug.
+    client.cookies.delete("business_id")
+    page = client.get("/").text
+
+    assert "set up your first business" not in page.lower(), (
+        "an existing owner was offered the create-your-first-business wall")
+    assert "Test Shop" in page, "did not land in the business they own"
+
+
+def test_the_fallback_business_is_remembered_not_recomputed(client):
+    """Falling back should also set the cookie, so the business selector and
+    the page agree for the rest of the session."""
+    _start(client)
+    client.post("/businesses", data={"name": "Meera's Boutique"})
+    client.cookies.delete("business_id")
+
+    response = client.get("/")
+
+    assert response.cookies.get("business_id"), "the fallback was not persisted"
+
+
+def test_a_cookie_for_an_archived_business_falls_back_instead_of_stranding(client):
+    """Archiving the business you were last in must not look like losing
+    every business you have."""
+    _start(client)
+    client.post("/businesses", data={"name": "Kept"})
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        kept = [b for b in led.businesses.all() if b["name"] == "Kept"][0]
+    client.post("/businesses", data={"name": "Archived One"})
+
+    with appmod.ledger() as led:
+        gone = [b for b in led.businesses.all()
+                if b["name"] == "Archived One"][0]["business_id"]
+        led.businesses.archive(gone)
+
+    # The cookie still points at the archived one.
+    client.cookies.set("business_id", gone)
+    page = client.get("/").text
+
+    assert "set up your first business" not in page.lower()
+    assert kept["name"] in page
+
+
+def test_an_empty_workspace_names_the_account_it_belongs_to(client):
+    """
+    Regression. Signing in with a second Google account lands on this
+    screen with no businesses, which reads as "my data is gone" unless the
+    page says which identity it is showing. It must name the address and
+    offer the way back out.
+    """
+    client.post("/signup", data={"name": "Jimit",
+                                 "email": "second@example.com",
+                                 "password": "a-long-password"})
+
+    page = client.get("/").text
+
+    assert "second@example.com" in page, "the signed-in account is not named"
+    assert "different account" in page
+    assert 'href="/logout"' in page
+
+
+def test_the_empty_workspace_lists_every_live_agent_not_just_one(client):
+    """It used to print live[0] alone - one arbitrary agent standing in for
+    the whole platform, whichever sorted first."""
+    client.post("/signup", data={"name": "Jimit",
+                                 "email": "third@example.com",
+                                 "password": "a-long-password"})
+
+    page = client.get("/").text
+
+    from merchant.catalog import all_agents
+    for spec in [a for a in all_agents() if a.is_live]:
+        assert spec.name in page, f"{spec.name} is missing from the welcome"
+
+
+def test_the_hub_advertises_nothing_it_cannot_run(client):
+    """
+    The roadmap is empty on purpose (the TDS Credit Tracker was withdrawn,
+    not shipped as a promise), so the hub must show no "coming soon" card at
+    all - while still stating the policy that an unimplemented agent would be
+    unavailable to everyone.
+    """
     _start(client)
     page = client.get("/agents").text
-    assert "Coming soon" in page
+    assert "Coming soon" not in page
     assert "Income Management" in page
-    assert "cannot be switched on for anyone" in page
+    assert "could not be switched\n     on for anyone" in page or \
+           "could not be switched" in page
 
 
 def test_the_hub_carries_the_toggle_home_does_not(client):
@@ -1796,3 +1925,127 @@ def test_gateway_fee_credit_is_scoped_to_one_business(led, tmp_path):
 
     assert result["paise"] == 0, (
         "another business's gateway fee GST leaked through")
+
+
+# --- the Home dashboard's counting cards and Insights panel -----------------
+
+from merchant import views  # noqa: E402
+
+
+def _summary(**over):
+    """A dashboard_summary()-shaped dict, zeroed, with overrides applied."""
+    base = {
+        "gross_paise": 0, "fee_paise": 0, "tax_paise": 0, "net_paise": 0,
+        "bank_credited_paise": 0, "recoverable_paise": 0,
+        "itc_safe_paise": 0, "itc_at_risk_paise": 0,
+        "payment_count": 0, "method_count": 0, "method_mix": [],
+        "customer_count": 0, "customer_registered": 0,
+        "vendor_count": 0, "vendor_overbilled_paise": 0,
+    }
+    base.update(over)
+    return base
+
+
+def test_the_counting_cards_show_the_real_counts():
+    """Transactions, Customers and Vendors each state a real count off a
+    real table, including the money figure the vendor agent found."""
+    html = views.dashboard_bottom(_summary(
+        payment_count=14, method_count=3,
+        customer_count=8, customer_registered=5,
+        vendor_count=10, vendor_overbilled_paise=1875570,
+    ), [])
+
+    assert "Transactions" in html and ">14<" in html
+    assert "across 3 payment methods" in html
+    assert "Customers" in html and ">8<" in html
+    assert "5 GST-registered, 3 not" in html
+    assert "Vendors" in html and ">10<" in html
+    assert "18,755.70 overbilled" in html
+
+
+def test_a_counting_card_with_nothing_behind_it_says_so():
+    """A business that has never run an agent gets an honest "nothing yet",
+    never a zero dressed up as a real measurement."""
+    html = views.dashboard_bottom(_summary(), [])
+
+    assert "no settlements recorded yet" in html
+    assert "no sales invoices loaded yet" in html
+    assert "no supplier invoices checked yet" in html
+
+
+def test_the_insights_panel_does_not_nest_anchors():
+    """Regression: the panel used to be an <a> wrapping the runner-up rows,
+    which are themselves <a>s. Nested anchors are invalid HTML - the parser
+    closes the outer one early and ejects the rest of the card out of it,
+    which is exactly what it did on screen."""
+    html = views.insights_panel([
+        {"agent": "Settlement", "headline": "Rs 720.92",
+         "subtext": "recoverable overcharges", "tone": "danger",
+         "href": "/agents/settlement", "urgency": 72092},
+        {"agent": "Payout timing", "headline": "Rs 131.16",
+         "subtext": "float cost", "tone": "warn",
+         "href": "/agents/payout-timing", "urgency": 13116},
+    ])
+
+    # The panel itself must not be an anchor while it contains anchors.
+    assert not html.strip().startswith("<a")
+    assert 'class="card insights-panel' in html
+    assert html.count("<a ") == 2, (
+        "expected exactly the lead link and one runner-up row")
+    assert "Payout timing" in html
+
+
+def test_the_insights_panel_is_calm_when_nothing_is_wrong():
+    """No findings is a real, reassuring answer - not an empty state to
+    paper over with a placeholder."""
+    html = views.insights_panel([])
+    assert "Nothing is waiting on you" in html
+    assert "<a " not in html
+
+
+def test_insight_candidates_are_capped_at_four_and_sorted_by_urgency(led):
+    """Seeds three agents' real demo data plus a hand-planted fourth (a
+    payout-timing run has no demo seeder of its own to call directly), and
+    checks the row that comes back is the ranked, capped list the Home page
+    needs - not just "some list"."""
+    from types import SimpleNamespace
+
+    import merchant.app as appmod
+
+    led.seed_vendor_terms_demo(40)
+    led.seed_chargeback_demo(30)
+    led.conn.execute(
+        "INSERT INTO business_payout_timing_runs (run_id, business_id,"
+        " n_settled, total_float_cost, created_at) VALUES"
+        " ('pt_1', ?, 10, 999999900, 0)", (led.business_id,))
+    led.conn.commit()
+
+    ws = SimpleNamespace(business_id=led.business_id)
+    summary = led.dashboard_summary()
+    candidates = appmod._insight_candidates(led, ws, summary)
+
+    assert 1 <= len(candidates) <= 4
+    urgencies = [c["urgency"] for c in candidates]
+    assert urgencies == sorted(urgencies, reverse=True), \
+        "candidates must be worst-first"
+    # The hand-planted payout-timing float cost is deliberately the largest
+    # figure of anything plantable here, so it has to lead.
+    assert candidates[0]["agent"] == "Payout timing"
+    assert {c["agent"] for c in candidates} <= {
+        "Settlement", "Suppliers", "Vendor terms", "Chargebacks",
+        "Payout timing", "Three-way recon", "Cash forecast"}
+
+
+def test_an_agent_with_nothing_worth_flagging_contributes_no_candidate(led):
+    """A vendor_terms run where every line was clean would have a run to
+    look at but nothing to headline - it must not appear as an empty or
+    zero-value card."""
+    from types import SimpleNamespace
+
+    import merchant.app as appmod
+
+    ws = SimpleNamespace(business_id=led.business_id)
+    summary = led.dashboard_summary()
+    candidates = appmod._insight_candidates(led, ws, summary)
+
+    assert candidates == [], "a business with no runs at all has nothing to show"

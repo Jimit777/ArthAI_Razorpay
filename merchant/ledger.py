@@ -3116,6 +3116,113 @@ class Ledger:
         return {"paise": row["paise"], "display": rules.rupees(row["paise"]),
                 "count": row["n"]}
 
+    def dashboard_summary(self) -> dict:
+        """
+        The cross-run totals the Home page's hero card needs, in one call -
+        gross sales through gateway deductions to what actually landed, plus
+        the two GST ITC figures the side panel shows alongside them.
+
+        Every settlement-side figure is summed across EVERY run this
+        business has, not one run at a time - `payments`/`settlement_lines`/
+        `bank_credits` (engine/store.py) carry no business_id of their own,
+        only run_id, so each join goes through business_runs exactly the way
+        gateway_fee_credit() above already does. `itc_findings` carries
+        business_id directly, no join needed.
+
+        `recoverable_paise` is the same `action = 'dispute'` formula
+        Store.totals() already computes one run at a time, widened here to
+        every run - the Home page used to get this by summing that per-run
+        figure in a loop; this is the same number from one query instead.
+        """
+        gross = self.conn.execute(
+            "SELECT COALESCE(SUM(p.amount), 0) paise FROM payments p"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " WHERE br.business_id = ?", (self._scoped(),)).fetchone()["paise"]
+
+        deducted = self.conn.execute(
+            "SELECT COALESCE(SUM(sl.fee), 0) fee, COALESCE(SUM(sl.tax), 0) tax"
+            " FROM settlement_lines sl JOIN business_runs br"
+            " ON br.run_id = sl.run_id"
+            " WHERE br.business_id = ? AND sl.type = 'payment'",
+            (self._scoped(),)).fetchone()
+
+        credited = self.conn.execute(
+            "SELECT COALESCE(SUM(bc.amount), 0) paise FROM bank_credits bc"
+            " JOIN business_runs br ON br.run_id = bc.run_id"
+            " WHERE br.business_id = ?", (self._scoped(),)).fetchone()["paise"]
+
+        recoverable = self.conn.execute(
+            "SELECT COALESCE(SUM(v.money_at_stake), 0) paise FROM variances v"
+            " JOIN business_runs br ON br.run_id = v.run_id"
+            " WHERE br.business_id = ? AND v.action = 'dispute'",
+            (self._scoped(),)).fetchone()["paise"]
+
+        from engine.gst.taxonomy import AT_RISK, NO_ACTION
+
+        itc_safe = self.conn.execute(
+            "SELECT COALESCE(SUM(claimed_tax), 0) paise FROM itc_findings"
+            f" WHERE business_id = ? AND exception_code IN"
+            f" ({','.join('?' * len(NO_ACTION))})",
+            (self._scoped(), *(str(c) for c in NO_ACTION))).fetchone()["paise"]
+
+        itc_at_risk = self.conn.execute(
+            "SELECT COALESCE(SUM(money_at_stake), 0) paise FROM itc_findings"
+            f" WHERE business_id = ? AND exception_code IN"
+            f" ({','.join('?' * len(AT_RISK))})",
+            (self._scoped(), *(str(c) for c in AT_RISK))).fetchone()["paise"]
+
+        # --- the counting cards: Transactions, Customers, Vendors ----------
+        #
+        # Each is a real count off a real table, never a derived-looking
+        # number with nothing behind it. Where a business has never used the
+        # agent that owns a table, the count is simply 0 and the card says
+        # so - see views.stat_card()'s empty branch.
+
+        txn = self.conn.execute(
+            "SELECT COUNT(*) n, COUNT(DISTINCT p.method) methods FROM payments p"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " WHERE br.business_id = ?", (self._scoped(),)).fetchone()
+
+        # Method mix drives the Payments card's little distribution strip.
+        method_mix = [
+            (r["method"] or "unknown", r["n"]) for r in self.conn.execute(
+                "SELECT p.method, COUNT(*) n FROM payments p"
+                " JOIN business_runs br ON br.run_id = p.run_id"
+                " WHERE br.business_id = ? GROUP BY p.method"
+                " ORDER BY n DESC", (self._scoped(),)).fetchall()]
+
+        # Customers come off the sales-invoice side (the GST output-tax
+        # agent's own source table), which is the only place this product
+        # ever learns a buyer's identity - `payments` carries no buyer at all.
+        cust = self.conn.execute(
+            "SELECT COUNT(DISTINCT buyer_name) n,"
+            " COUNT(DISTINCT CASE WHEN COALESCE(buyer_gstin, '') <> ''"
+            "   THEN buyer_name END) registered"
+            " FROM live_sale_invoices WHERE business_id = ?",
+            (self._scoped(),)).fetchone()
+
+        vend = self.conn.execute(
+            "SELECT COUNT(DISTINCT supplier_gstin) n,"
+            " COALESCE(SUM(CASE WHEN code = 'OVERBILLED'"
+            "   THEN money_at_stake_paise ELSE 0 END), 0) overbilled"
+            " FROM vendor_terms_findings WHERE business_id = ?",
+            (self._scoped(),)).fetchone()
+
+        fee_paise, tax_paise = deducted["fee"], deducted["tax"]
+        return {
+            "gross_paise": gross, "fee_paise": fee_paise, "tax_paise": tax_paise,
+            "net_paise": gross - fee_paise - tax_paise,
+            "bank_credited_paise": credited,
+            "recoverable_paise": recoverable,
+            "itc_safe_paise": itc_safe, "itc_at_risk_paise": itc_at_risk,
+            "payment_count": txn["n"], "method_count": txn["methods"],
+            "method_mix": method_mix,
+            "customer_count": cust["n"],
+            "customer_registered": cust["registered"],
+            "vendor_count": vend["n"],
+            "vendor_overbilled_paise": vend["overbilled"],
+        }
+
     def load_batch(self, run_id: str, rate_card: dict) -> Optional[Batch]:
         """
         Rebuild a stored settlement so it can be re-audited without re-entering it.

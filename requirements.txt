@@ -6,3 +6,4 @@ python-multipart
 pytest
 cryptography
 openpyxl
+python-dotenv

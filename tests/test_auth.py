@@ -379,7 +379,9 @@ def test_a_stale_business_cookie_is_not_access(client):
 
     # no workspace resolves, so the overview falls back to "create one"
     page = client.get("/").text
-    assert "Set up your first business" in page
+    assert 'action="/businesses"' in page, "no create-a-business form"
+    assert "set up your first business" in page.lower()
+    assert "Theirs" not in page, "the other account's business leaked through"
     assert "Theirs" not in page
 
 
