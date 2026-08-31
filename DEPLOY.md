@@ -26,17 +26,23 @@ Render runs one ordinary long-lived process, so neither has to be rebuilt.
 1. Go to <https://dashboard.render.com/blueprints> and sign in with GitHub.
 2. **New Blueprint Instance** → pick `Jimit777/settlement-auditor`.
    Render reads `render.yaml` and proposes one web service, `ledgerline`.
-3. It will ask for the values marked `sync: false`. Fill in:
+3. It will ask for the values marked `sync: false`:
 
-   | Variable | Value |
+   | Variable | What it is |
    |---|---|
-   | `ANTHROPIC_API_KEY` | your Anthropic key (`sk-ant-...`) |
-   | `LEDGERLINE_SECRET_KEY` | any long random string — see below |
-   | `GOOGLE_CLIENT_ID` | `895602690517-...apps.googleusercontent.com` |
-   | `GOOGLE_CLIENT_SECRET` | your current `GOCSPX-...` |
-   | `GOOGLE_REDIRECT_URI` | `https://<your-app>.onrender.com/auth/google/callback` |
+   | `ANTHROPIC_API_KEY` | powers the agents; without it every run fails |
+   | `LEDGERLINE_SECRET_KEY` | encrypts stored gateway credentials |
+   | `GOOGLE_CLIENT_ID` | public half of Google sign-in |
+   | `GOOGLE_CLIENT_SECRET` | private half — treat like a password |
+   | `GOOGLE_REDIRECT_URI` | where Google returns people after sign-in |
 
-   Generate the secret key with:
+   > **The actual values are in `.env.render` in this folder, not here.**
+   > This file is committed and the repository is public, so real keys must
+   > never be written into it. `.env.render` is gitignored and exists purely
+   > to be copied from. Open it, paste each value into Render, and leave it
+   > on your machine.
+
+   If you need a fresh `LEDGERLINE_SECRET_KEY`:
 
    ```bash
    python3 -c "import secrets; print(secrets.token_urlsafe(48))"

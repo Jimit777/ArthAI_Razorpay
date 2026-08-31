@@ -16,6 +16,8 @@ razorpay_samples/
 merchant.db
 demo_run.json
 
-# Encryption keys never live in the repo.
+# Secrets never live in the repo. The glob matters: .env alone would let
+# .env.render, .env.local and friends be committed by accident.
 .env
+.env.*
 *.key
