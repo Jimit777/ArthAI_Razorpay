@@ -115,9 +115,15 @@ once `/healthz` passes, so a broken build does not replace a working one.
 Read the log in the Render dashboard. The usual causes:
 
 - **`ModuleNotFoundError`** — a dependency is missing from `requirements.txt`.
-- **`unable to open database file`** — `AUDITOR_DB` points somewhere the app
-  cannot write. The app creates the parent directory itself, so this normally
-  means a disk is configured but not mounted at the same path.
+- **`/healthz` returns 503 with `unable to open database file`** — `AUDITOR_DB`
+  points somewhere the app cannot write. The response names the path it tried.
+
+  **Removing a variable from `render.yaml` does not remove it from Render.**
+  Once a value has been synced, it lives in the service's Environment and stays
+  there; deleting the line only stops it being declared. Delete the row in
+  **Environment** in the dashboard as well. This cost one deploy: `AUDITOR_DB`
+  was set to `/var/data/merchant.db` by the first sync, the disk it refers to
+  was never enabled, and the variable outlived its removal from this file.
 - **`redirect_uri_mismatch` on sign-in** — `GOOGLE_REDIRECT_URI` and the entry
   in the Google console are not byte-for-byte identical. Check `https` and any
   trailing slash.

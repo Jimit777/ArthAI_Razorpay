@@ -354,7 +354,18 @@ def healthz():
         with ledger() as led:
             led.conn.execute("SELECT 1").fetchone()
     except Exception as exc:  # noqa: BLE001 - any failure here means unhealthy
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        # Name the path. "unable to open database file" alone sent one real
+        # deploy round in circles: the cause was a stale AUDITOR_DB left in
+        # the host's environment pointing at an unmounted disk, and the
+        # message gave no way to see that. Saying which path failed makes a
+        # misconfigured variable obvious from the health check alone.
+        return JSONResponse({
+            "ok": False,
+            "error": str(exc),
+            "database": DB,
+            "hint": ("the database path is not writable - check AUDITOR_DB, "
+                     "and that any disk it points at is actually mounted"),
+        }, status_code=503)
     return {"ok": True}
 
 
