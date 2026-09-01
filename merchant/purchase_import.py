@@ -283,7 +283,7 @@ def parse(data: bytes, filename: str) -> ImportResult:
 # merchant in Maharashtra would actually buy from, and the state codes are
 # the real ones - so the CGST/SGST versus IGST split is genuine rather than
 # arbitrary, and an inter-state supply looks like one.
-SAMPLE_REGISTER = """\
+_SAMPLE_REGISTER_TEMPLATE = """\
 Party Name,GSTIN of Supplier,Invoice No,Invoice Date,Taxable Value,CGST,SGST,IGST
 Deepak Packaging,24RWIZN6453L6ZT,DEE/1470,2026-08-10,400000,0,0,72000
 Deepak Packaging,24RWIZN6453L6ZT,DEE/5254,2026-08-18,400000,0,0,72000
@@ -316,6 +316,62 @@ Coimbatore Yarns,33QJAEU7258T1ZT,COI/439,2026-08-04,45000,0,0,8100
 Bhadohi Carpets,09GSLOD6294R2ZF,BHA/6388,2026-08-20,320000,0,0,57600
 Bhadohi Carpets,09GSLOD6294R2ZF,BHA/1600,2026-08-26,240000,0,0,43200
 """
+
+
+def _sample_register(today=None) -> str:
+    """
+    The sample register, with its invoice dates moved into the CURRENT month.
+
+    The dates in the template are written as August 2026 for readability, but
+    they are a shape rather than a fact: only the day-of-month carries meaning.
+    Each one is rewritten into the month this is called in, keeping its day.
+
+    This is not cosmetic. build_itc_batch passes `period=current_period()` -
+    today's month - and the detector raises `filed_in_later_period` only when a
+    supplier's filed period is later than that. A supplier filing late on an
+    August invoice files in September: run the demo in August and that is
+    genuinely later, run it in September and it is merely current, so the
+    late-filing case stops existing. This demo lost that entire category of
+    finding at midnight on 1 September 2026 with no code change. Anchoring the
+    dates to the run date rather than to a fixed month is what stops it
+    rotting again.
+
+    Days are clamped to the length of the target month, so a 31st survives
+    February rather than inventing a date.
+    """
+    import calendar
+    from datetime import date as _date
+
+    today = today or _date.today()
+    last_day = calendar.monthrange(today.year, today.month)[1]
+
+    out = []
+    for line in _SAMPLE_REGISTER_TEMPLATE.splitlines():
+        parts = line.split(",")
+        if len(parts) > 3 and parts[3].count("-") == 2:
+            try:
+                day = int(parts[3].rsplit("-", 1)[1])
+            except ValueError:
+                out.append(line)
+                continue
+            parts[3] = (f"{today.year}-{today.month:02d}-"
+                        f"{min(day, last_day):02d}")
+            line = ",".join(parts)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def __getattr__(name: str):
+    """
+    PEP 562 module-level attribute hook, so SAMPLE_REGISTER stays a plain
+    module name for its callers (including `SAMPLE_REGISTER.encode()`) while
+    being recomputed on every access. A module-level constant would freeze
+    the dates at import, and a server left running across a month boundary
+    would go on serving last month's - the exact failure being fixed.
+    """
+    if name == "SAMPLE_REGISTER":
+        return _sample_register()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # --- mode B: a filing history somebody assembled ---------------------------
@@ -635,6 +691,9 @@ def sample_filing_history(months: int = 36) -> str:
     """
     from engine.gst.filing_history import history_for
 
-    parsed = parse(SAMPLE_REGISTER.encode(), "sample.csv")
+    # _sample_register(), not SAMPLE_REGISTER: the module-level __getattr__
+    # below only fires for access from OUTSIDE this module, so the bare name
+    # does not resolve in here.
+    parsed = parse(_sample_register().encode(), "sample.csv")
     return filing_history_csv(
         history_for(g.supplier_gstin, months=months) for g in parsed.groups)

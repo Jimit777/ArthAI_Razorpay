@@ -1690,3 +1690,31 @@ def test_what_it_checked_reaches_the_drawer(shop):
     assert "Before deciding, it checked" in page
     assert "read their full filing history" in page
     assert "checked the Rule 37" in page
+
+
+def test_the_sample_register_follows_the_calendar():
+    """
+    Regression, found by the suite going red at midnight on 1 September 2026
+    with no code change.
+
+    build_itc_batch passes period=current_period() - today's month - and the
+    detector raises filed_in_later_period only when a supplier's filed period
+    is later than that. With the sample register's dates fixed to August, a
+    late filing landed in September: genuinely later during August, merely
+    current from the 1st onward, so an entire category of finding silently
+    stopped existing. The dates have to track the run date.
+    """
+    from datetime import date
+
+    from merchant.purchase_import import _sample_register
+
+    for when in (date(2026, 9, 15), date(2027, 1, 3), date(2027, 2, 8)):
+        rows = [l for l in _sample_register(when).splitlines()[1:] if l]
+        months = {l.split(",")[3][:7] for l in rows}
+        assert months == {f"{when.year}-{when.month:02d}"}, (
+            f"sample register did not follow {when}: {months}")
+
+        # February has no 30th. Clamping must shorten a day, never invent one.
+        days = [int(l.split(",")[3].rsplit("-", 1)[1]) for l in rows]
+        import calendar
+        assert max(days) <= calendar.monthrange(when.year, when.month)[1]
