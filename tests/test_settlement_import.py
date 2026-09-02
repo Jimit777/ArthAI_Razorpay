@@ -155,3 +155,81 @@ def test_imported_rows_are_audited_exactly_like_generated_ones(led):
     assert variances["pay_upi"].expected_fee < variances["pay_upi"].actual_fee, (
         "a UPI payment charged at a card rate was not flagged")
     assert variances["pay_card"].delta == 0, "a correctly priced card moved"
+
+
+# --- the Payments API fallback ---------------------------------------------
+
+def _api(**over) -> dict:
+    base = {"id": "pay_api1", "amount": 500_000, "status": "captured",
+            "captured": True, "method": "upi", "fee": 10_000, "tax": 1_800,
+            "created_at": 1_787_900_000, "order_id": "order_1",
+            "amount_refunded": 0, "international": False}
+    base.update(over)
+    return base
+
+
+def test_captured_payments_carry_everything_the_rate_check_needs():
+    """Test mode never settles, so this is the only real Razorpay data a test
+    account can ever produce."""
+    from merchant.settlement_import import batch_from_payments
+
+    batch = batch_from_payments(
+        [_api(method="card", card={"network": "Visa", "type": "credit"})],
+        {}).batch
+
+    payment = batch.records[0].payment
+    assert payment.method == "card"
+    assert payment.card_network == "visa", "nested card details were missed"
+    assert payment.card_type == "credit"
+    assert batch.records[0].settlement_lines[0].fee == 10_000
+
+
+def test_an_uncaptured_payment_is_skipped_and_named():
+    from merchant.settlement_import import batch_from_payments
+
+    result = batch_from_payments(
+        [_api(), _api(id="pay_api2", captured=False, status="authorized")], {})
+
+    assert result.payments == 1
+    assert any("pay_api2" in s for s in result.skipped)
+
+
+def test_the_payments_source_invents_no_settlement_date_or_bank_credit():
+    """
+    It answers "was I charged the right rate", not "did the money arrive".
+    A fabricated settled_at would let a timing agent read this and report
+    delays that were never measured.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    batch = batch_from_payments([_api()], {}).batch
+
+    assert batch.bank_credits == [], "invented a credit that never arrived"
+    line = batch.records[0].settlement_lines[0]
+    assert line.settled_at == 0 and not line.utr
+
+
+def test_a_vpa_is_not_treated_as_a_upi_reference():
+    """`vpa` is the payer's address. It says the rail was UPI, which `method`
+    already says - it is not the cross-field evidence rule 9 needs."""
+    from merchant.settlement_import import batch_from_payments
+
+    batch = batch_from_payments(
+        [_api(method="card", vpa="someone@okhdfcbank",
+              card={"network": "visa", "type": "credit"})], {}).batch
+
+    assert batch.records[0].payment.upi_reference is None
+
+
+def test_payments_from_the_api_audit_like_any_other_batch(led):
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    result = batch_from_payments([
+        _api(id="pay_upi", method="upi", amount=500_000, fee=10_000, tax=1_800),
+    ], card)
+    run_id = led.commit_settlement(result.batch)
+
+    variance = detect_batch(led.load_batch(run_id, card))[0]
+    assert variance.expected_fee < variance.actual_fee, (
+        "a UPI payment charged at a card rate was not flagged")

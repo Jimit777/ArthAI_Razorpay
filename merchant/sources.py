@@ -179,6 +179,38 @@ class Razorpay:
         return SyncResult(True, f"Read {len(rows)} settlement lines.",
                           len(settlements), len(payments), 0, 0, rows)
 
+    def captured_payments(self, count: int = 100) -> SyncResult:
+        """
+        Pull captured payments, which carry Razorpay's own `fee` and `tax`.
+
+        This exists because test mode never settles. The settlement recon
+        report is the richer source and stays the primary one, but on a test
+        account it is permanently empty - so an auditor that could only read
+        it could never run on real Razorpay data at all.
+
+        A captured payment states the amount, the instrument and what
+        Razorpay charged for it, which is every input the expected-value
+        engine needs. What it does NOT carry is a settlement date or a UTR,
+        so agents that measure settlement timing cannot use this: it answers
+        "was I charged the right rate", not "did the money arrive on time".
+        """
+        status, body = self.get(
+            f"/payments?count={min(count, 100)}")
+        if status != 200:
+            description = body.get("error", {}).get("description", str(status))
+            return SyncResult(False, f"Could not read payments: {description}")
+
+        rows = [r for r in body.get("items", [])
+                if r.get("captured") and r.get("status") == "captured"]
+        if not rows:
+            return SyncResult(
+                True,
+                "Connected, but no captured payments came back. A payment has "
+                "to complete through Checkout before it carries a fee.",
+                0, 0, 0, 0, [])
+        return SyncResult(True, f"Read {len(rows)} captured payments.",
+                          0, len(rows), 0, 0, rows)
+
     def invoices(self, count: int = 100) -> SyncResult:
         """
         Pull real outward invoices for the GST output-tax reconciler -

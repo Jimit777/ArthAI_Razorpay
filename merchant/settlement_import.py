@@ -66,6 +66,84 @@ def _text(value) -> Optional[str]:
     return text or None
 
 
+def batch_from_payments(rows, rate_card: dict) -> ImportResult:
+    """
+    Captured payments from the Payments API, as an auditable Batch.
+
+    The fallback for accounts whose settlement recon report is empty - which
+    on test mode is all of them, permanently. A captured payment carries the
+    amount, the instrument and Razorpay's own `fee` and `tax`, so the rate
+    check works in full.
+
+    It carries no settlement date and no UTR, and this does not invent
+    either. The settlement line is written with settled_at=0 and no UTR, and
+    the batch has no bank credits, because nothing here says when the money
+    arrived or whether it did. Agents that measure timing must not read this;
+    the rate and GST checks are unaffected, and those are what the auditor is
+    for.
+    """
+    result = ImportResult()
+    records = []
+
+    for row in rows or []:
+        payment_id = _text(row.get("id"))
+        if not payment_id:
+            result.skipped.append("a payment with no id")
+            continue
+        if not row.get("captured"):
+            result.skipped.append(f"{payment_id} (not captured)")
+            continue
+
+        amount = abs(_int(row.get("amount")))
+        order_id = _text(row.get("order_id")) or payment_id
+        record = Record(
+            record_id=payment_id, order_id=order_id,
+            created_at=_int(row.get("created_at")),
+            payment=Payment(
+                payment_id=payment_id, amount=amount,
+                method=(_text(row.get("method")) or "unknown").lower(),
+                # The Payments API nests card details rather than flattening
+                # them the way the recon report does.
+                card_network=(_text((row.get("card") or {}).get("network"))
+                              or "").lower() or None,
+                card_type=(_text((row.get("card") or {}).get("type"))
+                           or "").lower() or None,
+                is_international=bool(row.get("international")),
+                # `vpa` is the payer's UPI address, not an RRN. It says the
+                # rail was UPI, which `method` already says - it is not the
+                # cross-field evidence rule 9 needs, so it is not used as it.
+                upi_reference=None))
+
+        record.settlement_lines.append(SettlementLine(
+            entity_id=payment_id, settlement_id="", type="payment",
+            payment_id=payment_id, order_id=order_id, amount=amount,
+            fee=_int(row.get("fee")), tax=_int(row.get("tax")),
+            utr="", settled_at=0))
+
+        refunded = abs(_int(row.get("amount_refunded")))
+        if refunded:
+            result.refunds += 1
+            record.refund = Refund(f"rfnd_{payment_id}", payment_id, refunded,
+                                   record.created_at)
+            record.settlement_lines.append(SettlementLine(
+                entity_id=f"rfnd_{payment_id}", settlement_id="",
+                type="refund", payment_id=payment_id, order_id=order_id,
+                amount=-refunded, fee=0, tax=0, utr="", settled_at=0))
+
+        result.payments += 1
+        records.append(record)
+
+    if not records:
+        return result
+
+    # No bank credits: this source cannot say what reached the bank, and an
+    # empty list is the honest way to say so. Inventing one from the fees
+    # would make Layer 1 ("did the money arrive?") answer itself.
+    result.batch = Batch(records=records, bank_credits=[], seed=0,
+                         rate_card=rate_card)
+    return result
+
+
 def batch_from_recon(rows, rate_card: dict) -> ImportResult:
     """
     Turn recon rows into the same Batch the simulator produces, so nothing

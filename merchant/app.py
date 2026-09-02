@@ -1559,6 +1559,33 @@ def sync_razorpay(key_secret: str = Form(""),
         # message, and dropped - so the settlement auditor had nothing real to
         # audit and the connector proved only that the keys were valid.
         message = result.message
+        imported = None
+
+        if result.ok and not result.raw:
+            # The recon report is empty. On a test account it always will be -
+            # test mode does not settle - so rather than stopping at "nothing
+            # to audit", fall back to captured payments, which carry
+            # Razorpay's own fee and tax and answer the rate question in full.
+            # Said plainly in the message, because the two sources support
+            # different agents: this one has no settlement dates.
+            fallback = client.captured_payments()
+            if fallback.ok and fallback.raw:
+                from merchant.settlement_import import batch_from_payments
+
+                imported = batch_from_payments(fallback.raw, led.rate_card())
+                if imported.ok:
+                    run_id = led.commit_settlement(imported.batch)
+                    message = (
+                        f"No settlements yet, so {imported.payments} captured "
+                        f"payments were imported instead - enough to check "
+                        f"every rate and GST figure. Settlement timing needs "
+                        f"a settled account.")
+                    AccessLog(led.conn).record(
+                        Action.RUN_AUDIT, user=ws.user, business_id=resolved,
+                        target=run_id,
+                        detail=f"imported {imported.payments} captured "
+                               f"payments from Razorpay")
+
         if result.ok and result.raw:
             from merchant.settlement_import import batch_from_recon
 
