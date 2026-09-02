@@ -151,31 +151,51 @@ def the_gap(actual_fee: int, expected_fee: int, delta: int,
                        f"{rupees(fee_gap)} more than it should be.", at)
 
 
+# What each action means to the person reading, rather than the enum value
+# the code passes around. "my recommendation is to fix_books" is a database
+# column leaking onto the screen.
+_ACTION_WORDS = {
+    "dispute": "ask the gateway for this back",
+    "fix_books": "correct your books",
+    "dismiss": "leave this alone",
+    "escalate": "have a person look at it",
+}
+
+
 def evidence(rule: str, candidate: str, source: str, at=None) -> Line:
-    return line(SAY, f"The engine flagged this under {rule} - it looks like "
-                     f"{candidate}, argued from {source}.", at)
+    from merchant.views import code_label
+
+    # code_label, not .lower(): lowercasing the whole label turns
+    # "Zero MDR violation" into "zero mdr violation" and undoes the point.
+    label = code_label(candidate)
+    label = label[0].lower() + label[1:] if label[:2].isupper() is False else label
+    article = "an" if label[:1].lower() in "aeiou" else "a"
+    return line(SAY, f"{rule.capitalize()} says this looks like {article} "
+                     f"{label}, under {source}.", at)
 
 
 def weighing(at=None) -> Line:
-    return line(DO, "Weighing the evidence. This is the part arithmetic "
-                    "cannot do - two explanations can fit the same gap.", at)
+    return line(DO, "Two explanations could fit this gap. Choosing between "
+                    "them is my job, not the calculator's.", at)
 
 
 def tool_call(name: str, at=None) -> Line:
-    return line(TOOL, f"{name}() - checking that for myself before I say it.", at)
+    return line(TOOL, f"Checking {name}() myself before I say it.", at)
 
 
 def verdict(code: str, action: str, confidence: Optional[float], stake: int,
             tokens: int, seconds: float, at=None) -> Line:
-    sure = f"{confidence:.2f}" if confidence is not None else "-"
-    return line(OK, f"{code}. Confidence {sure}. {rupees(stake)} at stake, "
-                    f"and my recommendation is to {action}. "
-                    f"({tokens} tokens, {seconds:.0f}s)", at)
+    from merchant.views import code_label
+
+    sure = f"{confidence * 100:.0f}% sure" if confidence is not None else "unsure"
+    advice = _ACTION_WORDS.get(action, action.replace("_", " "))
+    return line(OK, f"{code_label(code)} - {rupees(stake)} at stake. "
+                    f"I would {advice}. ({sure}, {seconds:.0f}s)", at)
 
 
 def reviewed_clean(at=None) -> Line:
-    return line(SAY, "Every figure I just quoted traces back to the engine. "
-                     "I did not compute any of them.", at)
+    return line(SAY, "Checked: every figure above came from the calculator, "
+                     "not from me.", at)
 
 
 def reviewed_invented(figures: list[str], at=None) -> Line:
@@ -189,13 +209,14 @@ def reviewed_corrected(correction: str, at=None) -> Line:
 
 
 def classify_failed(error: str, at=None) -> Line:
-    return line(FAIL, f"I could not classify this one: {error[:110]}. "
-                      f"Escalating rather than assuming it is fine.", at)
+    return line(FAIL, f"I could not judge this one: {error[:110]}. "
+                      f"Sending it to a person rather than assuming it is "
+                      f"fine.", at)
 
 
 def gate(auto: int, queued: int, at=None) -> Line:
-    return line(DO, f"Applying the guardrails: {auto} I can close myself, "
-                    f"{queued} a person has to look at.", at)
+    return line(DO, f"Guardrails: {auto} I can close, {queued} "
+                    f"{'needs' if queued == 1 else 'need'} a person.", at)
 
 
 def held(payment_id: str, reason: str, at=None) -> Line:
@@ -203,14 +224,13 @@ def held(payment_id: str, reason: str, at=None) -> Line:
 
 
 def drafted(n: int, at=None) -> Line:
-    return line(OK, f"{n} dispute letter{'s' if n != 1 else ''} drafted. I wrote "
-                    f"the argument; the figures underneath were assembled from "
-                    f"the record, not by me.", at)
+    return line(OK, f"{n} dispute letter{'s' if n != 1 else ''} drafted. I "
+                    f"wrote the wording; the numbers came from the record.", at)
 
 
 def finished(at=None) -> Line:
-    return line(SAY, "Done. I have changed nothing - everything above is a "
-                     "proposal for a person to accept or reject.", at)
+    return line(SAY, "Done. Nothing was changed - every line above is a "
+                     "proposal for you to accept or reject.", at)
 
 
 # --- replaying a finished run --------------------------------------------

@@ -112,7 +112,10 @@ SHELL = """/* --- frame --------------------------------------------------------
 """
 
 COMPONENTS = """/* --- content ---------------------------------------------------------- */
-main { padding:20px 24px 60px; max-width:1120px }
+/* margin:0 auto centres the column inside its track. Without it the 1120px
+   cap left-aligns and every pixel of slack piles up on the right, which on a
+   wide screen reads as a broken layout rather than a measure. */
+main { padding:20px 24px 60px; max-width:1120px; margin:0 auto }
 h1 { font-size:18px; margin:0 0 2px; letter-spacing:-.02em; font-weight:640 }
 h2 { font-size:13px; margin:0 0 2px; letter-spacing:-.01em; font-weight:620 }
 .sub { color:var(--muted); font-size:12.3px; margin:0 0 12px }

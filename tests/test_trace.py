@@ -82,7 +82,7 @@ def test_the_trace_follows_the_pipeline(audited):
 
     order = ["Opening settlement", "reached the bank", "contract",
              "Checking every one", "settled by the rate card alone",
-             "need judgement", "Applying the guardrails"]
+             "need judgement", "Guardrails:"]
     positions = [text.index(phrase) for phrase in order]
     assert positions == sorted(positions), "the trace is out of order"
 
@@ -103,15 +103,14 @@ def test_the_tools_the_agent_called_are_shown(audited):
     led, run_id = audited
     lines = build(led.store, run_id, led.rate_card())
     tools = [line.text for line in lines if line.kind == "tool"]
-    assert any(t.startswith("rate_card_lookup()") for t in tools)
-    assert any(t.startswith("payment_detail()") for t in tools)
+    assert any("rate_card_lookup()" in t for t in tools)
+    assert any("payment_detail()" in t for t in tools)
 
 
 def test_the_review_step_is_reported(audited):
     led, run_id = audited
     text = _text(build(led.store, run_id, led.rate_card()))
-    assert "traces back to the engine" in text
-    assert "I did not compute any of them" in text
+    assert "came from the calculator, not from me" in text
 
 
 def test_a_correction_is_surfaced_as_a_warning(tmp_path):
@@ -155,8 +154,11 @@ def test_every_figure_appears_in_the_stored_record(audited):
     text = _text(build(led.store, run_id, led.rate_card()))
 
     stored = led.store.audit_trail(run_id)[0]
-    assert str(stored["output_tokens"]) in text
-    assert stored["exception_code"] in text
+    # The verdict now names the code in the form a person reads
+    # ("Zero MDR violation"), not the raw enum - but it is still derived
+    # from the stored code rather than written independently.
+    from merchant.views import code_label
+    assert code_label(stored["exception_code"]) in text
     for tool in json.loads(stored["tool_calls"]):
         assert tool in text
 
@@ -325,9 +327,9 @@ def test_pacing_comes_from_the_latency_that_was_measured(audited):
 
     entry = led.store.audit_trail(run_id)[0]
     weighing = next(i for i, l in enumerate(lines) if l.kind == "do"
-                    and "Weighing" in l.text)
+                    and "Two explanations" in l.text)
     verdict_at = next(i for i, l in enumerate(lines) if l.kind == "ok"
-                      and "Confidence" in l.text)
+                      and "% sure" in l.text)
     thinking = lines[verdict_at].offset - lines[weighing].offset
     # the gap across the model call reflects the recorded latency
     assert thinking >= entry["latency_ms"] * 0.5
