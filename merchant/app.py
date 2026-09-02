@@ -3325,12 +3325,10 @@ def gst_filing_page(ws: Workspace = Depends(required_workspace),
 </div>
 <div class="card">
   <h2>Demo Mode</h2>
-  <p class="sub" style="margin:6px 0 14px">A generated month of outward
-     sales, classified into B2B, B2CL and B2CS, with a missing e-invoice IRN
-     and an unconfigured HSN rate both planted so you can see how each is
-     handled - plus four prior filing periods, one clean, two locked (an
-     ordinary shortfall and wrongly-claimed ITC), one locked and large
-     enough to breach Rule 88C. One click builds all of it.</p>
+  <p class="sub" style="margin:6px 0 14px">A generated month of sales, plus
+     four earlier filing periods. Problems are planted on purpose &mdash; a
+     missing e-invoice, an unpriced HSN code, and periods locked by a
+     shortfall &mdash; so you can see how each is handled.</p>
   <form method="post" action="/agents/gst-filing/demo">
     <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
       color:var(--muted);margin-bottom:12px">

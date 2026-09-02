@@ -430,7 +430,7 @@ def test_the_page_says_the_history_is_simulated(shop):
     """
     page = shop.get("/agents/input-credit").text
     assert "Demo mode" in page
-    assert "Do not act on any of it against a real supplier" in page
+    assert "Do not act on" in page and "real supplier" in page
 
 
 def test_the_demo_warning_survives_onto_the_results(shop):
@@ -1217,7 +1217,7 @@ def test_demo_mode_asks_for_nothing(shop):
     page = shop.get(DEMO).text
     assert "Generate &amp; analyse demo data" in page
     assert 'type="file"' not in page
-    assert "Do not act on any of it against a real supplier" in page
+    assert "Do not act on" in page and "real supplier" in page
 
 
 def test_without_api_asks_for_history_then_the_register(shop):

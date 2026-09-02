@@ -1340,19 +1340,15 @@ def risk_demo_screen() -> str:
 <div class="src demo">
   <span class="src-dot"></span>
   <div><b>Demo mode &mdash; nothing here is your data</b>
-    <div class="src-what">A purchase register of eight suppliers, and 36 months
-      of GSTR-1 and GSTR-3B history for each of them, generated in the same
-      JSON the GST portal returns and read back through the same parser a live
-      connection uses. The arithmetic and the law are real; the companies and
-      their filing dates are not.
-      <b>Do not act on any of it against a real supplier.</b></div></div>
+    <div class="src-what">Eight invented suppliers with 36 months of filing
+      history. The law and the arithmetic are real; the companies are not.
+      <b>Do not act on this against a real supplier.</b></div></div>
 </div>
 
 <div class="card" style="text-align:center;padding:34px 24px">
   <h2 style="margin:0">See what this agent does</h2>
-  <p class="sub" style="margin:7px auto 18px;max-width:56ch">One click builds
-     the register and the filing history, scores every supplier, and opens the
-     results. Nothing is uploaded and nothing leaves this machine.</p>
+  <p class="sub" style="margin:7px auto 18px;max-width:56ch">Scores every
+     supplier and opens the results. Nothing leaves this machine.</p>
   <form method="post" action="/agents/input-credit/demo">
     <button style="font-size:14px;padding:12px 26px">
       Generate &amp; analyse demo data</button>
@@ -1658,12 +1654,9 @@ def recon_start_screen() -> str:
 <div class="card tint">
   <h2>Where the numbers come from</h2>
   <p class="sub" style="margin:4px 0 0;max-width:70ch">Fifty-five linked
-     records across the three sources, generated with known faults planted in
-     them &mdash; money that never arrived, credits short by an amount nobody
-     accounted for, gateway lines with no invoice reference, and one credit
-     that belongs to nobody. The generator returns the answer key, so the
-     match rate on the next screen is <b>measured against it</b> rather than
-     asserted.</p>
+     records with faults planted on purpose &mdash; money that never arrived,
+     short credits, lines with no invoice. Because we planted them, the match
+     rate on the next screen is <b>measured, not asserted</b>.</p>
 </div>"""
 
 
@@ -3275,17 +3268,15 @@ def cash_demo_screen() -> str:
 <div class="src demo">
   <span class="src-dot"></span>
   <div><b>Demo mode &mdash; this is a generated month</b>
-    <div class="src-what">A balance, three weeks of gateway settlements, a
-      payroll run, a tax instalment, rent, a cloud bill and eight vendor
-      invoices &mdash; with a cash crunch deliberately placed on day 14. The
-      arithmetic is real; the company is not.</div></div>
+    <div class="src-what">A generated month, with a cash crunch on day 14.
+      The arithmetic is real; the company is not.</div></div>
 </div>
 
 <div class="card" style="text-align:center;padding:34px 24px">
   <h2 style="margin:0">Thirty days forward</h2>
-  <p class="sub" style="margin:7px auto 18px;max-width:58ch">One click builds
-     the scenario, projects every day, finds the low point and asks the agent
-     which payment to move. Nothing is scheduled and nothing is paid.</p>
+  <p class="sub" style="margin:7px auto 18px;max-width:58ch">Projects thirty
+     days, finds the low point, and says which payment to move. Nothing is
+     scheduled or paid.</p>
   <form method="post" action="/agents/cash-forecaster/run">
     <input type="hidden" name="source" value="demo">
     <button style="font-size:14px;padding:12px 26px">
@@ -3430,18 +3421,16 @@ def vendor_terms_demo_screen(latest_link: str = "") -> str:
 <div class="src demo">
   <span class="src-dot"></span>
   <div><b>Demo mode &mdash; this is a generated purchase register</b>
-    <div class="src-what">Forty billed line items across six suppliers, and
-      a vendor rate card built to match &mdash; with a handful of items
-      deliberately billed above the contracted price. The arithmetic is
-      real; the suppliers are not.</div></div>
+    <div class="src-what">Forty line items from six invented suppliers, some
+      billed above contract. The arithmetic is real; the suppliers are
+      not.</div></div>
 </div>
 
 <div class="card" style="text-align:center;padding:34px 24px">
   <h2 style="margin:0">Check the batch</h2>
-  <p class="sub" style="margin:7px auto 18px;max-width:58ch">One click bills
-     forty line items, checks every one against the rate card, and drafts a
-     credit note request for every supplier who overcharged. Nothing is
-     sent.</p>
+  <p class="sub" style="margin:7px auto 18px;max-width:58ch">Checks every
+     line against the rate card and drafts a credit note for each overcharge.
+     Nothing is sent.</p>
   <form method="post" action="/agents/vendor-terms/run">
     <input type="hidden" name="tab" value="demo">
     <button style="font-size:14px;padding:12px 26px">Run Demo Mode</button>
@@ -3797,19 +3786,17 @@ def chargeback_demo_screen(latest_link: str = "") -> str:
 <div class="src demo">
   <span class="src-dot"></span>
   <div><b>Demo mode &mdash; this is a generated dispute batch</b>
-    <div class="src-what">Thirty disputes across UPI, RuPay and Razorpay's
-      own reason codes, with evidence planted complete, partial or missing
-      by design - and one reason code deliberately outside this build's
-      requirement table. The reason-code rules are real; the disputes are
-      not.</div></div>
+    <div class="src-what">Thirty invented disputes across real reason codes,
+      with evidence complete, partial or missing by design. The rules are
+      real; the disputes are not.</div></div>
 </div>
 
 <div class="card" style="text-align:center;padding:34px 24px">
   <h2 style="margin:0">Check the batch</h2>
   <p class="sub" style="margin:7px auto 18px;max-width:58ch">One click
-     checks every dispute's evidence against its reason code's real
-     requirement list, and drafts a representment letter for anything
-     with something on file. Nothing is submitted.</p>
+     checks each dispute's evidence against what its reason code actually
+     requires, and drafts a reply where there is something to argue with.
+     Nothing is submitted.</p>
   <form method="post" action="/agents/chargeback/run">
     <input type="hidden" name="tab" value="demo">
     <button style="font-size:14px;padding:12px 26px">Run Demo Mode</button>
