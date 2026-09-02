@@ -696,7 +696,8 @@ def test_a_new_business_is_sent_to_choose_a_data_source(client):
     page = client.get("/sources").text
     assert "Razorpay account" in page
     assert "Built-in simulator" in page
-    assert "not where sales happen" in page
+    # The page's job, not its wording: it must offer both sources.
+    assert "Where your settlements come from" in page
 
 
 def test_live_razorpay_keys_are_refused(client):
@@ -1503,8 +1504,7 @@ def test_the_hub_advertises_nothing_it_cannot_run(client):
     page = client.get("/agents").text
     assert "Coming soon" not in page
     assert "Income Management" in page
-    assert "could not be switched\n     on for anyone" in page or \
-           "could not be switched" in page
+    assert "not a roadmap" in page
 
 
 def test_the_hub_carries_the_toggle_home_does_not(client):
@@ -2086,3 +2086,41 @@ def test_an_agent_with_nothing_worth_flagging_contributes_no_candidate(led):
     candidates = appmod._insight_candidates(led, ws, summary)
 
     assert candidates == [], "a business with no runs at all has nothing to show"
+
+
+def test_the_queue_summarises_reasoning_instead_of_printing_all_of_it():
+    """
+    The Home queue was rendering every finding's full reasoning - over nine
+    hundred words of citation-dense argument on the front door, which buries
+    the one thing a summary list is for: deciding what to open. The full text
+    still lives on the page that exists to show it.
+    """
+    long_one = (
+        "This payment is recorded as method='card' yet carries a UPI "
+        "reference, which a genuine card payment does not have. The "
+        "arithmetic is clean - Rs 357.42 fee and Rs 64.34 GST are exactly "
+        "right for the 2.00% card slab. Priced as UPI it would have cost "
+        "Rs 71.48, a difference of Rs 285.94.")
+
+    out = views.summarise(long_one)
+
+    assert len(out.split()) <= 21
+    assert out.startswith("This payment is recorded")
+    assert "285.94" not in out, "summary ran past the first sentence"
+
+
+def test_summarising_does_not_break_on_decimals_or_citations():
+    """A bare split on "." cuts "Rs 357.42" and "s.10A" in half."""
+    assert views.summarise("Rs 357.42 was charged. Then more.") \
+        .startswith("Rs 357.42 was charged")
+    assert views.summarise("") == ""
+    assert views.summarise("No trailing punctuation") == "No trailing punctuation"
+
+
+def test_exception_codes_keep_their_acronyms():
+    """"Zero mdr violation" reads as a typo to the only people qualified to
+    judge this product."""
+    assert views.code_label("ZERO_MDR_VIOLATION") == "Zero MDR violation"
+    assert views.code_label("GST_MISMATCH") == "GST mismatch"
+    assert views.code_label("INSTRUMENT_MISLABEL") == "Instrument mislabel"
+    assert views.code_label("") == ""

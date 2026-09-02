@@ -1115,12 +1115,18 @@ def overview_page(user: User = Depends(current_user),
 
     # --- one queue, all agents ---------------------------------------------
     if decisions:
+        # The exception type leads; the reasoning is summarised beneath it.
+        # It used to be the other way round - a 140-word argument as the
+        # headline with the one scannable word ("instrument mislabel")
+        # demoted to grey subtext. The full reasoning is one click away, on
+        # the page built to show it.
         rows = "".join(f"""
       <tr>
         <td>{ui.badge(d["agent"], ui.TONE_BRAND)}</td>
-        <td>{views.esc(d["what"])}
+        <td><b style="font-weight:600">{views.esc(
+              views.code_label(d["why"]) or d["what"][:60])}</b>
           <div style="color:var(--muted);font-size:11.5px;margin-top:2px">
-            {views.esc(d["why"])}</div></td>
+            {views.esc(views.summarise(d["what"]))}</div></td>
         <td class="r">{rupees(d["amount"])}</td>
         <td class="r"><a class="btn ghost small" href="{views.esc(d["href"])}">
           Decide</a></td>
@@ -1135,23 +1141,17 @@ def overview_page(user: User = Depends(current_user),
   </table>
   <div style="padding:11px 16px;border-top:1px solid var(--line-2);
     color:var(--muted);font-size:11.5px">
-    Nothing here has been acted on. Every one is a proposal waiting for a
-    person, which is the only state an agent decision is ever allowed to reach
-    by itself.
+    Proposals only. Nothing is acted on until you say so.
   </div>
 </div>"""
     else:
         queue = ui.card(
-            '<p class="sub" style="margin:0">Nothing is waiting on you. '
-            'Findings the agents were confident about were closed on their '
-            'own; anything they were unsure about, or anything large, would '
-            'appear here instead.</p>',
+            '<p class="sub" style="margin:0">Nothing is waiting on you.</p>',
             title="Needs your decision")
 
     body = f"""
 <h1>{views.esc(shell["business"]["name"])}</h1>
-<p class="sub">Everything running across your books, and what is waiting on
-   you.</p>
+<p class="sub">What your agents found, and what needs you.</p>
 
 {dashboard}
 
@@ -1160,8 +1160,7 @@ def overview_page(user: User = Depends(current_user),
 <div style="margin-top:22px">{queue}</div>
 
 <div style="margin-top:9px">
-  <a class="btn ghost small" href="/agents">See every agent, including what is
-    coming</a>
+  <a class="btn ghost small" href="/agents">All agents</a>
 </div>"""
     return views.page("Home", body, "home", **shell)
 
@@ -1398,19 +1397,16 @@ def sources_page(ws: Workspace = Depends(required_workspace),
     </form>
     <p class="sub" style="margin:12px 0 0;font-size:12px">{storage_note}</p>
     <p class="sub" style="margin:8px 0 0;font-size:12px">
-      Razorpay test mode does not settle, so a test connection will usually
-      find zero settlements. The connector is real; there is simply nothing
-      behind it until this points at a live account.</p>"""
+      Test mode does not settle, so expect zero settlements until this points
+      at a live account.</p>"""
 
     simulator_inner = """
     <form method="post" action="/sources/simulator">
       <button class="ghost">Use the simulator</button>
     </form>
     <p class="sub" style="margin:12px 0 0;font-size:12px">
-      Adds a Simulator page where you record sales and settle them, so the
-      auditor has real settlement lines to work on. Everything downstream is
-      identical either way &mdash; the auditor cannot tell the difference, and
-      that is the point.</p>"""
+      Record sales and settle them locally. The auditor cannot tell the
+      difference, which is the point.</p>"""
 
     status = ""
     if current and current["last_message"]:
@@ -1457,8 +1453,7 @@ def sources_page(ws: Workspace = Depends(required_workspace),
     body = f"""
 {banner}{status}
 <h1>Data source</h1>
-<p class="sub">This platform is not where sales happen &mdash; it is where they
-   get checked afterwards. Choose where its settlements come from.</p>
+<p class="sub">Where your settlements come from.</p>
 
 {card(SourceKind.RAZORPAY, razorpay_inner)}
 {sync}
@@ -1477,9 +1472,8 @@ def sources_page(ws: Workspace = Depends(required_workspace),
   {''.join(f'<p class="sub" style="margin:0 0 4px;font-size:11.5px">'
            f'&middot; still missing: {views.esc(m)}</p>'
            for m in security["missing"])}
-  <p class="sub" style="margin:10px 0 0;font-size:11.5px">Encryption at rest is
-     one control, not a security posture. These are listed rather than glossed
-     because an install that looks safe and is not is worse than one that
+  <p class="sub" style="margin:10px 0 0;font-size:11.5px">Listed rather than
+     glossed: an install that looks safe and is not is worse than one that
      admits what it lacks.</p>
 </div>"""
     return views.page("Data source", body, "data", **shell)
@@ -6454,20 +6448,16 @@ def agents_hub(ws: Workspace = Depends(required_workspace)):
 
     body = f"""
 <h1>Agents</h1>
-<p class="sub">Each one audits a different thing somebody else calculated for
-   you, grouped by the process it belongs to. {len(live)} running{
-     f", {len(planned)} on the way" if planned else ""}.</p>
+<p class="sub">{len(live)} agents, each checking a number somebody else
+   calculated for you.</p>
 
 {_flow_sections(picture, with_controls=True)}
 
 <div class="card tint" style="margin-top:22px">
   <h2>Why these and not others</h2>
-  <p class="sub" style="margin:4px 0 0">Every agent here audits a number
-     somebody else worked out and had no reason to check, and every one of
-     them actually runs. Nothing is listed as coming soon: an agent with no
-     implementation would be shown as unavailable and could not be switched
-     on for anyone &mdash; a convincing mock of a working reconciler is not
-     a roadmap.</p>
+  <p class="sub" style="margin:4px 0 0">Everything listed here runs.
+     Nothing is marked coming soon &mdash; a convincing mock of a working
+     reconciler is not a roadmap.</p>
 </div>"""
     return views.page("Agents", body, "agents", **shell)
 

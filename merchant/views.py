@@ -591,6 +591,52 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
   </aside>"""
 
 
+def summarise(text: str, words: int = 20) -> str:
+    """
+    The first sentence of an agent's reasoning, capped.
+
+    The reasoning itself is the product and is never cut on the page where
+    somebody chose to read it. A summary list is not that page: the Home
+    queue was rendering nine findings at their full length - over nine
+    hundred words of citation-dense argument stacked on the front door -
+    which buries the one thing a list is for, deciding what to open.
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    # Cut at the first sentence end that is not a decimal point or an
+    # abbreviation like "s.10A" - a bare split on "." mangles both.
+    for i, ch in enumerate(text):
+        if ch in ".?!" and i + 1 < len(text) and text[i + 1] == " ":
+            if not text[i - 1].isdigit():
+                text = text[:i + 1]
+                break
+    parts = text.split()
+    if len(parts) > words:
+        return " ".join(parts[:words]).rstrip(".,;:") + "…"
+    return text
+
+
+# Acronyms that must not be sentence-cased. "Zero mdr violation" reads as a
+# typo to the only people qualified to judge this product.
+_ACRONYMS = {"mdr", "gst", "gstr", "tds", "upi", "itc", "hsn", "rcm", "utr",
+             "qrmp", "irn", "pan", "b2b", "b2c", "api"}
+
+
+def code_label(code: str) -> str:
+    """
+    An exception code as a person reads it: ZERO_MDR_VIOLATION becomes
+    "Zero-MDR violation", not "Zero mdr violation".
+    """
+    words = (code or "").replace("_", " ").strip().split()
+    if not words:
+        return ""
+    out = [w.upper() if w.lower() in _ACRONYMS else w.lower() for w in words]
+    if out[0] not in _ACRONYMS and not out[0].isupper():
+        out[0] = out[0].capitalize()
+    return " ".join(out)
+
+
 def google_button(label: str = "Continue with Google") -> str:
     """
     Google's sign-in button, plus the "or" divider under it.
@@ -866,8 +912,7 @@ def dashboard_waterfall(summary: dict, ask_embed: str = "") -> str:
   <div class="dash-head">
     <div>
       <h2 style="margin:0 0 4px">Payments</h2>
-      <p class="sub" style="margin:0">Every rupee, from what customers paid to
-         what actually reached your account.</p>
+      <p class="sub" style="margin:0">Sales in, deductions out, what landed.</p>
     </div>
     <span class="pill-count">{summary.get("payment_count", 0)} payments</span>
   </div>
@@ -1003,9 +1048,8 @@ def dashboard_side_panel(summary: dict) -> str:
   </div>
   <p class="sub" style="margin:0">across every settlement audited</p>
   {bars}
-  <p class="sub" style="margin-top:16px;font-size:11px">Three separate
-     figures from two agents, shown together because they're worth a
-     glance - not parts of one total.</p>
+  <p class="sub" style="margin-top:14px;font-size:11px">Three separate
+     figures, not parts of one total.</p>
 </div>"""
 
 
