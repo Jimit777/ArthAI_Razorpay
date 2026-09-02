@@ -1554,9 +1554,33 @@ def sync_razorpay(key_secret: str = Form(""),
         result = client.settlements(now.year, now.month)
         sources.record_sync(resolved, result)
 
+        # Store what came back, rather than only that the call worked. This
+        # used to end at record_sync: the rows were fetched, counted in a
+        # message, and dropped - so the settlement auditor had nothing real to
+        # audit and the connector proved only that the keys were valid.
+        message = result.message
+        if result.ok and result.raw:
+            from merchant.settlement_import import batch_from_recon
+
+            imported = batch_from_recon(result.raw, led.rate_card())
+            if imported.ok:
+                run_id = led.commit_settlement(imported.batch)
+                message = (f"{imported.payments} payments and "
+                           f"{imported.refunds} refunds imported and ready to "
+                           f"audit.")
+                if imported.skipped:
+                    # Transfers and adjustments are real rows this auditor has
+                    # no rate to check. Named, not silently dropped.
+                    message += (f" {len(imported.skipped)} transfer or "
+                                f"adjustment lines were left out.")
+                AccessLog(led.conn).record(
+                    Action.RUN_AUDIT, user=ws.user, business_id=resolved,
+                    target=run_id,
+                    detail=f"imported {imported.payments} settlement lines "
+                           f"from Razorpay")
+
     key = "ok" if result.ok else "error"
-    return RedirectResponse(f"/data?{key}={quote(result.message)}",
-                            status_code=303)
+    return RedirectResponse(f"/data?{key}={quote(message)}", status_code=303)
 
 
 @app.post("/sale")
