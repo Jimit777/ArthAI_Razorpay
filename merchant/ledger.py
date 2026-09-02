@@ -2166,14 +2166,21 @@ class Ledger:
         self.conn.commit()
         return len(rows)
 
-    def recon_batch(self):
+    def recon_batch(self, requires=("invoice", "settlement", "bank")):
         """
-        The three stored sources, in the shape the matcher already takes.
+        The stored sources, in the shape the matcher already takes.
 
-        Returns None when any of the three is missing. A two-way join is a
+        Returns None when any REQUIRED source is missing. A two-way join is a
         different product with different findings, and quietly running one
         while calling it a three-way reconciliation would be the dishonest
         option - so the caller is told which source is absent instead.
+
+        `requires` exists because not every agent reading these sources needs
+        all three. The payout timing detector passes `bank=[]` itself (see
+        engine/payout_timing/detector.py) - it compares when a sale was made
+        against when the gateway settled it, and a bank statement has no part
+        in that question. Demanding one would refuse to run on data that
+        answers the question completely.
         """
         import json
         from datetime import date as _date
@@ -2187,7 +2194,7 @@ class Ledger:
                 " ORDER BY ref", (self._scoped(),)):
             held.setdefault(row["kind"], []).append(json.loads(row["payload"]))
 
-        if not all(held.get(k) for k in ("invoice", "settlement", "bank")):
+        if not all(held.get(k) for k in requires):
             return None
 
         def when(value):
@@ -2212,6 +2219,28 @@ class Ledger:
                 credit_amount=r["credit_amount"],
                 transaction_date=when(r["transaction_date"]))
                 for r in held["bank"]])
+
+    # What payout timing needs on file, and nothing more. Named here rather
+    # than spelled out at each call site so the two entry points - an uploaded
+    # settlement report and a Razorpay pull - cannot drift apart on what they
+    # consider enough to run.
+    PAYOUT_TIMING_SOURCES = ("invoice", "settlement")
+
+    def payout_timing_batch(self):
+        """
+        Real sales and real settlements, ready for the payout timing detector.
+
+        Deliberately does not require a bank statement: this agent asks when
+        the gateway settled a sale against when it promised to, which the
+        invoice and settlement dates answer between them. See recon_batch's
+        `requires`.
+        """
+        return self.recon_batch(requires=self.PAYOUT_TIMING_SOURCES)
+
+    def payout_timing_missing(self) -> list:
+        """Which of the sources this agent needs are not on file yet."""
+        held = self.recon_sources_held()
+        return [k for k in self.PAYOUT_TIMING_SOURCES if not held.get(k)]
 
     def recon_sources_held(self) -> dict:
         """What is on file for each source, for the page to describe it."""

@@ -1541,3 +1541,100 @@ def test_no_recon_tool_call_leaves_recon_flagged_empty():
     inputs, _ = generate(as_of=TODAY)
     result = run(inputs, agent=FakeAgent(), source="demo")
     assert result.verdict.recon_flagged == []
+
+
+# --- payout timing on the merchant's own data ------------------------------
+
+@pytest.fixture
+def led(tmp_path):
+    """A ledger already pointed at one business - same shape as the fixture
+    in test_merchant.py, which is module-local rather than in a conftest."""
+    from merchant.ledger import Ledger
+
+    bootstrap = Ledger(tmp_path / "live.db")
+    business_id = bootstrap.businesses.create("Test Boutique")
+    bootstrap.close()
+    handle = Ledger(tmp_path / "live.db", business_id)
+    handle.db_path = str(tmp_path / "live.db")
+    yield handle
+    handle.close()
+
+
+def _payout_sources(led):
+    """Six sales; three settled inside T+2, three well outside it."""
+    from datetime import date
+
+    from engine.recon.records import Invoice, Settlement
+
+    led.replace_recon_source("invoice", [
+        Invoice(invoice_id=f"INV-{i}", customer_name=f"C{i}", amount=100_000,
+                date_issued=date(2026, 9, 1), status="issued")
+        for i in range(1, 7)], "sales.csv")
+    days = [3, 3, 3, 9, 10, 11]          # 1st is a Tuesday; 3rd is T+2
+    led.replace_recon_source("settlement", [
+        Settlement(txn_id=f"TXN-{i}", gross_amount=100_000, fee_deducted=2_000,
+                   net_settled=98_000, settlement_date=date(2026, 9, d),
+                   invoice_reference=f"INV-{i}", utr=None)
+        for i, d in enumerate(days, 1)], "settlements.csv")
+
+
+def test_payout_timing_does_not_need_a_bank_statement(led):
+    """
+    It asks when the gateway settled a sale against when it promised to, and
+    the invoice and settlement dates answer that between them. Demanding a
+    bank statement would refuse data that answers the question completely.
+    """
+    _payout_sources(led)
+
+    assert led.payout_timing_batch() is not None
+    assert led.payout_timing_missing() == []
+    # The three-way agent still wants all three.
+    assert led.recon_batch() is None
+
+
+def test_payout_timing_names_what_is_still_missing(led):
+    from datetime import date
+
+    from engine.recon.records import Invoice
+
+    assert set(led.payout_timing_missing()) == {"invoice", "settlement"}
+
+    led.replace_recon_source("invoice", [
+        Invoice(invoice_id="INV-1", customer_name="C", amount=1000,
+                date_issued=date(2026, 9, 1), status="issued")], "s.csv")
+
+    assert led.payout_timing_missing() == ["settlement"]
+    assert led.payout_timing_batch() is None, "ran with a source missing"
+
+
+def test_a_live_payout_run_refuses_rather_than_falling_back(led, tmp_path):
+    """
+    Auditing generated settlements while the screen says the data is real is
+    the one failure this product cannot survive, so live mode raises.
+    """
+    import pytest as _pytest
+
+    from merchant.agents.payout_timing import run_payout_timing
+    from merchant.catalog import AgentContext
+
+    ctx = AgentContext(business_id=led.business_id, rate_card={},
+                       db=led.db_path, target_id="k", use_agent=False,
+                       source="connected")
+
+    with _pytest.raises(ValueError, match="Nothing to audit yet"):
+        run_payout_timing(ctx)
+
+
+def test_a_live_payout_run_measures_the_merchant_s_own_settlements(led):
+    from merchant.agents.payout_timing import run_payout_timing
+    from merchant.catalog import AgentContext
+
+    _payout_sources(led)
+    run_payout_timing(AgentContext(
+        business_id=led.business_id, rate_card={}, db=led.db_path,
+        target_id="k", use_agent=False, source="connected"))
+
+    run = led.latest_payout_timing_run()
+    assert run is not None
+    assert run["source"] == "connected", "a live run was recorded as demo"
+    assert run["n_sla_miss"] == 3, "the three late settlements were not found"

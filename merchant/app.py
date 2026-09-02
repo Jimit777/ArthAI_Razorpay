@@ -2421,6 +2421,226 @@ def payout_timing_page(ws: Workspace = Depends(required_workspace),
                                    "agent:payout_timing", **shell))
 
 
+# --- payout timing on the merchant's own data ------------------------------
+#
+# Both tabs read the same two stored sources the three-way agent already
+# holds, rather than keeping a second copy: a merchant who uploads their
+# settlement report once should not have to upload it again for the agent
+# next door. What differs is only where the settlements came from, which is
+# exactly the distinction the three-way tabs already draw.
+
+PAYOUT_SOURCE_WORD = {"invoice": "sales", "settlement": "settlements"}
+
+
+def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
+    """What is on file, what is missing, and the button to run on it."""
+    held = led.recon_sources_held()
+    missing = led.payout_timing_missing()
+
+    rows = ""
+    for kind in Ledger.PAYOUT_TIMING_SOURCES:
+        on_file = held.get(kind)
+        word = PAYOUT_SOURCE_WORD[kind]
+        if on_file:
+            detail = (f'{on_file["records"]} records'
+                      + (f' from {views.esc(on_file["source_file"])}'
+                         if on_file.get("source_file") else ""))
+            pill = '<span class="pill good">on file</span>'
+        else:
+            detail = "nothing uploaded yet"
+            pill = '<span class="pill">needed</span>'
+        rows += (f'<div class="money"><div class="lbl">Your {word}</div>'
+                 f'<div class="val">{pill}</div></div>'
+                 f'<p class="sub" style="margin:2px 0 12px;font-size:11.5px">'
+                 f'{detail}</p>')
+
+    uploads = "".join(f"""
+    <form method="post" action="/agents/payout-timing/upload"
+          enctype="multipart/form-data" style="margin-bottom:10px">
+      <input type="hidden" name="kind" value="{kind}">
+      <label style="font-size:12.5px">Your {PAYOUT_SOURCE_WORD[kind]}</label>
+      <div class="row">
+        <div><input type="file" name="upload" accept=".csv,.xlsx" required></div>
+        <div style="flex:0"><button class="btn ghost small">Upload</button></div>
+      </div>
+    </form>""" for kind in (Ledger.PAYOUT_TIMING_SOURCES if not connected
+                            else ("invoice",)))
+
+    pull = ""
+    if connected:
+        pull = """
+    <form method="post" action="/agents/payout-timing/pull"
+          style="margin-bottom:10px">
+      <label style="font-size:12.5px">Your settlements</label>
+      <p class="sub" style="margin:2px 0 8px;font-size:11.5px">Pulled straight
+         from Razorpay's settlement recon report. Test-mode keys do not settle,
+         so this returns nothing until it points at a live account.</p>
+      <button class="btn ghost small">Pull from Razorpay</button>
+    </form>"""
+
+    can_run = not missing
+    run = f"""
+  <form method="post" action="/agents/payout-timing/run" style="margin-top:6px">
+    <input type="hidden" name="source" value="connected">
+    <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
+      color:var(--muted);margin-bottom:12px">
+      <input type="checkbox" name="use_agent" value="yes" checked>
+      Ask the agent to narrate the pattern and draft the escalation
+    </label>
+    <button class="btn"{'' if can_run else ' disabled'}>Measure my payouts</button>
+  </form>""" if can_run else f"""
+  <p class="sub" style="margin:6px 0 0">Still need your
+     {' and '.join(PAYOUT_SOURCE_WORD[m] for m in missing)} before this can
+     run. It will not fall back to generated data.</p>"""
+
+    return f"""
+<div class="card">
+  <h2>{'Pulled from Razorpay' if connected else 'Your own exports'}</h2>
+  <p class="sub" style="margin:6px 0 14px">Measures when each sale actually
+     settled against the T+{rules_payout.SETTLEMENT_WORKING_DAYS} working-day
+     cycle. No bank statement needed.</p>
+  {rows}
+  {pull}{uploads}
+  {run}
+</div>"""
+
+
+def _payout_timing_tab(ws, slug: str, error: str, ok: str) -> HTMLResponse:
+    with ledger(ws.business_id) as led:
+        shell = _shell_for(led, ws)
+        head = _workspace_head(led, ws, "payout_timing", slug)
+        card = _payout_timing_sources_card(led, ws,
+                                           connected=(slug == "connected"))
+        latest = led.latest_payout_timing_run()
+
+    banners = ""
+    if error:
+        banners += (f'<div class="banner danger" style="margin-bottom:16px">'
+                    f'{views.esc(error)}</div>')
+    if ok:
+        banners += (f'<div class="banner brand" style="margin-bottom:16px">'
+                    f'{views.esc(ok)}</div>')
+    link = (f'<p class="sub" style="margin-top:10px">'
+            f'<a href="/payout-timing/{views.esc(latest["run_id"])}">'
+            f'See your last run &rarr;</a></p>') if latest else ""
+
+    return HTMLResponse(views.page(
+        "Payout timing", f"{head}{banners}{card}{link}",
+        "agent:payout_timing", **shell))
+
+
+@app.get("/agents/payout-timing/upload", response_class=HTMLResponse)
+def payout_timing_upload_page(ws: Workspace = Depends(required_workspace),
+                              error: str = "", ok: str = ""):
+    """Your own sales and settlement exports."""
+    return _payout_timing_tab(ws, "upload", error, ok)
+
+
+@app.get("/agents/payout-timing/connected", response_class=HTMLResponse)
+def payout_timing_connected_page(ws: Workspace = Depends(required_workspace),
+                                 error: str = "", ok: str = ""):
+    """Settlements pulled from Razorpay; sales still uploaded."""
+    return _payout_timing_tab(ws, "connected", error, ok)
+
+
+@app.post("/agents/payout-timing/upload")
+async def upload_payout_timing_source(
+        request: Request, ws: Workspace = Depends(required_workspace)):
+    """
+    Stores into the same recon_sources the three-way agent reads, so an
+    export uploaded for one agent is already there for the other.
+    """
+    from urllib.parse import quote
+
+    from merchant import recon_import
+
+    form = await request.form()
+    kind = str(form.get("kind") or "")
+    upload = form.get("upload")
+    back = "/agents/payout-timing/upload"
+
+    if kind not in Ledger.PAYOUT_TIMING_SOURCES or upload is None:
+        return RedirectResponse(
+            back + "?error=" + quote("Pick a file and which source it is."),
+            status_code=303)
+
+    data = await upload.read()
+    parse = {"invoice": recon_import.parse_invoices,
+             "settlement": recon_import.parse_settlements}[kind]
+    result = parse(data, upload.filename)
+
+    if not result.ok:
+        return RedirectResponse(
+            back + "?error=" + quote(
+                f"Could not read {upload.filename}. Missing columns: "
+                f"{', '.join(result.missing_columns)}."), status_code=303)
+
+    records = result.invoices if kind == "invoice" else result.settlements
+    if not records:
+        return RedirectResponse(
+            back + "?error=" + quote(
+                f"{upload.filename} had the right columns and no usable rows."),
+            status_code=303)
+
+    with ledger(ws.business_id) as led:
+        stored = led.replace_recon_source(kind, records, upload.filename)
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=upload.filename,
+            detail=f"uploaded {stored} {kind} records for payout timing")
+
+    return RedirectResponse(
+        back + "?ok=" + quote(
+            f"{stored} {PAYOUT_SOURCE_WORD[kind]} read from {upload.filename}."),
+        status_code=303)
+
+
+@app.post("/agents/payout-timing/pull")
+def pull_payout_timing_settlements(
+        ws: Workspace = Depends(required_workspace)):
+    """The same Razorpay settlement pull the three-way agent already uses."""
+    from datetime import datetime, timezone
+    from urllib.parse import quote
+
+    from merchant.recon_import import settlements_from_razorpay
+    from merchant.sources import Razorpay, Sources
+
+    back = "/agents/payout-timing/connected"
+    now = datetime.now(timezone.utc)
+
+    with ledger(ws.business_id) as led:
+        sources = Sources(led.conn)
+        row = sources.get(ws.business_id)
+        secret = sources.stored_secret(ws.business_id)
+        if not row or not row["razorpay_key_id"] or not secret:
+            return RedirectResponse(
+                back + "?error=" + quote(
+                    "Connect Razorpay first, on Data & integrations."),
+                status_code=303)
+        try:
+            client = Razorpay(row["razorpay_key_id"], secret)
+        except ValueError as exc:
+            return RedirectResponse(back + "?error=" + quote(str(exc)),
+                                    status_code=303)
+
+        result = client.settlements(now.year, now.month)
+        if not result.ok:
+            return RedirectResponse(back + "?error=" + quote(result.message),
+                                    status_code=303)
+
+        settlements = settlements_from_razorpay(result.raw)
+        stored = led.replace_recon_source(
+            "settlement", settlements, f"Razorpay {now.month:02d}/{now.year}")
+
+    if not stored:
+        return RedirectResponse(back + "?error=" + quote(
+            f"Razorpay returned no settlements for {now.month:02d}/{now.year}. "
+            f"{result.message}"), status_code=303)
+    return RedirectResponse(back + "?ok=" + quote(
+        f"{stored} settlement lines pulled for {now.month:02d}/{now.year}."),
+        status_code=303)
+
+
 @app.post("/agents/payout-timing/run")
 async def run_payout_timing_demo(request: Request,
                                  ws: Workspace = Depends(required_workspace)):
@@ -2440,14 +2660,17 @@ async def run_payout_timing_demo(request: Request,
                     "done": 0, "total": 0, "lines": [], "results": [],
                     "agent": "Payout Timing Auditor", "started": time.time()}
 
+    source = "connected" if form.get("source") == "connected" else "demo"
+
     with ledger(ws.business_id) as led:
         AccessLog(led.conn).record(
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
-            target=key, detail="ran a payout timing audit on demo data")
+            target=key,
+            detail=f"ran a payout timing audit on {source} data")
 
     ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
                        target_id=key, use_agent=(form.get("use_agent") == "yes"),
-                       progress=_progress(key))
+                       progress=_progress(key), source=source)
     threading.Thread(target=_run_agent, args=("payout_timing", ctx),
                      daemon=True).start()
     return RedirectResponse(f"/agents/payout-timing?key={key}",
@@ -6284,13 +6507,16 @@ def _agent_state(led, ws, spec, source_kind) -> str:
         return (ui.STATE_DEMO if recon.get("source") == "demo"
                 else ui.STATE_ACTIVE)
     if spec.id == "payout_timing":
-        # v1 has only Demo Mode - see nav.AGENT_ROUTES's single tab for this
-        # agent - so any run that exists is demo data by definition, same
-        # reasoning as every other agent's first checkpoint before an
-        # Upload/Connected tab existed.
-        if not led.latest_payout_timing_run():
+        # Reads the run's own recorded source, the same way the recon and
+        # vendor agents do. This used to hardcode DEMO because Demo Mode was
+        # the only tab; with Upload and Connected it would have badged a run
+        # on the merchant's own settlements as generated data, which is the
+        # exact misreading the badge exists to prevent.
+        run = led.latest_payout_timing_run()
+        if not run:
             return ui.STATE_SETUP
-        return ui.STATE_DEMO
+        return (ui.STATE_DEMO if run["source"] == "demo"
+                else ui.STATE_ACTIVE)
     if spec.id == "gst_filing":
         if not led.latest_gstr1_run():
             return ui.STATE_SETUP

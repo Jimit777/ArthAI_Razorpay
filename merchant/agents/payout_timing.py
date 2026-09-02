@@ -22,8 +22,17 @@ def _line(text: str, kind: str = "info", detail: str = "") -> dict:
 
 
 def run_payout_timing(ctx: AgentContext) -> None:
-    """Demo Mode only for this pass - generates its own batch, ignores
-    ctx.target_id, same shape as the cash forecaster's demo runner."""
+    """
+    Runs on generated data or on the merchant's own, decided by
+    `ctx.source`: "demo" generates a batch, "connected" reads the sales and
+    settlements already on file - uploaded, or pulled from Razorpay. That is
+    the field AgentContext already carries for this distinction; target_id is
+    the run key here and means nothing to the choice.
+
+    Live mode refuses rather than falls back. Silently auditing generated
+    settlements while the screen says the data is real would be the one
+    failure this product cannot survive.
+    """
     from engine.payout_timing.generator import generate_batch
     from merchant.ledger import Ledger
     from merchant.payout_timing_pipeline import run as run_pipeline
@@ -31,13 +40,29 @@ def run_payout_timing(ctx: AgentContext) -> None:
     def say(**kw) -> None:
         ctx.progress(line=_line(**kw))
 
-    batch, _truth = generate_batch()
-    say(text=f"Checking {len(batch.invoices)} settlements against the "
-             f"T+{rules.SETTLEMENT_WORKING_DAYS} working-day cycle you were "
-             f"promised", kind="start")
+    live = (ctx.source or "demo") == "connected"
 
     with Ledger(ctx.db, ctx.business_id) as led:
-        result = run_pipeline(batch, use_agent=ctx.use_agent, source="demo",
+        if live:
+            batch = led.payout_timing_batch()
+            if batch is None:
+                missing = led.payout_timing_missing()
+                raise ValueError(
+                    "Nothing to audit yet - still missing your "
+                    + " and ".join(
+                        {"invoice": "sales", "settlement": "settlements"}[m]
+                        for m in missing) + ".")
+            say(text=f"Reading {len(batch.invoices)} sales and "
+                     f"{len(batch.settlements)} settlements from your own "
+                     f"records", kind="start")
+        else:
+            batch, _truth = generate_batch()
+            say(text=f"Checking {len(batch.invoices)} settlements against the "
+                     f"T+{rules.SETTLEMENT_WORKING_DAYS} working-day cycle you "
+                     f"were promised", kind="start")
+
+        source = "connected" if live else "demo"
+        result = run_pipeline(batch, use_agent=ctx.use_agent, source=source,
                               on_progress=lambda **kw: ctx.progress(**kw))
         summary, decision = result.summary, result.decision
 
@@ -47,7 +72,7 @@ def run_payout_timing(ctx: AgentContext) -> None:
                 detail=f"[confidence {result.verdict.confidence:.2f}]")
 
         run_id = led.commit_payout_timing_run(
-            summary, decision, result.verdict, source="demo")
+            summary, decision, result.verdict, source=source)
         led.record_payout_timing_findings(run_id, summary)
         ctx.progress(target_id=run_id, run_id=run_id)
 

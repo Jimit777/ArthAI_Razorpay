@@ -172,8 +172,17 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
     "payout_timing": AgentRoute(
         agent_id="payout_timing", slug="payout-timing",
         tabs=(
+            # Both real-data tabs read the same two stored sources the
+            # three-way agent already holds - sales and settlements. This
+            # agent needs no bank statement: it asks when the gateway settled
+            # a sale against when it promised to, and the two dates answer
+            # that between them.
             AgentTab("Demo Mode", "",
                      "a generated settlement batch with planted delays"),
+            AgentTab("Upload", "upload",
+                     "your own sales and settlement exports"),
+            AgentTab("Connected", "connected",
+                     "settlements pulled from Razorpay; you upload sales"),
         )),
     "vendor_terms": AgentRoute(
         agent_id="vendor_terms", slug="vendor-terms",
