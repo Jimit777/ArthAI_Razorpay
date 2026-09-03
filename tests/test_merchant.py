@@ -2354,3 +2354,31 @@ def test_a_source_with_no_bank_data_is_not_called_unreconciled(client):
     assert "does not reconcile" not in page
     assert "does not report what reached the bank" in page
     assert "not reported" in page
+
+
+def test_the_payout_pull_asks_for_the_secret_it_needs(client, monkeypatch):
+    """
+    Without an encryption key the Razorpay secret is verified and dropped, so
+    a Pull button that only looked for a stored one failed at a business that
+    was plainly connected - and said "connect Razorpay first", which was both
+    wrong and unactionable.
+    """
+    monkeypatch.delenv("LEDGERLINE_SECRET_KEY", raising=False)
+    _start(client)
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        business_id = led.businesses.all()[0]["business_id"]
+        led.conn.execute(
+            "INSERT OR REPLACE INTO data_sources (business_id, kind,"
+            " razorpay_key_id, last_status, last_message)"
+            " VALUES (?,'razorpay','rzp_test_x','ok','Connected.')",
+            (business_id,))
+        led.conn.commit()
+
+    page = client.get("/agents/payout-timing/connected").text
+    assert 'name="key_secret"' in page, "no way to supply the secret"
+
+    response = client.post("/agents/payout-timing/pull", data={},
+                           follow_redirects=False)
+    assert "key secret" in response.headers["location"].replace("%20", " ")
+    assert "Connect Razorpay first" not in response.headers["location"]

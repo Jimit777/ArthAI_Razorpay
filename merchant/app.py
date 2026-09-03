@@ -2650,13 +2650,25 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
 
     pull = ""
     if connected:
-        pull = """
+        from merchant.sources import Sources
+
+        has_secret = Sources(led.conn).stored_secret(ws.business_id) is not None
+        # Without an encryption key the secret is verified and dropped rather
+        # than stored, so it has to be typed again here - the same field
+        # /data shows, for the same reason. Asking for it beats failing with
+        # "connect Razorpay first" at a business that plainly is connected.
+        secret_field = ("" if has_secret else """
+      <div style="margin:6px 0 8px"><label style="font-size:12px">Key secret</label>
+        <input name="key_secret" type="password" required
+          placeholder="needed each time until an encryption key is set"></div>""")
+        pull = f"""
     <form method="post" action="/agents/payout-timing/pull"
           style="margin-bottom:10px">
       <label style="font-size:12.5px">Your settlements</label>
       <p class="sub" style="margin:2px 0 8px;font-size:11.5px">Pulled straight
          from Razorpay's settlement recon report. Test-mode keys do not settle,
          so this returns nothing until it points at a live account.</p>
+      {secret_field}
       <button class="btn ghost small">Pull from Razorpay</button>
     </form>"""
 
@@ -2779,6 +2791,7 @@ async def upload_payout_timing_source(
 
 @app.post("/agents/payout-timing/pull")
 def pull_payout_timing_settlements(
+        key_secret: str = Form(""),
         ws: Workspace = Depends(required_workspace)):
     """The same Razorpay settlement pull the three-way agent already uses."""
     from datetime import datetime, timezone
@@ -2793,11 +2806,19 @@ def pull_payout_timing_settlements(
     with ledger(ws.business_id) as led:
         sources = Sources(led.conn)
         row = sources.get(ws.business_id)
-        secret = sources.stored_secret(ws.business_id)
-        if not row or not row["razorpay_key_id"] or not secret:
+        # Typed now, or stored earlier - the same order /data uses. These are
+        # different failures and used to share one misleading message.
+        secret = key_secret.strip() or sources.stored_secret(ws.business_id)
+        if not row or not row["razorpay_key_id"]:
             return RedirectResponse(
                 back + "?error=" + quote(
                     "Connect Razorpay first, on Data & integrations."),
+                status_code=303)
+        if not secret:
+            return RedirectResponse(
+                back + "?error=" + quote(
+                    "Enter your Razorpay key secret. It is not stored on this "
+                    "install, so it is needed each time."),
                 status_code=303)
         try:
             client = Razorpay(row["razorpay_key_id"], secret)
