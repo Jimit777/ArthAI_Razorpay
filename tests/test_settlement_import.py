@@ -528,3 +528,26 @@ def test_an_import_somebody_reviewed_is_not_discarded(led):
 
     assert first in {r["run_id"] for r in led.settlements()}, (
         "a reviewed run was discarded by a re-import")
+
+
+def test_a_missing_settlement_date_is_not_a_period_boundary(led):
+    """
+    Found in a real audit's reasoning. The Payments API carries no settlement
+    date, so settled_at is 0 - and read as a date that is 1 Jan 1970, making
+    every payment look like it crossed an accounting period. The agent then
+    had to argue that away on all twelve records of the run.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    result = batch_from_payments(
+        [_api(id=f"pay_{i}", amount=18_000, fee=396, tax=0, method="card",
+              card={"network": "visa", "type": "debit"}) for i in range(3)],
+        card)
+    run_id = led.commit_settlement(result.batch)
+
+    for v in detect_batch(led.load_batch(run_id, card)):
+        kinds = {s.kind for s in v.signals}
+        assert "CROSSES_ACCOUNTING_PERIOD" not in kinds, (
+            "a missing settlement date was read as 1 Jan 1970")
+        assert kinds, "the real rate finding was lost too"

@@ -417,6 +417,13 @@ def _signal_period_boundary(record) -> Optional[Signal]:
     if not payment_lines:
         return None
     settled_at = payment_lines[0].settled_at
+    if not settled_at:
+        # No settlement date on this source at all - the Payments API carries
+        # none, and test mode never settles. Zero is not a date: read as one
+        # it becomes 1 Jan 1970, so every payment "crossed an accounting
+        # period" and the agent had to argue that away on all twelve records
+        # of a real run. A question we cannot ask is not a finding.
+        return None
     if _month(record.created_at) == _month(settled_at):
         return None
 
