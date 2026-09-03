@@ -3195,22 +3195,34 @@ class Ledger:
         every run - the Home page used to get this by summing that per-run
         figure in a loop; this is the same number from one query instead.
         """
+        # One row per payment, not per import. Re-importing the same
+        # Razorpay account is a fresh snapshot of the same money, not more of
+        # it, and summing every row read three imports of twelve payments as
+        # thirty-six sales - overstating this merchant's gross by Rs 10,600.
         gross = self.conn.execute(
-            "SELECT COALESCE(SUM(p.amount), 0) paise FROM payments p"
-            " JOIN business_runs br ON br.run_id = p.run_id"
-            " WHERE br.business_id = ?", (self._scoped(),)).fetchone()["paise"]
+            "SELECT COALESCE(SUM(amount), 0) paise FROM ("
+            "  SELECT p.payment_id, MAX(p.amount) amount FROM payments p"
+            "  JOIN business_runs br ON br.run_id = p.run_id"
+            "  WHERE br.business_id = ? GROUP BY p.payment_id)",
+            (self._scoped(),)).fetchone()["paise"]
 
+        # Same reasoning for what was deducted: one settlement line per
+        # entity, so a re-imported fee is not charged twice on this screen.
         deducted = self.conn.execute(
-            "SELECT COALESCE(SUM(sl.fee), 0) fee, COALESCE(SUM(sl.tax), 0) tax"
-            " FROM settlement_lines sl JOIN business_runs br"
-            " ON br.run_id = sl.run_id"
-            " WHERE br.business_id = ? AND sl.type = 'payment'",
+            "SELECT COALESCE(SUM(fee), 0) fee, COALESCE(SUM(tax), 0) tax FROM ("
+            "  SELECT sl.entity_id, MAX(sl.fee) fee, MAX(sl.tax) tax"
+            "  FROM settlement_lines sl JOIN business_runs br"
+            "  ON br.run_id = sl.run_id"
+            "  WHERE br.business_id = ? AND sl.type = 'payment'"
+            "  GROUP BY sl.entity_id)",
             (self._scoped(),)).fetchone()
 
         credited = self.conn.execute(
-            "SELECT COALESCE(SUM(bc.amount), 0) paise FROM bank_credits bc"
-            " JOIN business_runs br ON br.run_id = bc.run_id"
-            " WHERE br.business_id = ?", (self._scoped(),)).fetchone()["paise"]
+            "SELECT COALESCE(SUM(amount), 0) paise FROM ("
+            "  SELECT bc.utr, MAX(bc.amount) amount FROM bank_credits bc"
+            "  JOIN business_runs br ON br.run_id = bc.run_id"
+            "  WHERE br.business_id = ? GROUP BY bc.utr)",
+            (self._scoped(),)).fetchone()["paise"]
 
         recoverable = self.conn.execute(
             "SELECT COALESCE(SUM(v.money_at_stake), 0) paise FROM variances v"
@@ -3240,14 +3252,15 @@ class Ledger:
         # so - see views.stat_card()'s empty branch.
 
         txn = self.conn.execute(
-            "SELECT COUNT(*) n, COUNT(DISTINCT p.method) methods FROM payments p"
+            "SELECT COUNT(DISTINCT p.payment_id) n,"
+            "       COUNT(DISTINCT p.method) methods FROM payments p"
             " JOIN business_runs br ON br.run_id = p.run_id"
             " WHERE br.business_id = ?", (self._scoped(),)).fetchone()
 
         # Method mix drives the Payments card's little distribution strip.
         method_mix = [
             (r["method"] or "unknown", r["n"]) for r in self.conn.execute(
-                "SELECT p.method, COUNT(*) n FROM payments p"
+                "SELECT p.method, COUNT(DISTINCT p.payment_id) n FROM payments p"
                 " JOIN business_runs br ON br.run_id = p.run_id"
                 " WHERE br.business_id = ? GROUP BY p.method"
                 " ORDER BY n DESC", (self._scoped(),)).fetchall()]

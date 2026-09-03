@@ -447,3 +447,31 @@ def test_the_data_panel_lists_the_transactions_not_just_a_count(shop_razorpay):
     assert "What came in" in page
     assert "pay_visible" in page, "the transaction itself is not shown"
     assert "Rs 1,627.00" in page
+
+
+def test_the_dashboard_totals_do_not_grow_when_you_import_twice(led):
+    """
+    Regression, found from a real database. Re-importing the same Razorpay
+    account is a fresh snapshot of the same money, not more of it - but the
+    Home waterfall summed every stored row, so three imports of twelve
+    payments read as thirty-six sales and overstated gross by Rs 10,600.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    rows = [_api(id=f"pay_{i}", amount=100_000, fee=2_360, tax=360)
+            for i in range(5)]
+
+    led.commit_settlement(batch_from_payments(rows, card).batch)
+    once = led.dashboard_summary()
+
+    for _ in range(2):
+        led.commit_settlement(batch_from_payments(rows, card).batch)
+    thrice = led.dashboard_summary()
+
+    assert once["gross_paise"] == 500_000
+    assert thrice["gross_paise"] == once["gross_paise"], (
+        "gross grew on re-import")
+    assert thrice["fee_paise"] == once["fee_paise"], "fees were double counted"
+    assert thrice["payment_count"] == 5
+    assert dict(thrice["method_mix"])["upi"] == 5
