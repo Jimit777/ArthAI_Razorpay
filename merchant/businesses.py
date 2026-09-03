@@ -395,6 +395,12 @@ class Businesses:
             (behaviour, business_id))
         self.conn.commit()
 
+    def behaviours(self, business_id: str) -> list:
+        """The gateway setting as a list, however many are switched on."""
+        from merchant.gateway import parse_behaviours
+
+        return parse_behaviours(self.behaviour(business_id))
+
     def behaviour(self, business_id: str) -> str:
         row = self.get(business_id)
         return row["gateway_behaviour"] if row else "correct"

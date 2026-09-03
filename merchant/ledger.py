@@ -899,7 +899,21 @@ class Ledger:
     # --- how the gateway is behaving -------------------------------------
 
     def behaviour(self) -> Behaviour:
-        return Behaviour(self.businesses.behaviour(self._scoped()))
+        """
+        One behaviour, for the callers that take a single payment.
+
+        The setting can now hold several - see businesses.behaviours - so the
+        stored value may be a list. This returns the first, which keeps every
+        single-payment path working unchanged; the batch generator asks for
+        the whole set instead.
+        """
+        from merchant.gateway import parse_behaviours
+
+        return parse_behaviours(self.businesses.behaviour(self._scoped()))[0]
+
+    def behaviours(self) -> list:
+        """Every fault currently switched on."""
+        return self.businesses.behaviours(self._scoped())
 
     def set_behaviour(self, behaviour: Behaviour) -> None:
         self.businesses.set_behaviour(self._scoped(), str(behaviour))
@@ -3031,7 +3045,7 @@ class Ledger:
     def orders(self, limit: int = 50) -> list:
         return self.conn.execute(
             "SELECT o.*, p.payment_id, p.fee, p.tax, p.method AS paid_method,"
-            " p.refunded, p.settled_run_id"
+            " p.refunded, p.settled_run_id, p.behaviour"
             " FROM live_orders o LEFT JOIN live_payments p"
             " ON p.order_id = o.order_id WHERE o.business_id = ?"
             " ORDER BY o.created_at DESC LIMIT ?",
@@ -3196,8 +3210,8 @@ class Ledger:
         ("amex", 3), ("international", 3),
     )
 
-    def generate_mixed_batch(self, n: int = 60, seed: Optional[int] = None
-                             ) -> dict:
+    def generate_mixed_batch(self, n: int = 60, seed: Optional[int] = None,
+                             behaviours=None) -> dict:
         """
         A month of sales across several rails, with several DIFFERENT faults
         planted in it - not one behaviour applied uniformly.
@@ -3218,6 +3232,11 @@ class Ledger:
 
         rng = _random.Random(seed if seed is not None else 20260905)
 
+        # Only the faults the merchant ticked. CORRECT is always available:
+        # a batch with no clean rows in it teaches nothing about when the
+        # auditor should stay quiet, which is half of what it is for.
+        wanted = set(behaviours) if behaviours else None
+
         # (behaviour, which instruments it can apply to, share of the batch)
         recipes = [
             (Behaviour.CORRECT, [i for i, _w in self.BATCH_INSTRUMENTS], 55),
@@ -3229,6 +3248,15 @@ class Ledger:
              [i for i, _w in self.BATCH_INSTRUMENTS], 9),
             (Behaviour.MISLABEL_UPI, ["upi"], 10),
         ]
+
+        if wanted is not None:
+            recipes = [r for r in recipes
+                       if r[0] in wanted or r[0] is Behaviour.CORRECT]
+            # Ticking nothing but "charge correctly" is a legitimate demo -
+            # the clean sheet - so an empty fault list is not an error.
+            if not recipes:
+                recipes = [(Behaviour.CORRECT,
+                            [i for i, _w in self.BATCH_INSTRUMENTS], 100)]
 
         pool, weights = zip(*self.BATCH_INSTRUMENTS)
         made = []

@@ -64,7 +64,8 @@ from merchant import catalog, google_auth, views
 from merchant.accesslog import ACTION_LABEL, AccessLog, Action
 from merchant.auth import SESSION_COOKIE, Auth, Role, User
 from merchant.catalog import AgentContext
-from merchant.gateway import BEHAVIOUR_LABEL, BEHAVIOUR_NOTE, Behaviour
+from merchant.gateway import (BEHAVIOUR_FINDS, BEHAVIOUR_LABEL,
+                              BEHAVIOUR_NOTE, Behaviour)
 from merchant import benchmark as benchmark_mod
 from engine.gst import rules as rules_gst
 from engine.gst_filing import rules as rules_gstf
@@ -767,11 +768,36 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
         shell = _shell_for(led, ws)
         supplier_behaviours = set(led.businesses.supplier_behaviours(resolved))
         behaviour = led.behaviour()
+        behaviours = led.businesses.behaviours(resolved)
         pending = led.unsettled()
-        orders = led.orders(limit=25)
+        # The whole generated batch, not a window on it - the point of
+        # generating sixty is being able to look at the sixty.
+        orders = led.orders(limit=250)
         audit_on = led.businesses.agent_enabled(resolved, "settlement_audit")
     gross = sum(p["amount"] for p in pending)
     deducted = sum(p["fee"] + p["tax"] for p in pending)
+
+    # What the batch actually contains, so a demo can point at the spread
+    # rather than asking the room to take it on trust.
+    from collections import Counter
+    method_mix = Counter((o["paid_method"] or "unpaid") for o in orders)
+    fault_mix = Counter((o["behaviour"] or "correct") for o in orders
+                        if o["payment_id"])
+    if orders:
+        bits = [f"{len(orders)} sales",
+                ", ".join(f"{n} {m}" for m, n in method_mix.most_common())]
+        planted = [
+            f"{n} {views.code_label(BEHAVIOUR_FINDS.get(Behaviour(b), b))}"
+            for b, n in fault_mix.most_common()
+            if b != str(Behaviour.CORRECT)]
+        if planted:
+            bits.append("faults planted: " + ", ".join(planted))
+        clean = fault_mix.get(str(Behaviour.CORRECT), 0)
+        if clean:
+            bits.append(f"{clean} charged correctly")
+        mix_line = " &middot; ".join(bits)
+    else:
+        mix_line = "Nothing generated yet."
 
     rows = "".join(f"""
       <tr>
@@ -795,16 +821,16 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
     # merchant has a "make my gateway misbehave" control; it is a demo
     # instrument, and putting it on a customer-facing settings page was the
     # single most confusing thing in the app.
-    from merchant.gateway import BEHAVIOUR_AFFECTS, BEHAVIOUR_FINDS
+    from merchant.gateway import BEHAVIOUR_AFFECTS
 
     faults = "".join(f"""
       <label style="display:block;padding:9px 12px;border:1px solid
-        {'var(--brand)' if b == behaviour else 'var(--line)'};border-radius:7px;
+        {'var(--brand)' if b in behaviours else 'var(--line)'};border-radius:7px;
         margin-bottom:5px;cursor:pointer;
-        {'background:var(--brand-wash);' if b == behaviour else ''}">
+        {'background:var(--brand-wash);' if b in behaviours else ''}">
         <div style="display:flex;align-items:center;gap:9px">
-          <input type="radio" name="behaviour" value="{b.value}"
-            {'checked' if b == behaviour else ''} style="width:auto;margin:0">
+          <input type="checkbox" name="behaviour" value="{b.value}"
+            {'checked' if b in behaviours else ''} style="width:auto;margin:0">
           <b style="font-size:12.5px">{views.esc(BEHAVIOUR_LABEL[b])}</b>
           <span class="sp"></span>
           <span class="pill {'good' if b == Behaviour.CORRECT else 'danger'}">
@@ -851,6 +877,10 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
      demonstrates nothing, so the fault is a switch you can see rather than
      something hidden in a fixture. No real merchant has this control &mdash;
      it belongs to the simulator, not to a business.</p>
+  <p class="sub" style="margin:0 0 12px"><b>Tick as many as you like.</b> Each
+     payment is given one of them, so a generated batch comes out with several
+     kinds of problem in it at once &mdash; which is the case the auditor
+     exists for. Tick none and every payment is charged correctly.</p>
   <form method="post" action="/settings/gateway">
     {faults}
     <button style="margin-top:4px">Apply to new payments</button>
@@ -861,11 +891,11 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
 
 <div class="card">
   <h2>Generate a month at once</h2>
-  <p class="sub" style="margin:3px 0 12px">Sixty sales across every rail a
-     small merchant sees &mdash; UPI, RuPay, Visa debit and credit, Amex,
-     netbanking, wallet, international &mdash; with the faults above mixed
+  <p class="sub" style="margin:3px 0 12px">Sales across every rail a small
+     merchant sees &mdash; UPI, RuPay, Visa debit and credit, Amex, netbanking,
+     wallet, international &mdash; with <b>the faults ticked above</b> mixed
      through them rather than one applied to everything. Ticket sizes straddle
-     &#8377;2,000 so both debit caps get exercised. Roughly half come out
+     &#8377;2,000 so both debit caps get exercised, and roughly half come out
      clean, which is the half that has to stay quiet.</p>
   <form method="post" action="/data/simulator/batch">
     <div class="row" style="max-width:320px">
@@ -923,37 +953,10 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
 
 {fault_panel}
 
-<div class="card">
-  <form method="post" action="/sale">
-    <div class="row">
-      <div><label>Amount (&#8377;)</label>
-        <input name="rupees" type="number" step="0.01" min="0.01"
-          value="1627.00" required></div>
-      <div><label>What was sold</label>
-        <input name="description" placeholder="Silk scarf" value="Silk scarf"></div>
-      <div><label>Paid with</label>
-        <select name="instrument">
-          <option value="upi">UPI</option>
-          <option value="rupay_debit">RuPay debit card</option>
-          <option value="visa_debit">Visa/Mastercard debit</option>
-          <option value="visa_credit">Visa/Mastercard credit</option>
-          <option value="amex">Amex</option>
-          <option value="international">International card</option>
-          <option value="netbanking">Net banking</option>
-          <option value="wallet">Wallet</option>
-        </select></div>
-      <div style="flex:0"><button>Take payment</button></div>
-    </div>
-  </form>
-</div>
-
 <div class="card flush">
   <div class="card-head">
-    <div><h2>Recent sales</h2>
-      <p class="sub" style="margin:2px 0 0">{
-        f"{len(pending)} awaiting settlement &middot; {rupees(gross)} gross, "
-        f"{rupees(deducted)} already deducted"
-        if pending else "Everything here has been settled."}</p></div>
+    <div><h2>Sales in this simulator</h2>
+      <p class="sub" style="margin:2px 0 0">{mix_line}</p></div>
     <span class="sp"></span>
     {settle}
   </div>
@@ -963,8 +966,9 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
     {rows or '<tr><td colspan="7" class="empty">'
      '<div style="font-weight:560;color:var(--ink);margin-bottom:4px">'
      'No sales yet</div>'
-     'Record one above. The gateway will deduct its fee, and once you settle '
-     'the batch the auditor checks whether that fee was right.</td></tr>'}
+     'Generate a month above. The gateway deducts its fee as it goes, and '
+     'once the batch is settled the auditor checks whether each fee was '
+     'right.</td></tr>'}
   </table>
 </div>"""
     return views.page("Simulator", body, "data", **shell)
@@ -1710,7 +1714,10 @@ def generate_simulator_batch(count: str = Form("60"),
         n = 60
 
     with ledger(ws.business_id) as led:
-        info = led.generate_mixed_batch(n)
+        # Only the faults ticked above. The switch and the generator are the
+        # same control; two places to say what the gateway does would drift.
+        info = led.generate_mixed_batch(
+            n, behaviours=led.businesses.behaviours(ws.business_id))
         batch = led.build_settlement(led.rate_card())
         run_id = led.commit_settlement(batch, source="simulator") if batch else None
         AccessLog(led.conn).record(
@@ -7116,6 +7123,7 @@ def settings_page(ws: Workspace = Depends(required_workspace),
         shell = _shell_for(led, ws)
         card = led.rate_card()
         behaviour = led.behaviour()
+        behaviours = led.businesses.behaviours(resolved)
         source = Sources(led.conn).kind(resolved)
         deletable = led.businesses.may_delete(resolved)
         settled = led.businesses.settlement_count(resolved)
@@ -7881,13 +7889,27 @@ def set_supplier_behaviour(behaviour: list[str] = Form(default=[]),
 
 
 @app.post("/settings/gateway")
-def set_gateway(behaviour: str = Form(...),
-                ws: Workspace = Depends(required_workspace)):
+async def set_gateway(request: Request,
+                      ws: Workspace = Depends(required_workspace)):
+    """
+    Several faults at once, the same way the supplier switch already works.
+
+    One gateway does not misprice every rail identically, so a simulator that
+    can only be wrong one way at a time cannot produce the batch the auditor
+    exists to read. Ticking nothing means charging correctly - the clean
+    sheet is a legitimate demo, not an empty form.
+    """
+    from merchant.gateway import join_behaviours
+
     resolved = ws.business_id
     ws.require_owner("the gateway simulator")
+
+    form = await request.form()
+    chosen = [v for v in form.getlist("behaviour") if v]
     if resolved:
         with ledger(resolved) as led:
-            led.set_behaviour(Behaviour(behaviour))
+            led.businesses.set_behaviour(
+                resolved, join_behaviours(chosen) or str(Behaviour.CORRECT))
     return RedirectResponse("/data/simulator", status_code=303)
 
 

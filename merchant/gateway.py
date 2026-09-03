@@ -200,3 +200,43 @@ def capture(amount: int, method: str, behaviour: Behaviour,
                    card_type=recorded_type, is_international=is_international,
                    upi_reference=upi_reference, fee=fee, tax=tax,
                    instrument_used=instrument)
+
+
+SEPARATOR = ","
+
+
+def parse_behaviours(text) -> list["Behaviour"]:
+    """
+    The stored gateway setting as a list.
+
+    Mirrors merchant.suppliers.parse_behaviours exactly, for the same reason:
+    a row written before the simulator could hold several faults contains a
+    bare value, and that has to keep parsing as a one-element list rather
+    than needing a migration. Unknown values are dropped instead of raising -
+    a setting a merchant cannot correct from the UI must not be able to break
+    their simulator.
+    """
+    if not text:
+        return [Behaviour.CORRECT]
+    if isinstance(text, Behaviour):
+        return [text]
+    if isinstance(text, str):
+        parts = [p.strip() for p in text.split(SEPARATOR)]
+    else:
+        parts = [str(p).strip() for p in text]
+
+    out = []
+    for part in parts:
+        try:
+            found = Behaviour(part)
+        except ValueError:
+            continue
+        if found not in out:
+            out.append(found)
+    return out or [Behaviour.CORRECT]
+
+
+def join_behaviours(chosen) -> str:
+    """The list as it is stored. Order follows the enum so it is stable."""
+    kept = [b for b in Behaviour if b in set(parse_behaviours(chosen))]
+    return SEPARATOR.join(str(b) for b in kept)

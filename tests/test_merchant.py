@@ -949,7 +949,7 @@ def test_empty_tables_offer_the_next_step(client):
 
     simulator = client.get("/simulator").text
     assert "No sales yet" in simulator
-    assert "the auditor checks whether that fee was right" in simulator
+    assert "the auditor checks whether each fee was right" in simulator
 
 
 def test_every_behaviour_declares_which_rails_it_touches(led):
@@ -1600,7 +1600,8 @@ def test_the_settle_and_audit_controls_are_reachable(client):
     step has to be a visible control on the page a person is already on.
     """
     _start(client)
-    assert 'action="/sale"' in client.get("/data/simulator").text
+    # The single-sale form is gone; a batch is generated instead.
+    assert 'action="/data/simulator/batch"' in client.get("/data/simulator").text
 
     client.post("/sale", data={"rupees": "9000.00", "instrument": "upi"})
     # Settle appears once there is something to settle, which is why the order
@@ -2173,3 +2174,62 @@ def test_the_calculator_still_runs_without_a_key(client, monkeypatch):
                            follow_redirects=False)
 
     assert response.status_code == 303, "the rules-only run was refused too"
+
+
+def test_the_gateway_can_be_wrong_in_several_ways_at_once(client):
+    """
+    One gateway does not misprice every rail identically, so a simulator that
+    can only be wrong one way at a time cannot produce the batch the auditor
+    exists to read - the same reasoning the supplier switch already follows.
+    """
+    _start(client)
+    # dict-of-list, not list-of-tuples: httpx2 reads the latter as raw
+    # content and sends no form fields at all.
+    client.post("/settings/gateway",
+                data={"behaviour": ["card_rate_on_upi", "gst_on_sale_value"]})
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        chosen = {str(b) for b in led.behaviours()}
+
+    assert chosen == {"card_rate_on_upi", "gst_on_sale_value"}
+
+
+def test_ticking_no_fault_means_charging_correctly(client):
+    """A clean sheet is a legitimate demo, not an empty form."""
+    _start(client)
+    client.post("/settings/gateway", data={})
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert [str(b) for b in led.behaviours()] == ["correct"]
+
+
+def test_a_generated_batch_only_plants_the_faults_that_are_ticked(client):
+    _start(client)
+    client.post("/settings/gateway", data={"behaviour": ["mislabel_upi"]})
+    client.post("/data/simulator/batch", data={"count": "40"})
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        planted = {r["behaviour"] for r in led.conn.execute(
+            "SELECT DISTINCT behaviour FROM live_payments WHERE business_id = ?",
+            (led.business_id,))}
+
+    assert planted <= {"mislabel_upi", "correct"}, (
+        f"a fault nobody ticked was planted: {planted}")
+
+
+def test_the_simulator_shows_every_generated_sale(client):
+    """The point of generating sixty is being able to look at the sixty."""
+    _start(client)
+    client.post("/data/simulator/batch", data={"count": "60"})
+
+    page = client.get("/data/simulator").text
+
+    assert page.count('<td class="mono">') == 60, "the batch was truncated"
+    assert "60 sales" in page
+    assert 'action="/sale"' not in page, "the single-sale form came back"
