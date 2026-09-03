@@ -889,6 +889,40 @@ def checklist(steps) -> str:
 # for this codebase (hand-rolled, zero external dependencies) - just simpler,
 # since a four-stage drop-off needs no curve fitting.
 
+def _source_split(summary: dict) -> str:
+    """
+    Where the money on this page came from - the gateway, or the simulator.
+
+    A dashboard that mixes both and says neither invites the worst possible
+    misreading: a merchant, or a judge, taking generated figures for real
+    ones. Shown whenever both are present; a single-source business needs no
+    disclaimer and gets none.
+    """
+    by = summary.get("by_source") or {}
+    live = by.get("razorpay") or {}
+    demo = by.get("simulator") or {}
+    if not (live and demo):
+        return ""
+
+    total = (live.get("gross_paise", 0) + demo.get("gross_paise", 0)) or 1
+    live_pct = live.get("gross_paise", 0) / total * 100
+    return f"""
+  <div class="src-split">
+    <div class="src-split-bar">
+      <span class="seg live" style="width:{live_pct:.1f}%"></span>
+      <span class="seg demo" style="width:{100 - live_pct:.1f}%"></span>
+    </div>
+    <div class="src-split-keys">
+      <span><i class="live"></i>Razorpay
+        <b>{esc(rupees(live.get("gross_paise", 0)))}</b>
+        <em>{live.get("payment_count", 0)} payments</em></span>
+      <span><i class="demo"></i>Simulated
+        <b>{esc(rupees(demo.get("gross_paise", 0)))}</b>
+        <em>{demo.get("payment_count", 0)} payments</em></span>
+    </div>
+  </div>"""
+
+
 def dashboard_waterfall(summary: dict, ask_embed: str = "") -> str:
     """
     The hero card: gross sales through gateway deductions to what should
@@ -975,6 +1009,7 @@ def dashboard_waterfall(summary: dict, ask_embed: str = "") -> str:
     </div>
     <span class="pill-count">{summary.get("payment_count", 0)} payments</span>
   </div>
+  {_source_split(summary)}
   {mix_strip}
   <div class="waterfall-wrap">
     <div class="waterfall">{"".join(bars)}</div>
@@ -3050,6 +3085,40 @@ COMPONENTS += """
 .dash-grid { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr);
   gap:16px }
 @media (max-width:900px) { .dash-grid { grid-template-columns:1fr } }
+
+/* The gateway/simulator split on the Home waterfall. Same two colours as the
+   source tags below, so one language across the app. */
+.src-split { margin:14px 0 4px }
+.src-split-bar { display:flex; gap:3px; height:8px; border-radius:999px;
+  overflow:hidden }
+.src-split-bar .seg { display:block; height:100%; border-radius:999px;
+  min-width:3px }
+.src-split-bar .seg.live { background:var(--brand) }
+.src-split-bar .seg.demo { background:var(--warn) }
+.src-split-keys { display:flex; gap:18px; flex-wrap:wrap; margin-top:8px;
+  font-size:11.5px; color:var(--muted) }
+.src-split-keys span { display:inline-flex; align-items:baseline; gap:5px }
+.src-split-keys i { width:8px; height:8px; border-radius:3px;
+  align-self:center }
+.src-split-keys i.live { background:var(--brand) }
+.src-split-keys i.demo { background:var(--warn) }
+.src-split-keys b { color:var(--ink); font-variant-numeric:tabular-nums }
+.src-split-keys em { font-style:normal; color:var(--faint) }
+
+/* --- where a row's data came from ----------------------------------------
+   One glance should answer "is this real?". Blue for the gateway, amber for
+   the simulator - the same two colours the source badges already use, so the
+   table agrees with the badge above it rather than inventing a third
+   language. A left edge rather than a filled row: it must read at a glance
+   without competing with the money, which is what the eye is here for. */
+.src-live { border-left:3px solid var(--brand) }
+.src-demo { border-left:3px solid var(--warn) }
+tr.src-live > td:first-child { box-shadow:inset 3px 0 0 var(--brand) }
+tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
+.src-tag { font-size:10.5px; font-weight:650; letter-spacing:.04em;
+  padding:2px 7px; border-radius:999px; white-space:nowrap }
+.src-tag.live { background:var(--brand-wash); color:var(--brand-ink) }
+.src-tag.demo { background:var(--warn-wash); color:var(--warn) }
 
 /* --- Google sign-in ------------------------------------------------------ */
 .btn-google { display:flex; align-items:center; justify-content:center;

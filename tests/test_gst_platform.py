@@ -732,6 +732,8 @@ def test_dashboard_summary_is_scoped_to_one_business(tmp_path):
         # The counting cards' figures, zero for a business with no runs -
         # a real zero, which the card renders as "nothing here yet".
         "payment_count": 0, "method_count": 0, "method_mix": [],
+        # Nothing imported and nothing simulated, so no split to draw.
+        "by_source": {},
         "customer_count": 0, "customer_registered": 0,
         "vendor_count": 0, "vendor_overbilled_paise": 0,
     }

@@ -825,6 +825,20 @@ CREATE INDEX IF NOT EXISTS idx_chargeback_findings_run
 
 
 
+# The instrument shapes the simulator offers, mirrored from app.INSTRUMENTS
+# so the batch generator does not import the web layer.
+INSTRUMENT_SHAPES = {
+    "upi": ("upi", None, None, False),
+    "rupay_debit": ("card", "rupay", "debit", False),
+    "visa_debit": ("card", "visa", "debit", False),
+    "visa_credit": ("card", "visa", "credit", False),
+    "amex": ("card", "amex", "credit", False),
+    "international": ("card", "visa", "credit", True),
+    "netbanking": ("netbanking", None, None, False),
+    "wallet": ("wallet", None, None, False),
+}
+
+
 class Ledger:
     """
     One business's books.
@@ -2941,7 +2955,8 @@ class Ledger:
                         card_network: Optional[str] = None,
                         card_type: Optional[str] = None,
                         is_international: bool = False,
-                        captured_at: Optional[int] = None) -> str:
+                        captured_at: Optional[int] = None,
+                        behaviour=None) -> str:
         """
         Take the money. The gateway decides its own fee; we record what it did.
 
@@ -2968,7 +2983,12 @@ class Ledger:
         if order is None:
             raise KeyError(f"no order {order_id} for this business")
 
-        result = capture(order["amount"], method, self.behaviour(),
+        # `behaviour` overrides the business-wide switch for THIS payment.
+        # A real batch is not uniformly wrong: one gateway misprices UPI while
+        # charging cards correctly, and a demo where every row carries the
+        # same fault teaches the auditor nothing about telling faults apart.
+        acting = behaviour if behaviour is not None else self.behaviour()
+        result = capture(order["amount"], method, acting,
                          card_network, card_type, is_international, self._rng)
         payment_id = _rzp_id(self._rng, "pay_")
 
@@ -2979,7 +2999,7 @@ class Ledger:
             (payment_id, self._scoped(), order_id, order["amount"], result.method,
              result.card_network, result.card_type, int(is_international),
              result.upi_reference, result.fee, result.tax,
-             str(self.behaviour()),
+             str(acting),
              int(captured_at if captured_at is not None else time.time())))
         self.conn.execute("UPDATE live_orders SET status='paid' WHERE order_id = ?",
                           (order_id,))
@@ -3166,6 +3186,75 @@ class Ledger:
         self.conn.commit()
         return run_id
 
+    # What a realistic month looks like across the rails a small Indian
+    # merchant actually sees. Weighted, not uniform: UPI dominates, Amex and
+    # international are rare, which is what makes a mixed batch look like a
+    # month rather than a test matrix.
+    BATCH_INSTRUMENTS = (
+        ("upi", 26), ("visa_debit", 14), ("visa_credit", 9),
+        ("rupay_debit", 6), ("netbanking", 5), ("wallet", 4),
+        ("amex", 3), ("international", 3),
+    )
+
+    def generate_mixed_batch(self, n: int = 60, seed: Optional[int] = None
+                             ) -> dict:
+        """
+        A month of sales across several rails, with several DIFFERENT faults
+        planted in it - not one behaviour applied uniformly.
+
+        A batch where every payment is wrong the same way proves only that the
+        auditor can apply one rule. Mixing them is what shows it telling faults
+        apart: a UPI payment priced as a card sits next to a card charged above
+        its slab, next to GST computed on the sale value, next to rows that are
+        simply correct and must stay quiet.
+
+        Each fault is applied only to instruments it can actually occur on -
+        zero-MDR violations need a zero-MDR rail, a mislabel needs UPI - so
+        nothing here plants a finding the rules could not legitimately raise.
+        """
+        import random as _random
+
+        from merchant.gateway import Behaviour
+
+        rng = _random.Random(seed if seed is not None else 20260905)
+
+        # (behaviour, which instruments it can apply to, share of the batch)
+        recipes = [
+            (Behaviour.CORRECT, [i for i, _w in self.BATCH_INSTRUMENTS], 55),
+            (Behaviour.CARD_RATE_ON_UPI, ["upi", "rupay_debit"], 13),
+            (Behaviour.OVER_CONTRACT,
+             ["visa_debit", "visa_credit", "amex", "netbanking", "wallet",
+              "international"], 13),
+            (Behaviour.GST_ON_SALE_VALUE,
+             [i for i, _w in self.BATCH_INSTRUMENTS], 9),
+            (Behaviour.MISLABEL_UPI, ["upi"], 10),
+        ]
+
+        pool, weights = zip(*self.BATCH_INSTRUMENTS)
+        made = []
+        for _ in range(max(1, n)):
+            behaviour, allowed, _share = rng.choices(
+                recipes, weights=[r[2] for r in recipes])[0]
+            choices = [i for i in allowed if i in pool] or list(pool)
+            instrument = rng.choices(
+                choices, weights=[weights[pool.index(i)] for i in choices])[0]
+
+            # Ticket sizes that straddle the Rs 2,000 debit-cap boundary, so
+            # rules 3 and 4 both get exercised rather than only whichever the
+            # amounts happened to fall under.
+            rupees = rng.choice([180, 340, 520, 890, 1_240, 1_650, 1_980,
+                                 2_400, 3_100, 4_750, 6_200, 9_900])
+            method, network, card_type, intl = INSTRUMENT_SHAPES[instrument]
+            order_id = self.create_order(rupees * 100, f"Sale {len(made) + 1}")
+            self.capture_payment(order_id, method, network, card_type, intl,
+                                 behaviour=behaviour)
+            made.append((instrument, str(behaviour)))
+
+        from collections import Counter
+        return {"n": len(made),
+                "instruments": dict(Counter(i for i, _b in made)),
+                "faults": dict(Counter(b for _i, b in made))}
+
     def imported_payments(self, limit: int = 200) -> list:
         """
         The transactions themselves, newest first - what the gateway said
@@ -3343,8 +3432,27 @@ class Ledger:
             " FROM vendor_terms_findings WHERE business_id = ?",
             (self._scoped(),)).fetchone()
 
+        # The same figures again, split by where the data came from. The
+        # waterfall shows one bar per stage; without this a merchant cannot
+        # tell whether the money on screen is their gateway's or the
+        # simulator's, which on a page mixing both is the first thing they
+        # need to know.
+        by_source = {}
+        for row in self.conn.execute(
+                "SELECT COALESCE(r.source, 'simulator') src,"
+                "       COALESCE(SUM(amount), 0) gross, COUNT(*) n FROM ("
+                "  SELECT p.payment_id AS pid, p.run_id AS rid,"
+                "         MAX(p.amount) AS amount"
+                "  FROM payments p JOIN business_runs br ON br.run_id = p.run_id"
+                "  WHERE br.business_id = ? GROUP BY p.payment_id) u"
+                " JOIN runs r ON r.run_id = u.rid GROUP BY src",
+                (self._scoped(),)):
+            by_source[row["src"]] = {"gross_paise": row["gross"],
+                                     "payment_count": row["n"]}
+
         fee_paise, tax_paise = deducted["fee"], deducted["tax"]
         return {
+            "by_source": by_source,
             "gross_paise": gross, "fee_paise": fee_paise, "tax_paise": tax_paise,
             "net_paise": gross - fee_paise - tax_paise,
             "bank_credited_paise": credited,

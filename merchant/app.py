@@ -860,6 +860,23 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
 </div>
 
 <div class="card">
+  <h2>Generate a month at once</h2>
+  <p class="sub" style="margin:3px 0 12px">Sixty sales across every rail a
+     small merchant sees &mdash; UPI, RuPay, Visa debit and credit, Amex,
+     netbanking, wallet, international &mdash; with the faults above mixed
+     through them rather than one applied to everything. Ticket sizes straddle
+     &#8377;2,000 so both debit caps get exercised. Roughly half come out
+     clean, which is the half that has to stay quiet.</p>
+  <form method="post" action="/data/simulator/batch">
+    <div class="row" style="max-width:320px">
+      <div><label>How many</label>
+        <input name="count" type="number" value="60" min="1" max="200"></div>
+      <div style="flex:0"><button>Generate and settle</button></div>
+    </div>
+  </form>
+</div>
+
+<div class="card">
   <h2>How your suppliers file</h2>
   <p class="sub" style="margin:3px 0 12px">The other side of the books. A real
      merchant has no idea whether a supplier filed &mdash; finding out is the
@@ -1674,6 +1691,41 @@ def sync_razorpay(key_secret: str = Form(""),
 
     key = "ok" if result.ok else "error"
     return RedirectResponse(f"/data?{key}={quote(message)}", status_code=303)
+
+
+@app.post("/data/simulator/batch")
+def generate_simulator_batch(count: str = Form("60"),
+                             ws: Workspace = Depends(required_workspace)):
+    """
+    A month of sales in one press, with the faults mixed through them.
+
+    Settles immediately: an unsettled batch has no fee to check, and the
+    point of generating sixty is to have something for the auditor to read.
+    """
+    from urllib.parse import quote
+
+    try:
+        n = max(1, min(200, int(count)))
+    except (TypeError, ValueError):
+        n = 60
+
+    with ledger(ws.business_id) as led:
+        info = led.generate_mixed_batch(n)
+        batch = led.build_settlement(led.rate_card())
+        run_id = led.commit_settlement(batch, source="simulator") if batch else None
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target=run_id or "", detail=f"generated {info['n']} simulated sales")
+
+    rails = len(info["instruments"])
+    faults = len([f for f in info["faults"] if f != "correct"])
+    message = (f"{info['n']} sales across {rails} payment methods, with "
+               f"{faults} different fault types mixed through them.")
+    if run_id:
+        return RedirectResponse(f"/settlements/{run_id}?ok={quote(message)}",
+                                status_code=303)
+    return RedirectResponse(f"/data/simulator?ok={quote(message)}",
+                            status_code=303)
 
 
 @app.post("/sale")
@@ -8083,10 +8135,17 @@ def settlements_page(ws: Workspace = Depends(required_workspace)):
         if detail else {"gross": 0, "deducted": 0, "recoverable_paise": 0,
                         "queued": 0}
 
+    def _src(row):
+        """Blue for the gateway, amber for the simulator - so a run's origin
+        reads at a glance rather than needing the id decoded."""
+        return "live" if (row["source"] or "simulator") == "razorpay" else "demo"
+
     rows = "".join(f"""
-      <tr>
+      <tr class="src-{_src(r)}">
         <td class="mono"><a href="/agents/settlement/run/{views.esc(r["run_id"])}"
-          style="color:var(--brand-ink)">{views.esc(r["run_id"])}</a></td>
+          style="color:var(--brand-ink)">{views.esc(r["run_id"])}</a>
+          <span class="src-tag {_src(r)}">{
+            "Razorpay" if _src(r) == "live" else "simulated"}</span></td>
         <td class="r">{views.when(r["created_at"])}</td>
         <td class="r">{r["n_records"]}</td>
         <td class="r">{rupees(detail[r["run_id"]]["gross"])}</td>
@@ -8308,6 +8367,25 @@ def _settlement_card(f, instrument: str, run_id: str) -> str:
                   if f["decided_by"] == "calculator"
                   else f'the agent at {(f["confidence"] or 0):.0%} confidence')
 
+    # How sure the agent is, on the card rather than folded away inside the
+    # working. A recommendation to dispute money is a different proposition
+    # at 95% than at 60%, and the person deciding needs that before they open
+    # anything. The calculator says so plainly instead of showing a number:
+    # a rule either applies or it does not, and dressing that as 100% would
+    # invite it to be read as the same kind of quantity.
+    if f["decided_by"] == "calculator":
+        conviction = ('<div class="fact"><span>Conviction</span>'
+                      '<b>Rule, not judgment</b><em>no confidence to state</em>'
+                      '</div>')
+    else:
+        pct = (f["confidence"] or 0)
+        tone = ("var(--good)" if pct >= 0.85
+                else "var(--warn)" if pct >= 0.7 else "var(--danger)")
+        conviction = (f'<div class="fact"><span>Agent conviction</span>'
+                      f'<b style="color:{tone}">{pct:.0%}</b>'
+                      f'<em>{"strong" if pct >= 0.85 else "moderate" if pct >= 0.7 else "weak - check it"}</em>'
+                      f'</div>')
+
     # A human's word on this, remembered so the agent can recall it the next
     # time a similar case comes up rather than raising the same question
     # twice. CLAUDE.md section 12 - this is the button that feeds it.
@@ -8352,6 +8430,7 @@ def _settlement_card(f, instrument: str, run_id: str) -> str:
       <b>{rupees(f["expected_fee"])}</b></div>
     <div class="fact"><span>GST charged</span>
       <b>{rupees(f["actual_tax"])}</b></div>
+    {conviction}
   </div>
 
   <div class="recommend">
