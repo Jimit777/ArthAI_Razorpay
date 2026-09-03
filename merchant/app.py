@@ -1222,9 +1222,15 @@ def _open_decisions(led, ws) -> list:
 
     for run in led.settlements():
         for finding in led.store.findings(run["run_id"], queued_only=True):
+            # With the agent switched off there is no reasoning, and the
+            # fallback repeated the code under its own label - "Unexplained"
+            # over "UNEXPLAINED", which says nothing twice. Say why it is
+            # unresolved instead.
             out.append({
                 "agent": "Settlement",
-                "what": finding["reasoning"] or finding["exception_code"],
+                "what": (finding["reasoning"]
+                         or "The rules found a gap here but could not name it. "
+                            "Run the agent, or decide it yourself."),
                 "why": finding["exception_code"].replace("_", " ").lower(),
                 "amount": finding["money_at_stake"] or 0,
                 "href": f"/agents/settlement/run/{run['run_id']}",
