@@ -353,3 +353,42 @@ def test_the_split_does_not_raise_a_gst_finding_on_a_consistent_fee(led):
         assert v.expected_tax != v.actual_tax or True  # readability
         assert str(v.exception_code or "") != str(ExceptionCode.GST_MISMATCH), (
             "a consistent GST-inclusive fee was read as a GST violation")
+
+
+# --- what the data panel records after an import ----------------------------
+
+def test_the_sync_records_the_import_not_the_empty_settlement_report(
+        shop_razorpay, monkeypatch):
+    """
+    Regression from a real sync. record_sync ran before the fallback, so the
+    page kept showing "no settlement lines" - the intermediate step - while
+    twelve payments had in fact just imported. The stored message must
+    describe the outcome.
+    """
+    import merchant.app as appmod
+    from merchant.sources import SyncResult
+
+    class FakeRazorpay:
+        def __init__(self, *a, **k):
+            pass
+
+        def settlements(self, year, month):
+            return SyncResult(True, "Connected, but 09/2026 has no "
+                                    "settlement lines.", 0, 0, 0, 0, [])
+
+        def captured_payments(self, count=100):
+            return SyncResult(True, "Read 3 captured payments.", 0, 3, 0, 0,
+                              [_api(id=f"pay_{i}") for i in range(3)])
+
+    # The handler imports Razorpay from merchant.sources at call time, so
+    # patching it there is what the running code will pick up.
+    monkeypatch.setattr("merchant.sources.Razorpay", FakeRazorpay)
+    monkeypatch.setattr("merchant.sources.Sources.stored_secret",
+                        lambda self, b: "secret")
+
+    shop_razorpay.post("/sources/sync", data={"key_secret": "s"})
+    page = shop_razorpay.get("/data").text
+
+    assert "3 payments imported" in page
+    assert "no settlement lines" not in page, (
+        "the intermediate message outlived the import that replaced it")

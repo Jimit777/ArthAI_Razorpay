@@ -1556,6 +1556,7 @@ def sync_razorpay(key_secret: str = Form(""),
     resolved = ws.business_id
     ws.require_owner("the data source connection")
 
+    from dataclasses import replace
     from datetime import datetime, timezone
     from urllib.parse import quote
 
@@ -1581,7 +1582,10 @@ def sync_razorpay(key_secret: str = Form(""),
                                     status_code=303)
         now = datetime.now(timezone.utc)
         result = client.settlements(now.year, now.month)
-        sources.record_sync(resolved, result)
+        # record_sync is deliberately NOT called yet. It writes the message
+        # this page shows until the next sync, and calling it here stored the
+        # settlements result - "no settlement lines" - which then sat on
+        # screen contradicting an import that had in fact just succeeded.
 
         # Store what came back, rather than only that the call worked. This
         # used to end at record_sync: the rows were fetched, counted in a
@@ -1634,6 +1638,13 @@ def sync_razorpay(key_secret: str = Form(""),
                     target=run_id,
                     detail=f"imported {imported.payments} settlement lines "
                            f"from Razorpay")
+
+        # Now that the outcome is known, persist THAT rather than the
+        # intermediate step's message.
+        sources.record_sync(
+            resolved, replace(result, message=message,
+                              payments_found=imported.payments if imported
+                              else result.payments_found))
 
     key = "ok" if result.ok else "error"
     return RedirectResponse(f"/data?{key}={quote(message)}", status_code=303)
