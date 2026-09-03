@@ -8152,6 +8152,12 @@ def settlements_page(ws: Workspace = Depends(required_workspace)):
     empty_href = "/data/simulator" if simulated else "/data"
     empty_label = "Take a payment" if simulated else "Pull your settlements"
 
+    delete_all = ("""
+    <form method="post" action="/settlements/delete-all"
+          onsubmit="return confirm('Delete EVERY settlement and all their findings? This cannot be undone.')">
+      <button class="ghost small" style="color:var(--danger)">Delete all</button>
+    </form>""" if runs else "")
+
     grand = {k: sum(d[k] for d in detail.values())
              for k in ("gross", "deducted", "recoverable_paise", "queued")} \
         if detail else {"gross": 0, "deducted": 0, "recoverable_paise": 0,
@@ -8179,6 +8185,12 @@ def settlements_page(ws: Workspace = Depends(required_workspace)):
           ('<span class="pill good">clean</span>' if r["findings"]
            else '<span class="pill">not audited</span>')}</td>
         <td class="r">{detail[r["run_id"]]["queued"] or "-"}</td>
+        <td class="r">
+          <form method="post" action="/settlements/{views.esc(r["run_id"])}/delete"
+                onsubmit="return confirm('Delete this settlement and its findings? This cannot be undone.')"
+                style="display:inline">
+            <button class="ghost small" style="color:var(--danger)">delete</button>
+          </form></td>
       </tr>""" for r in runs)
 
     body = f"""
@@ -8188,10 +8200,16 @@ def settlements_page(ws: Workspace = Depends(required_workspace)):
    deducted to get there. {len(runs)} batch(es) &middot;
    {rupees(grand["gross"])} gross &middot; {rupees(grand["deducted"])} deducted
    &middot; {rupees(grand["recoverable_paise"])} recoverable.</p>
-<div class="card flush"><table>
+<div class="card flush">
+  <div class="card-head">
+    <div><h2>Settlements</h2></div>
+    <span class="sp"></span>
+    {delete_all}
+  </div>
+  <div style="overflow-x:auto"><table>
   <tr><th>Settlement</th><th class="r">When</th><th class="r">Pmts</th>
       <th class="r">Gross</th><th class="r">Deducted</th><th class="r">Credited</th>
-      <th class="r">Recoverable</th><th class="r">Queued</th></tr>
+      <th class="r">Recoverable</th><th class="r">Queued</th><th class="r"></th></tr>
   {rows or f'<tr><td colspan="8" class="empty">'
            f'<div style="font-weight:560;color:var(--ink);margin-bottom:4px">'
            f'No settlements yet</div>'
@@ -8199,7 +8217,7 @@ def settlements_page(ws: Workspace = Depends(required_workspace)):
            f'together. Each one gets audited line by line.<br>'
            f'<a class="btn" style="margin-top:11px" href="{empty_href}">'
            f'{empty_label}</a></td></tr>'}
-</table></div>"""
+</table></div></div>"""
     return views.page("Settlements", body, "agent:settlement_audit", **shell)
 
 
@@ -8245,6 +8263,64 @@ def _run_agent(agent_id: str, ctx: AgentContext, runner=None) -> None:
     except Exception as exc:                                # noqa: BLE001
         state["state"] = "error"
         state["phase"] = f"{type(exc).__name__}: {exc}"
+
+
+@app.post("/settlements/{run_id}/delete")
+def delete_settlement(run_id: str, ws: Workspace = Depends(required_workspace)):
+    """Remove one settlement and everything hanging off it."""
+    from urllib.parse import quote
+
+    ws.require_owner("deleting a settlement")
+    with ledger(ws.business_id) as led:
+        gone = led.delete_run(run_id)
+        if gone:
+            AccessLog(led.conn).record(
+                Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+                target=run_id, detail="deleted a settlement and its findings")
+    if not gone:
+        return HTMLResponse(views.error_page(
+            "Not this business's settlement",
+            "That settlement belongs to a different business.",
+            "Back", "/agents/settlement"), status_code=404)
+    return RedirectResponse(
+        "/agents/settlement?ok=" + quote("Settlement deleted."),
+        status_code=303)
+
+
+@app.post("/settlements/{run_id}/payment/{payment_id}/delete")
+def delete_settlement_payment(run_id: str, payment_id: str,
+                              ws: Workspace = Depends(required_workspace)):
+    """Drop one transaction out of a settlement."""
+    from urllib.parse import quote
+
+    ws.require_owner("editing a settlement")
+    with ledger(ws.business_id) as led:
+        gone = led.delete_payment_from_run(run_id, payment_id)
+    if not gone:
+        return HTMLResponse(views.error_page(
+            "Not this business's settlement",
+            "That settlement belongs to a different business.",
+            "Back", "/agents/settlement"), status_code=404)
+    return RedirectResponse(
+        f"/settlements/{run_id}?ok=" + quote(f"{payment_id} removed."),
+        status_code=303)
+
+
+@app.post("/settlements/delete-all")
+def delete_all_settlements(ws: Workspace = Depends(required_workspace)):
+    """Every settlement this business holds."""
+    from urllib.parse import quote
+
+    ws.require_owner("deleting settlements")
+    with ledger(ws.business_id) as led:
+        n = led.delete_all_runs()
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target="", detail=f"deleted all {n} settlements")
+    return RedirectResponse(
+        "/agents/settlement?ok=" + quote(
+            f"{n} settlement{'s' if n != 1 else ''} deleted."),
+        status_code=303)
 
 
 @app.post("/audit/{run_id}")
@@ -8519,13 +8595,26 @@ def settlement_page(run_id: str, request: Request, error: str = "", ok: str = ""
         totals = led.store.totals(run_id)
         payments = {r["payment_id"]: r for r in led.conn.execute(
             "SELECT * FROM payments WHERE run_id = ?", (run_id,))}
+        # Per-payment fee and GST, so the run page can show the transactions
+        # themselves rather than only what they add up to.
+        # dict(), not the Row: a sqlite3.Row has no .get(), and the table
+        # below needs a default for a payment with no settlement line.
+        per_payment = {r["payment_id"]: dict(r) for r in led.conn.execute(
+            "SELECT payment_id, fee, tax FROM settlement_lines"
+            " WHERE run_id = ? AND type = 'payment'", (run_id,))}
         lines = led.conn.execute(
             "SELECT type, SUM(amount) a, SUM(fee) f, SUM(tax) t"
             " FROM settlement_lines WHERE run_id = ? GROUP BY type",
             (run_id,)).fetchall()
-        credited = led.conn.execute(
-            "SELECT COALESCE(SUM(amount),0) a FROM bank_credits WHERE run_id = ?",
-            (run_id,)).fetchone()["a"]
+        credit_rows = led.conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(amount),0) a FROM bank_credits"
+            " WHERE run_id = ?", (run_id,)).fetchone()
+        credited = credit_rows["a"]
+        # No rows at all is not the same as a credit of zero. The Payments API
+        # cannot say what reached the bank, so an import from it stores none -
+        # and reporting that as "Rs 0.00, does not reconcile" accuses the
+        # gateway of losing the entire settlement.
+        bank_known = credit_rows["n"] > 0
         # This business's own contract - there is no global rate card any more,
         # and labelling an instrument against someone else's would be wrong in
         # exactly the way this product exists to catch.
@@ -8540,7 +8629,47 @@ def settlement_page(run_id: str, request: Request, error: str = "", ok: str = ""
     if refunded:
         money.append(("Refunded to customers", -refunded))
     money += [("Gateway fees", -fee_total), ("GST on fees", -tax_total)]
-    ties = gross - refunded - fee_total - tax_total == credited
+    ties = (gross - refunded - fee_total - tax_total == credited
+            if bank_known else None)
+
+    # The transactions this settlement is made of. Shown before the audit
+    # rather than after it: "what is in here" is a different question from
+    # "what is wrong with it", and a merchant asks the first one first.
+    txn_rows = "".join(f"""
+      <tr>
+        <td class="mono" style="font-size:11.5px">{views.esc(pid)}</td>
+        <td>{views.esc(" ".join(x for x in (
+              p["method"], p["card_network"], p["card_type"]) if x))}</td>
+        <td class="r">{rupees(p["amount"])}</td>
+        <td class="r">{rupees(per_payment[pid]["fee"] + per_payment[pid]["tax"])
+                       if pid in per_payment else "&mdash;"}</td>
+        <td class="r">
+          <form method="post" action="/settlements/{views.esc(run_id)}/payment/{views.esc(pid)}/delete"
+                onsubmit="return confirm('Remove {views.esc(pid)} from this settlement?')"
+                style="display:inline">
+            <button class="ghost small">remove</button></form></td>
+      </tr>""" for pid, p in payments.items())
+
+    txn_table = f"""
+<div class="card flush">
+  <div class="card-head">
+    <div><h2>What is in this settlement</h2>
+      <p class="sub" style="margin:2px 0 0">{len(payments)} transaction{'s'
+        if len(payments) != 1 else ''}, as the gateway reported them</p></div>
+    <span class="sp"></span>
+    <form method="post" action="/settlements/{run_id}/delete"
+          onsubmit="return confirm('Delete this whole settlement and its findings? This cannot be undone.')">
+      <button class="ghost small" style="color:var(--danger)">Delete settlement</button>
+    </form>
+  </div>
+  <div style="overflow-x:auto">
+    <table>
+      <tr><th>Payment</th><th>Instrument</th><th class="r">Amount</th>
+          <th class="r">Charged</th><th class="r"></th></tr>
+      {txn_rows}
+    </table>
+  </div>
+</div>""" if payments else ""
 
     state = RUNS.get(run_id, {"state": "idle"})
     audited = bool(findings)
@@ -8795,16 +8924,22 @@ def settlement_page(run_id: str, request: Request, error: str = "", ok: str = ""
     {''.join(f'<div class="lbl">{views.esc(l)}</div>'
              f'<div class="val">{rupees(a)}</div>' for l, a in money)}
     <div class="lbl total">Credited to the bank</div>
-    <div class="val total">{rupees(credited)}</div>
+    <div class="val total">{rupees(credited) if bank_known
+                            else '<span style="color:var(--muted)">not reported</span>'}</div>
   </div>
   <p class="sub" style="margin:12px 0 0">{
     "Every line reconciles to the paise. That is the point: the arithmetic can "
     "be perfect and the rates still wrong."
-    if ties else "WARNING: these lines do not reconcile."}</p>
+    if ties else
+    "WARNING: these lines do not reconcile."
+    if ties is False else
+    "This source does not report what reached the bank, so there is nothing "
+    "to reconcile against. The fee and GST checks are unaffected."}</p>
 </div>
 
 {f'<div class="banner warn"><span>{views.esc(error)}</span></div>' if error else ''}
 {f'<div class="banner brand"><span>{views.esc(ok)}</span></div>' if ok else ''}
+{txn_table}
 {control}
 {trace_panel}
 {results}

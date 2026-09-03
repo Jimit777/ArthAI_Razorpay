@@ -2233,3 +2233,124 @@ def test_the_simulator_shows_every_generated_sale(client):
     assert page.count('<td class="mono">') == 60, "the batch was truncated"
     assert "60 sales" in page
     assert 'action="/sale"' not in page, "the single-sale form came back"
+
+
+def _one_settlement(client):
+    _start(client)
+    client.post("/data/simulator/batch", data={"count": "6"})
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        return led.settlements()[0]["run_id"]
+
+
+def test_a_settlement_can_be_deleted_with_its_findings(client):
+    """
+    A variance is a statement about rows. Leaving one behind after the rows
+    are gone would put a recoverable figure on Home pointing at nothing.
+    """
+    run_id = _one_settlement(client)
+    client.post(f"/audit/{run_id}", data={"use_agent": "no"})
+
+    client.post(f"/settlements/{run_id}/delete")
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert run_id not in {r["run_id"] for r in led.settlements()}
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM variances WHERE run_id = ?",
+            (run_id,)).fetchone()["n"] == 0
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM payments WHERE run_id = ?",
+            (run_id,)).fetchone()["n"] == 0
+
+
+def test_deleting_a_settlement_unsettles_its_payments_rather_than_erasing_them(
+        client):
+    """Deleting a settlement undoes the settling, not the sale."""
+    run_id = _one_settlement(client)
+
+    client.post(f"/settlements/{run_id}/delete")
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert len(led.unsettled()) == 6, "the sales went with the settlement"
+
+
+def test_one_transaction_can_be_dropped_from_a_settlement(client):
+    run_id = _one_settlement(client)
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        pid = led.conn.execute(
+            "SELECT payment_id FROM payments WHERE run_id = ?",
+            (run_id,)).fetchone()["payment_id"]
+
+    client.post(f"/settlements/{run_id}/payment/{pid}/delete")
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM payments WHERE run_id = ?",
+            (run_id,)).fetchone()["n"] == 5
+        # the header must not go on claiming a payment it no longer holds
+        assert led.conn.execute(
+            "SELECT n_records FROM runs WHERE run_id = ?",
+            (run_id,)).fetchone()["n_records"] == 5
+
+
+def test_delete_all_clears_every_settlement(client):
+    _start(client)
+    for _ in range(3):
+        client.post("/data/simulator/batch", data={"count": "4"})
+
+    client.post("/settlements/delete-all")
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert led.settlements() == []
+
+
+def test_one_business_cannot_delete_anothers_settlement(client):
+    run_id = _one_settlement(client)
+    client.get("/logout")
+    _signup(client, "other@x.in")
+    client.post("/businesses", data={"name": "Someone Else"})
+
+    response = client.post(f"/settlements/{run_id}/delete")
+
+    assert response.status_code == 404
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM runs WHERE run_id = ?",
+            (run_id,)).fetchone()["n"] == 1, "another business deleted it"
+
+
+def test_a_source_with_no_bank_data_is_not_called_unreconciled(client):
+    """
+    The Payments API cannot say what reached the bank, so an import stores no
+    credit. Reporting that as "Rs 0.00, does not reconcile" accuses the
+    gateway of losing the entire settlement.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    _start(client)
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        result = batch_from_payments([{
+            "id": "pay_x", "amount": 100_000, "status": "captured",
+            "captured": True, "method": "upi", "fee": 2_360, "tax": 360,
+            "created_at": 1_787_900_000, "order_id": "o", "international": False,
+            "amount_refunded": 0}], led.rate_card())
+        run_id = led.commit_settlement(result.batch, source="razorpay")
+
+    page = client.get(f"/settlements/{run_id}").text
+
+    assert "does not reconcile" not in page
+    assert "does not report what reached the bank" in page
+    assert "not reported" in page

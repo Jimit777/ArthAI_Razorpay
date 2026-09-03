@@ -3283,6 +3283,64 @@ class Ledger:
                 "instruments": dict(Counter(i for i, _b in made)),
                 "faults": dict(Counter(b for _i, b in made))}
 
+    def delete_run(self, run_id: str) -> bool:
+        """
+        Remove one settlement and everything hanging off it.
+
+        Scoped through business_runs, so one business cannot delete another's.
+        Deliberately takes the findings with it: a variance is a statement
+        about rows that no longer exist, and leaving it behind would put a
+        recoverable figure on the Home page pointing at nothing.
+        """
+        if not self.owns_run(run_id):
+            return False
+        for table in self.RUN_OWNED_TABLES:
+            self.conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+        self.conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        # The live payments this settled go back to unsettled rather than
+        # vanishing - deleting a settlement undoes the settling, not the sale.
+        self.conn.execute(
+            "UPDATE live_payments SET settled_run_id = NULL"
+            " WHERE settled_run_id = ? AND business_id = ?",
+            (run_id, self._scoped()))
+        self.conn.commit()
+        return True
+
+    def delete_payment_from_run(self, run_id: str, payment_id: str) -> bool:
+        """
+        Drop one transaction out of a settlement.
+
+        Its findings go too, for the same reason delete_run takes them: a
+        finding about a payment that is no longer in the batch is a claim
+        about nothing. The run's record count is corrected so the header does
+        not go on claiming a payment it no longer holds.
+        """
+        if not self.owns_run(run_id):
+            return False
+        for table in ("payments", "settlement_lines", "variances", "refunds"):
+            self.conn.execute(
+                f"DELETE FROM {table} WHERE run_id = ? AND payment_id = ?"
+                if table != "payments" else
+                "DELETE FROM payments WHERE run_id = ? AND payment_id = ?",
+                (run_id, payment_id))
+        self.conn.execute(
+            "UPDATE runs SET n_records = ("
+            "  SELECT COUNT(*) FROM payments WHERE run_id = ?)"
+            " WHERE run_id = ?", (run_id, run_id))
+        self.conn.execute(
+            "UPDATE live_payments SET settled_run_id = NULL"
+            " WHERE payment_id = ? AND business_id = ?",
+            (payment_id, self._scoped()))
+        self.conn.commit()
+        return True
+
+    def delete_all_runs(self) -> int:
+        """Every settlement this business holds. Returns how many went."""
+        ids = [r["run_id"] for r in self.settlements()]
+        for run_id in ids:
+            self.delete_run(run_id)
+        return len(ids)
+
     def imported_payments(self, limit: int = 200) -> list:
         """
         The transactions themselves, newest first - what the gateway said
