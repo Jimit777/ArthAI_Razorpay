@@ -417,6 +417,12 @@ def test_the_audit_survives_the_agent_being_unavailable(client, monkeypatch):
         raise RuntimeError("Could not resolve authentication method")
 
     monkeypatch.setattr(clf, "ClaudeClassifier", _explode)
+    # A key IS configured here. This test is about the agent failing at RUN
+    # time - a network drop, an expired card, a rate limit - which must
+    # degrade to a rules-only audit. Having no key at all is a different
+    # case, refused before the run starts; see
+    # test_an_agent_run_without_an_api_key_refuses_before_it_starts.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
 
     _start(client)
     client.post("/settings/gateway", data={"behaviour": "card_rate_on_upi"})
@@ -2124,3 +2130,46 @@ def test_exception_codes_keep_their_acronyms():
     assert views.code_label("GST_MISMATCH") == "GST mismatch"
     assert views.code_label("INSTRUMENT_MISLABEL") == "Instrument mislabel"
     assert views.code_label("") == ""
+
+
+def test_an_agent_run_without_an_api_key_refuses_before_it_starts(client,
+                                                                 monkeypatch):
+    """
+    Regression from a real run. With no key the Anthropic client raises on
+    every record, so the audit burned the whole settlement, marked itself
+    FAILED, and left one Python TypeError per payment on screen - "Could not
+    resolve authentication method" - which tells a merchant nothing.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _start(client)
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    client.post("/settle")
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        run_id = led.settlements()[0]["run_id"]
+
+    response = client.post(f"/audit/{run_id}", data={"use_agent": "yes"})
+
+    assert response.status_code == 400
+    assert "has no API key" in response.text
+    assert "Untick" in response.text, "no way forward was offered"
+
+
+def test_the_calculator_still_runs_without_a_key(client, monkeypatch):
+    """The refusal must not block the path that needs no key at all."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _start(client)
+    client.post("/sale", data={"rupees": "1000.00", "instrument": "upi"})
+    client.post("/settle")
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        run_id = led.settlements()[0]["run_id"]
+
+    response = client.post(f"/audit/{run_id}", data={"use_agent": "no"},
+                           follow_redirects=False)
+
+    assert response.status_code == 303, "the rules-only run was refused too"

@@ -104,6 +104,29 @@ def ledger(business_id: Optional[str] = None) -> Ledger:
     return Ledger(DB, business_id)
 
 
+def _needs_api_key(use_agent: bool, back_label: str, back_href: str):
+    """
+    Refuse an agent run with no key, before it starts.
+
+    Without ANTHROPIC_API_KEY the client raises on every record, so a run
+    burned the whole batch, marked itself FAILED, and printed one Python
+    TypeError per record - "Could not resolve authentication method" - which
+    tells a merchant nothing about what to do. Every agent here also runs on
+    its calculator alone, so that is the offer rather than a dead end.
+
+    Returns a response to return, or None to carry on.
+    """
+    if not use_agent or os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    return HTMLResponse(views.error_page(
+        "The agent has no API key",
+        "ANTHROPIC_API_KEY is not set, so the agent cannot judge anything "
+        "and every record would fail. Untick “Ask the agent” to run "
+        "on the rules alone — they find and price every gap without a "
+        "network call — or set the key and try again.",
+        back_label, back_href), status_code=400)
+
+
 def _shell(led: Ledger) -> dict:
     """
     Everything the frame needs, in one place.
@@ -2762,6 +2785,11 @@ async def run_payout_timing_demo(request: Request,
             target=key,
             detail=f"ran a payout timing audit on {source} data")
 
+    refusal = _needs_api_key(form.get("use_agent") == "yes",
+                             "Back", "/agents/payout-timing")
+    if refusal is not None:
+        return refusal
+
     ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
                        target_id=key, use_agent=(form.get("use_agent") == "yes"),
                        progress=_progress(key), source=source)
@@ -3128,6 +3156,11 @@ async def run_vendor_terms(request: Request,
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
             target=key, detail=f"ran a vendor invoice audit ({tab})")
 
+    refusal = _needs_api_key(form.get("use_agent") == "yes",
+                             "Back", "/agents/vendor-terms")
+    if refusal is not None:
+        return refusal
+
     ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
                        target_id=key, use_agent=(form.get("use_agent") == "yes"),
                        progress=_progress(key), source=source)
@@ -3448,6 +3481,11 @@ async def run_chargeback(request: Request,
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
             target=key, detail=f"ran a chargeback defence check ({tab})")
 
+    refusal = _needs_api_key(form.get("use_agent") == "yes",
+                             "Back", "/agents/chargeback")
+    if refusal is not None:
+        return refusal
+
     ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
                        target_id=key, use_agent=(form.get("use_agent") == "yes"),
                        progress=_progress(key), source=source)
@@ -3705,6 +3743,11 @@ async def run_gst_filing_demo(request: Request,
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
             target=key,
             detail=f"ran the GST output-tax pipeline on {source} data")
+
+    refusal = _needs_api_key(form.get("use_agent") == "yes",
+                             "Back", "/agents/gst-filing")
+    if refusal is not None:
+        return refusal
 
     ctx = AgentContext(business_id=ws.business_id, rate_card={}, db=DB,
                        target_id=key, use_agent=(form.get("use_agent") == "yes"),
@@ -5890,6 +5933,11 @@ def run_itc(request: Request, use_agent: str = Form("yes"),
             Action.RUN_AUDIT, user=ws.user, business_id=resolved,
             target=key, address="")
 
+    refusal = _needs_api_key(use_agent == "yes", "Back",
+                             "/agents/input-credit")
+    if refusal is not None:
+        return refusal
+
     ctx = AgentContext(business_id=resolved, rate_card=card, db=DB,
                        target_id=key, use_agent=(use_agent == "yes"),
                        progress=_progress(key))
@@ -6233,6 +6281,11 @@ def check_suppliers(request: Request, use_agent: str = Form("yes"),
         AccessLog(led.conn).record(
             Action.RUN_AUDIT, user=ws.user, business_id=resolved,
             target=key, address="", detail="ran the supplier watch")
+
+    refusal = _needs_api_key(use_agent == "yes", "Back",
+                             "/agents/input-credit")
+    if refusal is not None:
+        return refusal
 
     ctx = AgentContext(business_id=resolved, rate_card=card, db=DB,
                        target_id=key, use_agent=(use_agent == "yes"),
@@ -8128,6 +8181,22 @@ def start_audit(run_id: str, use_agent: str = Form("no"),
                 "That settlement belongs to a different business.",
                 "Back", "/settlements"), status_code=404)
         card = led.rate_card()
+
+    # Refuse before starting rather than after failing. Without a key the
+    # Anthropic client raises on every record, so the run burned the whole
+    # settlement, marked itself FAILED, and left one Python TypeError per
+    # payment on screen - "Could not resolve authentication method" - which
+    # tells a merchant nothing about what to do next. The calculator needs no
+    # key and finds the gaps on its own, so that is the offer.
+    if use_agent == "yes" and not os.environ.get("ANTHROPIC_API_KEY"):
+        return HTMLResponse(views.error_page(
+            "The agent has no API key",
+            "ANTHROPIC_API_KEY is not set, so the agent cannot classify "
+            "anything and every record would fail. Untick “Ask the agent” "
+            "to run on the rate card alone — it finds and prices every gap "
+            "without a network call — or set the key and try again.",
+            "Back to the settlement", f"/settlements/{run_id}"),
+            status_code=400)
 
     spec = catalog.get("settlement_audit")
     with _lock:
