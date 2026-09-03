@@ -1441,17 +1441,19 @@ def sources_page(ws: Workspace = Depends(required_workspace),
         # settlement workspace and infer it from a run list.
         with ledger(resolved) as led:
             imported_runs = led.settlements()
+            n_payments = led.imported_payment_count()
+            transactions = led.imported_payments(limit=100)
         n_runs = len(imported_runs)
-        n_payments = sum(r["n_records"] or 0 for r in imported_runs)
 
         if n_payments:
             on_file = f"""
         <div class="banner brand" style="margin:0 0 12px">
-          <b>{n_payments} payments imported</b>
-          <span>Across {n_runs} import{'s' if n_runs != 1 else ''}.
+          <b>{n_payments} transaction{'s' if n_payments != 1 else ''} imported</b>
+          <span>From {n_runs} import{'s' if n_runs != 1 else ''}.
             <a href="/agents/settlement">Open the settlement auditor</a> to
-            audit them.</span>
-        </div>"""
+            check what was charged on them.</span>
+        </div>
+        {views.imported_payments_table(transactions)}"""
         else:
             on_file = """
         <div class="banner warn" style="margin:0 0 12px">

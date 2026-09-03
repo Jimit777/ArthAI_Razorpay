@@ -287,7 +287,7 @@ def test_the_data_panel_counts_what_did_arrive(shop_razorpay):
 
     page = shop_razorpay.get("/data").text
 
-    assert "4 payments imported" in page
+    assert "4 transactions imported" in page
     assert "Nothing imported yet" not in page
 
 
@@ -389,6 +389,61 @@ def test_the_sync_records_the_import_not_the_empty_settlement_report(
     shop_razorpay.post("/sources/sync", data={"key_secret": "s"})
     page = shop_razorpay.get("/data").text
 
-    assert "3 payments imported" in page
+    assert "3 transactions imported" in page
     assert "no settlement lines" not in page, (
         "the intermediate message outlived the import that replaced it")
+
+
+# --- seeing the transactions themselves -------------------------------------
+
+def test_re_importing_does_not_multiply_the_transaction_count(led):
+    """
+    Pressing Import twice does not mean the money arrived twice. Each run is
+    a fresh snapshot of the same account, so counting rows turned twelve
+    transactions into thirty-six.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    rows = [_api(id=f"pay_{i}") for i in range(4)]
+    for _ in range(3):
+        led.commit_settlement(batch_from_payments(rows, card).batch)
+
+    assert led.imported_payment_count() == 4, "re-imports were double counted"
+    assert len(led.imported_payments()) == 4
+
+
+def test_the_transactions_show_the_instrument_and_what_was_charged(led):
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    led.commit_settlement(batch_from_payments([
+        _api(id="pay_u", method="upi", amount=162_700, fee=768, tax=0),
+        _api(id="pay_c", method="card", amount=30_000, fee=660, tax=0,
+             card={"network": "visa", "type": "debit"}),
+    ], card).batch)
+
+    by_id = {r["payment_id"]: r for r in led.imported_payments()}
+
+    assert by_id["pay_u"]["method"] == "upi"
+    assert by_id["pay_c"]["card_network"] == "visa"
+    assert by_id["pay_c"]["card_type"] == "debit"
+    # fee + tax must add back to what the gateway actually took.
+    assert by_id["pay_c"]["fee"] + by_id["pay_c"]["tax"] == 660
+
+
+def test_the_data_panel_lists_the_transactions_not_just_a_count(shop_razorpay):
+    import merchant.app as appmod
+    from merchant.settlement_import import batch_from_payments
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        led.commit_settlement(batch_from_payments(
+            [_api(id="pay_visible", method="upi", amount=162_700)],
+            led.rate_card()).batch)
+
+    page = shop_razorpay.get("/data").text
+
+    assert "What came in" in page
+    assert "pay_visible" in page, "the transaction itself is not shown"
+    assert "Rs 1,627.00" in page

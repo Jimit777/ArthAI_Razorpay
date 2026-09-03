@@ -3105,6 +3105,38 @@ class Ledger:
             " ON br.run_id = r.run_id WHERE br.business_id = ?"
             " ORDER BY r.created_at DESC", (self._scoped(),)).fetchall()
 
+    def imported_payments(self, limit: int = 200) -> list:
+        """
+        The transactions themselves, newest first - what the gateway said
+        happened, before anything audits it.
+
+        Deduplicated by payment_id, keeping the most recent import. Pressing
+        Import twice does not mean the money arrived twice: each run is a
+        fresh snapshot of the same account, so counting rows rather than
+        payments turned twelve transactions into thirty-six.
+        """
+        return self.conn.execute(
+            "SELECT p.payment_id, p.amount, p.method, p.card_network,"
+            "       p.card_type, p.is_international, p.upi_reference,"
+            "       p.created_at, sl.fee, sl.tax, sl.settled_at,"
+            "       MAX(r.created_at) AS imported_at"
+            " FROM payments p"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " JOIN runs r ON r.run_id = p.run_id"
+            " LEFT JOIN settlement_lines sl ON sl.run_id = p.run_id"
+            "   AND sl.payment_id = p.payment_id AND sl.type = 'payment'"
+            " WHERE br.business_id = ?"
+            " GROUP BY p.payment_id"
+            " ORDER BY p.created_at DESC LIMIT ?",
+            (self._scoped(), limit)).fetchall()
+
+    def imported_payment_count(self) -> int:
+        """Distinct transactions, not rows. See imported_payments."""
+        return self.conn.execute(
+            "SELECT COUNT(DISTINCT p.payment_id) n FROM payments p"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " WHERE br.business_id = ?", (self._scoped(),)).fetchone()["n"]
+
     def owns_run(self, run_id: str) -> bool:
         """One business must not be able to open another's settlement by id."""
         return self.conn.execute(

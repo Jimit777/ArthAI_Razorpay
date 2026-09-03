@@ -594,6 +594,62 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
   </aside>"""
 
 
+def imported_payments_table(rows) -> str:
+    """
+    The transactions themselves - what the gateway said happened, before
+    anything audits them.
+
+    Deliberately shows no verdict. This is the raw import, and a merchant
+    asking "did my transactions come through" is asking a different question
+    from "was I charged correctly"; answering the second here would make the
+    data panel a second, quieter opinion competing with the auditor's.
+    """
+    if not rows:
+        return ""
+
+    body = ""
+    for r in rows:
+        bits = [str(r["method"] or "unknown")]
+        if r["card_network"]:
+            bits.append(str(r["card_network"]))
+        if r["card_type"]:
+            bits.append(str(r["card_type"]))
+        if r["is_international"]:
+            bits.append("international")
+        charged = (r["fee"] or 0) + (r["tax"] or 0)
+        when = (_day_words(
+            datetime.fromtimestamp(r["created_at"], timezone.utc)
+            .date().isoformat()) if r["created_at"] else "&mdash;")
+        body += f"""
+    <tr>
+      <td class="mono" style="font-size:11.5px">{esc(r["payment_id"])}</td>
+      <td>{esc(" ".join(bits))}</td>
+      <td class="r">{esc(rupees(r["amount"]))}</td>
+      <td class="r">{esc(rupees(charged))}</td>
+      <td class="r" style="color:var(--muted)">{when}</td>
+    </tr>"""
+
+    return f"""
+    <div class="card flush" style="margin:0 0 12px">
+      <div class="card-head"><h2>What came in</h2>
+        <span class="sub">{len(rows)} transaction{'s' if len(rows) != 1 else ''},
+          newest first</span></div>
+      <div style="overflow-x:auto">
+        <table>
+          <tr><th>Payment</th><th>Instrument</th><th class="r">Amount</th>
+              <th class="r">Charged</th><th class="r">Paid on</th></tr>
+          {body}
+        </table>
+      </div>
+      <div style="padding:10px 16px;border-top:1px solid var(--line-2);
+        color:var(--muted);font-size:11.5px">
+        Straight from the gateway, before any audit. &ldquo;Charged&rdquo; is
+        the fee plus GST Razorpay deducted &mdash; whether it should have is
+        the auditor&rsquo;s question, not this table&rsquo;s.
+      </div>
+    </div>"""
+
+
 def summarise(text: str, words: int = 20) -> str:
     """
     The first sentence of an agent's reasoning, capped.
