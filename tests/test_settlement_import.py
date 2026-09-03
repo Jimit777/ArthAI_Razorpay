@@ -30,6 +30,30 @@ def _row(**over) -> dict:
 
 
 @pytest.fixture
+def shop_razorpay(tmp_path, monkeypatch):
+    """A signed-in business whose source is Razorpay, which is what makes the
+    import card render at all."""
+    from fastapi.testclient import TestClient
+
+    import merchant.app as appmod
+
+    monkeypatch.setattr(appmod, "DB", str(tmp_path / "app.db"))
+    client = TestClient(appmod.app)
+    client.post("/signup", data={"name": "D", "email": "d@x.in",
+                                 "password": "a-long-password"})
+    client.post("/businesses", data={"name": "Data Panel"})
+    with appmod.ledger() as led:
+        business_id = led.businesses.all()[0]["business_id"]
+        led.conn.execute(
+            "INSERT OR REPLACE INTO data_sources (business_id, kind,"
+            " razorpay_key_id, last_status, last_message)"
+            " VALUES (?,'razorpay','rzp_test_x','ok','Connected.')",
+            (business_id,))
+        led.conn.commit()
+    return client
+
+
+@pytest.fixture
 def led(tmp_path):
     boot = Ledger(tmp_path / "i.db")
     business_id = boot.businesses.create("Import Test")
@@ -233,3 +257,33 @@ def test_payments_from_the_api_audit_like_any_other_batch(led):
     variance = detect_batch(led.load_batch(run_id, card))[0]
     assert variance.expected_fee < variance.actual_fee, (
         "a UPI payment charged at a card rate was not flagged")
+
+
+# --- the data panel tells you whether anything arrived ----------------------
+
+def test_the_data_panel_says_when_nothing_has_been_imported(shop_razorpay):
+    """
+    "My transactions are not showing up" was unanswerable from this page: it
+    offered a Sync button and no statement of what, if anything, had landed.
+    """
+    page = shop_razorpay.get("/data").text
+
+    assert "Import from Razorpay" in page
+    assert "Nothing imported yet" in page
+    assert "captured" in page, "the authorised-vs-captured trap is not named"
+
+
+def test_the_data_panel_counts_what_did_arrive(shop_razorpay):
+    import merchant.app as appmod
+    from merchant.settlement_import import batch_from_payments
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        result = batch_from_payments(
+            [_api(id=f"pay_{i}") for i in range(4)], led.rate_card())
+        led.commit_settlement(result.batch)
+
+    page = shop_razorpay.get("/data").text
+
+    assert "4 payments imported" in page
+    assert "Nothing imported yet" not in page

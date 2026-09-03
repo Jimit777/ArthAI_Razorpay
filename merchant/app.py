@@ -1436,16 +1436,45 @@ def sources_page(ws: Workspace = Depends(required_workspace),
                   '<button class="ghost">Forget the stored secret</button>'
                   '</form>' if has_secret else "")
 
+        # What is already imported, so the page can answer "did my
+        # transactions come through?" without a person having to open the
+        # settlement workspace and infer it from a run list.
+        with ledger(resolved) as led:
+            imported_runs = led.settlements()
+        n_runs = len(imported_runs)
+        n_payments = sum(r["n_records"] or 0 for r in imported_runs)
+
+        if n_payments:
+            on_file = f"""
+        <div class="banner brand" style="margin:0 0 12px">
+          <b>{n_payments} payments imported</b>
+          <span>Across {n_runs} import{'s' if n_runs != 1 else ''}.
+            <a href="/agents/settlement">Open the settlement auditor</a> to
+            audit them.</span>
+        </div>"""
+        else:
+            on_file = """
+        <div class="banner warn" style="margin:0 0 12px">
+          <b>Nothing imported yet</b>
+          <span>Press Import below. If it finds nothing, your payments may
+            still be authorised rather than captured &mdash; only a captured
+            payment carries the fee this auditor checks.</span>
+        </div>"""
+
         sync = f"""
       <div class="card">
-        <h2>Pull settlements</h2>
+        <h2>Import from Razorpay</h2>
         <p class="sub" style="margin:3px 0 12px">Reads the settlement recon
-           report &mdash; the only place a gateway states, line by line, what it
-           deducted and why. Our whole schema mirrors its columns.</p>
+           report first &mdash; the only place a gateway states, line by line,
+           what it deducted. Test mode never settles, so on a test account it
+           falls back to your captured payments, which carry Razorpay's own fee
+           and tax. That is enough to check every rate and GST figure, though
+           not settlement timing.</p>
+        {on_file}
         <form method="post" action="/sources/sync">
           <div class="row">
             {field}
-            <div style="flex:0"><button>Sync</button>{forget}</div>
+            <div style="flex:0"><button>Import</button>{forget}</div>
           </div>
         </form>
       </div>"""
