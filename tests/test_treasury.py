@@ -1638,3 +1638,54 @@ def test_a_live_payout_run_measures_the_merchant_s_own_settlements(led):
     assert run is not None
     assert run["source"] == "connected", "a live run was recorded as demo"
     assert run["n_sla_miss"] == 3, "the three late settlements were not found"
+
+
+def test_payout_timing_can_read_this_platforms_own_settlements(led):
+    """
+    Razorpay never settles in test mode, so its recon report is permanently
+    empty there and this agent had no real source at all. A batch settled
+    here carries both dates the question needs.
+    """
+    card = led.rate_card()
+    led.generate_mixed_batch(10)
+    led.commit_settlement(led.build_settlement(card, delay_working_days=3))
+
+    batch = led.settled_payout_batch()
+
+    assert batch is not None
+    assert len(batch.invoices) == 10 and len(batch.settlements) == 10
+    assert batch.bank == [], "this source has no bank statement to offer"
+
+
+def test_nothing_settled_yet_is_not_an_empty_answer(led):
+    """"No delay found" and "nothing to look at" must not share a screen."""
+    led.generate_mixed_batch(5)          # captured, but never settled
+    assert led.settled_payout_batch() is None
+
+
+def test_a_settlement_on_time_reports_nothing_late(led):
+    from merchant.payout_timing_pipeline import run as run_pipeline
+
+    led.generate_mixed_batch(8)
+    led.commit_settlement(led.build_settlement(led.rate_card()))
+
+    summary = run_pipeline(led.settled_payout_batch(), use_agent=False,
+                           source="connected").summary
+
+    assert summary.n_settled == 8
+    assert summary.n_sla_miss == 0, "an on-time settlement was called late"
+
+
+def test_a_late_settlement_is_measured_and_priced(led):
+    """The delay control exists so this agent has something real to find."""
+    from merchant.payout_timing_pipeline import run as run_pipeline
+
+    led.generate_mixed_batch(8)
+    led.commit_settlement(led.build_settlement(led.rate_card(),
+                                               delay_working_days=4))
+
+    result = run_pipeline(led.settled_payout_batch(), use_agent=False,
+                          source="connected")
+
+    assert result.summary.n_sla_miss == 8
+    assert result.decision.float_cost_paise > 0, "a delay cost nothing"

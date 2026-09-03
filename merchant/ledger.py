@@ -2259,6 +2259,57 @@ class Ledger:
     # consider enough to run.
     PAYOUT_TIMING_SOURCES = ("invoice", "settlement")
 
+    def settled_payout_batch(self):
+        """
+        Payout timing over the settlements THIS platform produced.
+
+        Razorpay never settles in test mode, so the recon report a merchant
+        could point this agent at is permanently empty there. But the
+        settlements made here carry both dates the question needs - when the
+        payment was captured, and when the batch settled - so the loop can be
+        closed without leaving the platform at all.
+
+        Returns None when nothing has been settled yet. Every other source
+        this agent reads returns None rather than an empty answer for the
+        same reason: "no delay found" and "nothing to look at" are different
+        statements and must not share a screen.
+        """
+        from datetime import date as _date
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        from engine.recon.records import Invoice, ReconBatch, Settlement
+
+        rows = self.conn.execute(
+            "SELECT p.payment_id, p.amount, p.created_at, p.method,"
+            "       sl.fee, sl.tax, sl.settled_at"
+            " FROM payments p"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " JOIN settlement_lines sl ON sl.run_id = p.run_id"
+            "   AND sl.payment_id = p.payment_id AND sl.type = 'payment'"
+            " WHERE br.business_id = ? AND sl.settled_at > 0",
+            (self._scoped(),)).fetchall()
+        if not rows:
+            return None
+
+        def when(ts):
+            return _dt.fromtimestamp(ts, _tz.utc).date() if ts else _date.today()
+
+        invoices, settlements = [], []
+        for r in rows:
+            fee = (r["fee"] or 0) + (r["tax"] or 0)
+            invoices.append(Invoice(
+                invoice_id=r["payment_id"],
+                customer_name=(r["method"] or "sale").upper(),
+                amount=r["amount"], date_issued=when(r["created_at"]),
+                status="issued"))
+            settlements.append(Settlement(
+                txn_id=r["payment_id"], gross_amount=r["amount"],
+                fee_deducted=fee, net_settled=r["amount"] - fee,
+                settlement_date=when(r["settled_at"]),
+                invoice_reference=r["payment_id"], utr=None))
+        return ReconBatch(invoices=invoices, settlements=settlements, bank=[])
+
     def payout_timing_batch(self):
         """
         Real sales and real settlements, ready for the payout timing detector.
@@ -3053,7 +3104,8 @@ class Ledger:
 
     # --- settlement -------------------------------------------------------
 
-    def build_settlement(self, rate_card: dict) -> Optional[Batch]:
+    def build_settlement(self, rate_card: dict,
+                         delay_working_days: int = 0) -> Optional[Batch]:
         """
         Sweep every unsettled payment into one batch, exactly as a gateway does.
 
@@ -3080,9 +3132,13 @@ class Ledger:
         # month, red in the last few days, flipping mid-afternoon on 28 August
         # 2026 with no code change.
         latest = max((row["captured_at"] or 0) for row in pending)
+        # delay_working_days is the gateway missing its own promise. Without
+        # it every settlement made here lands exactly on T+2, so the payout
+        # timing auditor reading these settlements would correctly and
+        # uselessly report that nothing was ever late.
         settled_at = int(add_working_days(
             datetime.fromtimestamp(latest, timezone.utc),
-            SETTLEMENT_WORKING_DAYS).timestamp())
+            SETTLEMENT_WORKING_DAYS + max(0, delay_working_days)).timestamp())
 
         records: list[Record] = []
         for row in pending:

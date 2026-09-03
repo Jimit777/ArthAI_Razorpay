@@ -44,11 +44,17 @@ def run_payout_timing(ctx: AgentContext) -> None:
 
     with Ledger(ctx.db, ctx.business_id) as led:
         if live:
-            batch = led.payout_timing_batch()
+            # Settlements made on this platform first. Razorpay does not
+            # settle in test mode, so its recon report is permanently empty
+            # there - but a batch settled here carries both dates this
+            # question needs, and asking it of real local data beats
+            # refusing because a remote report has nothing in it.
+            batch = led.settled_payout_batch() or led.payout_timing_batch()
             if batch is None:
                 missing = led.payout_timing_missing()
                 raise ValueError(
-                    "Nothing to audit yet - still missing your "
+                    "Nothing to audit yet. Settle a batch on the simulator, "
+                    "or upload your "
                     + " and ".join(
                         {"invoice": "sales", "settlement": "settlements"}[m]
                         for m in missing) + ".")

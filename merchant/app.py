@@ -898,12 +898,18 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
      &#8377;2,000 so both debit caps get exercised, and roughly half come out
      clean, which is the half that has to stay quiet.</p>
   <form method="post" action="/data/simulator/batch">
-    <div class="row" style="max-width:320px">
+    <div class="row" style="max-width:470px">
       <div><label>How many</label>
         <input name="count" type="number" value="60" min="1" max="200"></div>
+      <div><label>Settled this many days late</label>
+        <input name="delay" type="number" value="0" min="0" max="10"></div>
       <div style="flex:0"><button>Generate and settle</button></div>
     </div>
   </form>
+  <p class="sub" style="margin:10px 0 0;font-size:11.3px">A delay here is the
+     gateway missing its own T+{rules_payout.SETTLEMENT_WORKING_DAYS} cycle.
+     Leave it at zero and the payout timing auditor correctly finds nothing;
+     set it and it has a real delay to measure and price.</p>
 </div>
 
 <div class="card">
@@ -930,9 +936,17 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
     settle = ""
     if pending:
         settle = f"""
-      <form method="post" action="/settle">
+      <form method="post" action="/settle"
+            style="display:flex;align-items:center;gap:9px">
         <button>Settle {len(pending)} payment{'s' if len(pending) != 1 else ''}
           &rarr; {rupees(gross - deducted)}</button>
+        <label style="font-size:12px;color:var(--muted);display:flex;
+          align-items:center;gap:6px;white-space:nowrap">
+          days late
+          <input name="delay" type="number" value="0" min="0" max="10"
+            style="width:62px" title="Settle later than the promised T+2, so
+              the payout timing auditor has a delay to measure">
+        </label>
       </form>"""
 
     warn = "" if audit_on else (
@@ -1704,7 +1718,7 @@ def sync_razorpay(key_secret: str = Form(""),
 
 
 @app.post("/data/simulator/batch")
-def generate_simulator_batch(count: str = Form("60"),
+def generate_simulator_batch(count: str = Form("60"), delay: str = Form("0"),
                              ws: Workspace = Depends(required_workspace)):
     """
     A month of sales in one press, with the faults mixed through them.
@@ -1718,13 +1732,18 @@ def generate_simulator_batch(count: str = Form("60"),
         n = max(1, min(200, int(count)))
     except (TypeError, ValueError):
         n = 60
+    try:
+        late = max(0, min(10, int(delay)))
+    except (TypeError, ValueError):
+        late = 0
 
     with ledger(ws.business_id) as led:
         # Only the faults ticked above. The switch and the generator are the
         # same control; two places to say what the gateway does would drift.
         info = led.generate_mixed_batch(
             n, behaviours=led.businesses.behaviours(ws.business_id))
-        batch = led.build_settlement(led.rate_card())
+        batch = led.build_settlement(led.rate_card(),
+                                     delay_working_days=late)
         run_id = led.commit_settlement(batch, source="simulator") if batch else None
         AccessLog(led.conn).record(
             Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
@@ -8141,10 +8160,24 @@ def submit_question(request: Request, question: str = Form(...),
 # --- settlements ----------------------------------------------------------
 
 @app.post("/settle")
-def settle(ws: Workspace = Depends(required_workspace)):
+def settle(delay: str = Form("0"),
+           ws: Workspace = Depends(required_workspace)):
+    """
+    Settle the pending payments, optionally later than promised.
+
+    `delay` is the gateway missing its own T+2 cycle. It exists so the payout
+    timing auditor has something to measure on data this platform produced -
+    Razorpay never settles in test mode, so its recon report is empty there
+    and that agent had no real source at all.
+    """
+    try:
+        late = max(0, min(10, int(delay)))
+    except (TypeError, ValueError):
+        late = 0
+
     resolved = ws.business_id
     with ledger(resolved) as led:
-        batch = led.build_settlement(led.rate_card())
+        batch = led.build_settlement(led.rate_card(), delay_working_days=late)
         if batch is None:
             return RedirectResponse("/data/simulator", status_code=303)
         run_id = led.commit_settlement(batch)
