@@ -1609,7 +1609,8 @@ def sync_razorpay(key_secret: str = Form(""),
 
                 imported = batch_from_payments(fallback.raw, led.rate_card())
                 if imported.ok:
-                    run_id = led.commit_settlement(imported.batch)
+                    # Replaces the previous import rather than stacking on it.
+                    run_id = led.replace_imported_settlements(imported.batch)
                     message = (
                         f"No settlements yet, so {imported.payments} captured "
                         f"payments were imported instead - enough to check "
@@ -1626,7 +1627,7 @@ def sync_razorpay(key_secret: str = Form(""),
 
             imported = batch_from_recon(result.raw, led.rate_card())
             if imported.ok:
-                run_id = led.commit_settlement(imported.batch)
+                run_id = led.replace_imported_settlements(imported.batch)
                 message = (f"{imported.payments} payments and "
                            f"{imported.refunds} refunds imported and ready to "
                            f"audit.")

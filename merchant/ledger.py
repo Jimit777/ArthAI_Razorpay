@@ -841,6 +841,11 @@ class Ledger:
 
         _add_column(self.store.conn, "supplier_filing_history",
                     "gstr3b_known", "INTEGER DEFAULT 1")
+        # Where a settlement run came from. Existing rows default to
+        # 'simulator', which is what every run predating the Razorpay
+        # importer actually was.
+        _add_column(self.store.conn, "runs", "source",
+                    "TEXT DEFAULT 'simulator'")
         # Resolution memory predates business scoping - CLAUDE.md section 12
         # was written when this was a single-business tool. Without this
         # column one merchant's confirmed resolution could be recalled for
@@ -3083,10 +3088,19 @@ class Ledger:
         return batch
 
     def commit_settlement(self, batch: Batch, model: str = "", effort: str = "",
-                          via_batch: bool = False) -> str:
-        """Persist the batch as a run and mark its payments settled."""
+                          via_batch: bool = False,
+                          source: str = "simulator") -> str:
+        """
+        Persist the batch as a run and mark its payments settled.
+
+        `source` records where the run came from. Without it an import and a
+        simulated settlement are indistinguishable once stored - both carry
+        seed 0 - and a re-import cannot tell which earlier runs it replaces.
+        """
         run_id = self.store.save_run(batch, model=model, effort=effort,
                                      via_batch=via_batch)
+        self.conn.execute("UPDATE runs SET source = ? WHERE run_id = ?",
+                          (source, run_id))
         self.conn.execute(
             "INSERT INTO business_runs (run_id, business_id, created_at)"
             " VALUES (?,?,?)", (run_id, self._scoped(), int(time.time())))
@@ -3104,6 +3118,53 @@ class Ledger:
             " ) AS findings FROM runs r JOIN business_runs br"
             " ON br.run_id = r.run_id WHERE br.business_id = ?"
             " ORDER BY r.created_at DESC", (self._scoped(),)).fetchall()
+
+    # Everything a settlement run owns. Listed rather than discovered, so
+    # adding a table is a deliberate decision about what replacing an import
+    # takes with it - the same reasoning Businesses.OWNED_TABLES uses.
+    RUN_OWNED_TABLES = ("payments", "settlement_lines", "bank_credits",
+                        "refunds", "tds_entries", "rate_card", "variances",
+                        "audit_log", "business_runs")
+
+    def replace_imported_settlements(self, batch, source: str = "razorpay"):
+        """
+        Commit an import, replacing the last one from the same source.
+
+        A re-import is a fresh snapshot of the same Razorpay account, not more
+        money - so it must correct rather than double, which is the rule this
+        codebase already applies to purchase registers and recon sources.
+        Stacking them instead is what made three imports of twelve payments
+        read as thirty-six sales.
+
+        Only imports from THIS source are replaced. Simulator runs are a
+        different account of what happened and are left alone, as are imports
+        a person has already made decisions on - the check below refuses to
+        discard those rather than quietly taking someone's reviewed findings
+        with it.
+        """
+        previous = [
+            r["run_id"] for r in self.conn.execute(
+                "SELECT r.run_id FROM runs r JOIN business_runs br"
+                " ON br.run_id = r.run_id"
+                " WHERE br.business_id = ? AND r.source = ?",
+                (self._scoped(), source)).fetchall()]
+
+        reviewed = {
+            r["run_id"] for r in self.conn.execute(
+                "SELECT DISTINCT run_id FROM variances"
+                " WHERE human_reviewed = 1").fetchall()} if previous else set()
+
+        run_id = self.commit_settlement(batch, source=source)
+
+        for old in previous:
+            if old in reviewed:
+                continue                # somebody acted on it; it is evidence
+            for table in self.RUN_OWNED_TABLES:
+                self.conn.execute(f"DELETE FROM {table} WHERE run_id = ?",
+                                  (old,))
+            self.conn.execute("DELETE FROM runs WHERE run_id = ?", (old,))
+        self.conn.commit()
+        return run_id
 
     def imported_payments(self, limit: int = 200) -> list:
         """

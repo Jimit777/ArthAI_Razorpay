@@ -475,3 +475,56 @@ def test_the_dashboard_totals_do_not_grow_when_you_import_twice(led):
     assert thrice["fee_paise"] == once["fee_paise"], "fees were double counted"
     assert thrice["payment_count"] == 5
     assert dict(thrice["method_mix"])["upi"] == 5
+
+
+def test_re_importing_replaces_the_previous_import(led):
+    """
+    The root fix. A re-import is a fresh snapshot of the same account, so it
+    corrects rather than doubles - the rule this codebase already applies to
+    purchase registers and recon sources. Deduplicating on read was treating
+    the symptom.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    rows = [_api(id=f"pay_{i}", amount=100_000) for i in range(4)]
+
+    for _ in range(3):
+        led.replace_imported_settlements(batch_from_payments(rows, card).batch)
+
+    assert len(led.settlements()) == 1, "imports stacked instead of replacing"
+    assert led.imported_payment_count() == 4
+
+
+def test_an_import_does_not_delete_simulator_runs(led):
+    """A simulated settlement is a different account of what happened, not a
+    stale copy of this one."""
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    led.commit_settlement(
+        batch_from_payments([_api(id="pay_sim")], card).batch,
+        source="simulator")
+    led.replace_imported_settlements(
+        batch_from_payments([_api(id="pay_live")], card).batch)
+
+    assert len(led.settlements()) == 2, "the simulator run was taken with it"
+
+
+def test_an_import_somebody_reviewed_is_not_discarded(led):
+    """Replacing must not quietly take a person's decisions with it."""
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    first = led.replace_imported_settlements(
+        batch_from_payments([_api(id="pay_1")], card).batch)
+    led.conn.execute(
+        "INSERT INTO variances (run_id, payment_id, human_reviewed)"
+        " VALUES (?,?,1)", (first, "pay_1"))
+    led.conn.commit()
+
+    led.replace_imported_settlements(
+        batch_from_payments([_api(id="pay_1")], card).batch)
+
+    assert first in {r["run_id"] for r in led.settlements()}, (
+        "a reviewed run was discarded by a re-import")
