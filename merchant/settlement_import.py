@@ -66,6 +66,41 @@ def _text(value) -> Optional[str]:
     return text or None
 
 
+def _split_fee(row, rate_card: dict) -> tuple:
+    """
+    Razorpay's two endpoints disagree about what `fee` means, and reading one
+    with the other's convention is a real error, not a nicety.
+
+    On the SETTLEMENT RECON REPORT, `fee` and `tax` are separate columns: the
+    total deducted is fee + tax, which is why recon_import adds them.
+
+    On the PAYMENTS API, `fee` is documented as the fee INCLUDING GST, and
+    `tax` is the GST portion within it. Storing that `fee` as this engine's
+    `fee` - which is exclusive of GST - overstates the fee by the GST on it
+    and leaves the tax reading zero, so every record raises a GST mismatch
+    against a tax that was actually charged and simply not separated.
+
+    Where `tax` is reported, it is used and nothing is assumed. Where it comes
+    back zero - which test mode does - the split is computed from the
+    documented inclusive relationship rather than left as "no GST was
+    charged", because a fee with no GST is not a thing that happens in India
+    and reporting twelve GST violations on that basis would be a false
+    accusation twelve times over.
+    """
+    fee_inclusive = _int(row.get("fee"))
+    reported_tax = _int(row.get("tax"))
+    if reported_tax:
+        return fee_inclusive - reported_tax, reported_tax
+
+    gst_bps = _int(rate_card.get("gst_rate_bps"), 1_800)
+    if not fee_inclusive or gst_bps <= 0:
+        return fee_inclusive, 0
+    # fee_inclusive = base * (1 + gst); recover base, then the remainder is
+    # the GST actually inside it, so the two always add back to what was paid.
+    base = round(fee_inclusive * 10_000 / (10_000 + gst_bps))
+    return base, fee_inclusive - base
+
+
 def batch_from_payments(rows, rate_card: dict) -> ImportResult:
     """
     Captured payments from the Payments API, as an auditable Batch.
@@ -114,11 +149,11 @@ def batch_from_payments(rows, rate_card: dict) -> ImportResult:
                 # cross-field evidence rule 9 needs, so it is not used as it.
                 upi_reference=None))
 
+        fee_ex_gst, gst = _split_fee(row, rate_card)
         record.settlement_lines.append(SettlementLine(
             entity_id=payment_id, settlement_id="", type="payment",
             payment_id=payment_id, order_id=order_id, amount=amount,
-            fee=_int(row.get("fee")), tax=_int(row.get("tax")),
-            utr="", settled_at=0))
+            fee=fee_ex_gst, tax=gst, utr="", settled_at=0))
 
         refunded = abs(_int(row.get("amount_refunded")))
         if refunded:

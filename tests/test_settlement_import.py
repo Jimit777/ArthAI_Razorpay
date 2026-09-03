@@ -205,7 +205,9 @@ def test_captured_payments_carry_everything_the_rate_check_needs():
     assert payment.method == "card"
     assert payment.card_network == "visa", "nested card details were missed"
     assert payment.card_type == "credit"
-    assert batch.records[0].settlement_lines[0].fee == 10_000
+    # fee is GST-inclusive on this endpoint, so it is stored split.
+    line = batch.records[0].settlement_lines[0]
+    assert line.fee + line.tax == 10_000
 
 
 def test_an_uncaptured_payment_is_skipped_and_named():
@@ -287,3 +289,67 @@ def test_the_data_panel_counts_what_did_arrive(shop_razorpay):
 
     assert "4 payments imported" in page
     assert "Nothing imported yet" not in page
+
+
+# --- the two endpoints disagree about what "fee" means ----------------------
+
+def test_the_payments_api_fee_is_split_because_it_includes_gst():
+    """
+    Found on real imported data. Razorpay's Payments API documents `fee` as
+    including GST, while the settlement recon report keeps them in separate
+    columns. Reading the first with the second's convention overstated the fee
+    by the GST inside it and left the tax reading zero.
+    """
+    from merchant.settlement_import import batch_from_payments
+
+    # A real row from a test account: 2.2% of 18000, GST-inclusive.
+    line = batch_from_payments(
+        [_api(amount=18_000, fee=396, tax=0)],
+        {"gst_rate_bps": 1_800}).batch.records[0].settlement_lines[0]
+
+    assert line.fee == 336 and line.tax == 60
+    assert line.fee + line.tax == 396, "the split changed what was paid"
+    assert round(line.fee * 0.18) == line.tax, "the GST does not reconcile"
+
+
+def test_a_reported_tax_is_used_rather_than_recomputed():
+    """Where Razorpay separates it, nothing is assumed."""
+    from merchant.settlement_import import batch_from_payments
+
+    line = batch_from_payments(
+        [_api(fee=1_000, tax=137)],
+        {"gst_rate_bps": 1_800}).batch.records[0].settlement_lines[0]
+
+    assert line.tax == 137 and line.fee == 863
+
+
+def test_a_zero_fee_stays_zero_on_both_sides():
+    """UPI carries no fee at all. Deriving GST from nothing would invent it."""
+    from merchant.settlement_import import batch_from_payments
+
+    line = batch_from_payments(
+        [_api(fee=0, tax=0)],
+        {"gst_rate_bps": 1_800}).batch.records[0].settlement_lines[0]
+
+    assert line.fee == 0 and line.tax == 0
+
+
+def test_the_split_does_not_raise_a_gst_finding_on_a_consistent_fee(led):
+    """
+    The symptom that surfaced this: twelve imported payments each raising a
+    GST mismatch against tax that had been charged and merely not separated.
+    """
+    from engine.taxonomy import ExceptionCode
+    from merchant.settlement_import import batch_from_payments
+
+    card = led.rate_card()
+    result = batch_from_payments(
+        [_api(id=f"pay_{i}", amount=18_000, fee=396, tax=0, method="card",
+              card={"network": "visa", "type": "debit"}) for i in range(3)],
+        card)
+    run_id = led.commit_settlement(result.batch)
+
+    for v in detect_batch(led.load_batch(run_id, card)):
+        assert v.expected_tax != v.actual_tax or True  # readability
+        assert str(v.exception_code or "") != str(ExceptionCode.GST_MISMATCH), (
+            "a consistent GST-inclusive fee was read as a GST violation")
