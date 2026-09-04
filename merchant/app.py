@@ -4726,8 +4726,6 @@ def _recon_page(ws: Workspace, tab: str, key: str, error: str, ok: str):
     payload = state.get("payload")
     if payload:
         body = views.recon_results(payload, key).replace("{key}", key)
-    elif tab == "upload":
-        body = views.recon_upload_screen(held)
     elif tab == "connected":
         body = views.recon_connected_screen(held, source_kind, last_pull)
     else:
@@ -4778,11 +4776,22 @@ def three_way_matched(ws: Workspace = Depends(required_workspace),
                                    "agent:three_way_recon", **shell))
 
 
-@app.get("/agents/three-way/upload", response_class=HTMLResponse)
-def three_way_upload_page(ws: Workspace = Depends(required_workspace),
-                          key: str = "", error: str = "", ok: str = ""):
-    """Your own three exports. Works for any merchant with any bank."""
-    return _recon_page(ws, "upload", key, error, ok)
+@app.get("/agents/three-way/upload")
+def three_way_upload_page(key: str = "", error: str = "", ok: str = ""):
+    """
+    Gone - Connected absorbed it.
+
+    Connected uploads your invoices and your bank statement and takes
+    settlements from the settlement auditor, which left this tab asking for
+    all three on a screen that was otherwise identical. Kept as a redirect so
+    a bookmark still lands somewhere useful.
+    """
+    from urllib.parse import urlencode
+
+    q = urlencode({k: v for k, v in
+                   (("key", key), ("error", error), ("ok", ok)) if v})
+    return RedirectResponse("/agents/three-way/connected"
+                            + (f"?{q}" if q else ""), status_code=303)
 
 
 @app.get("/agents/three-way/connected", response_class=HTMLResponse)
@@ -4814,19 +4823,19 @@ async def upload_recon_source(request: Request,
     kind = str(form.get("kind") or "")
     if kind not in RECON_FIELD:
         return RedirectResponse(
-            "/agents/three-way/upload?error="
+            "/agents/three-way/connected?error="
             + quote("That is not one of the three sources."), status_code=303)
 
     upload = form.get(RECON_FIELD[kind])
     if upload is None or not getattr(upload, "filename", ""):
         return RedirectResponse(
-            "/agents/three-way/upload?error=" + quote("Choose a file first."),
+            "/agents/three-way/connected?error=" + quote("Choose a file first."),
             status_code=303)
 
     data = await upload.read()
     if len(data) > 12 * 1024 * 1024:
         return RedirectResponse(
-            "/agents/three-way/upload?error="
+            "/agents/three-way/connected?error="
             + quote(f"{upload.filename} is over 12 MB."), status_code=303)
 
     parse = {"invoice": recon_import.parse_invoices,
@@ -4836,7 +4845,7 @@ async def upload_recon_source(request: Request,
 
     if not result.ok:
         return RedirectResponse(
-            "/agents/three-way/upload?error="
+            "/agents/three-way/connected?error="
             + quote(f"Could not read {upload.filename}. Missing columns: "
                     f"{', '.join(result.missing_columns)}."), status_code=303)
 
@@ -4844,7 +4853,7 @@ async def upload_recon_source(request: Request,
                result.settlements if kind == "settlement" else result.credits)
     if not records:
         return RedirectResponse(
-            "/agents/three-way/upload?error="
+            "/agents/three-way/connected?error="
             + quote(f"{upload.filename} had the right columns and no usable "
                     f"rows. {'; '.join(result.rows_skipped[:2])}"),
             status_code=303)
@@ -4863,7 +4872,7 @@ async def upload_recon_source(request: Request,
     if result.rows_skipped:
         message += f" {len(result.rows_skipped)} rows were skipped."
     return RedirectResponse(
-        "/agents/three-way/upload?ok=" + quote(message), status_code=303)
+        "/agents/three-way/connected?ok=" + quote(message), status_code=303)
 
 
 def _take_platform_settlements(ws: Workspace, back: str) -> RedirectResponse:
@@ -4980,7 +4989,7 @@ def forget_recon_sources(ws: Workspace = Depends(required_workspace)):
     with ledger(ws.business_id) as led:
         led.forget_recon_sources()
     return RedirectResponse(
-        "/agents/three-way/upload?ok="
+        "/agents/three-way/connected?ok="
         + quote("All three sources cleared."), status_code=303)
 
 

@@ -152,10 +152,12 @@ AGENT_ROUTES: dict[str, AgentRoute] = {
             # the dashboard are identical whichever tab produced the run.
             AgentTab("Demo Mode", "",
                      "generated invoices, settlements and credits, one click"),
-            AgentTab("Upload", "upload",
-                     "your own three exports - works with any bank"),
+            # No Upload tab: Connected already uploads your invoices and
+            # your bank statement, and takes settlements from the settlement
+            # auditor - so a second tab that asked for all three was the same
+            # screen with one more thing to supply.
             AgentTab("Connected", "connected",
-                     "settlements pulled from Razorpay; you upload two"),
+                     "settlements from the settlement auditor; you upload two"),
             AgentTab("Matched", "matched",
                      "every line the three sources closed between them"),
         )),

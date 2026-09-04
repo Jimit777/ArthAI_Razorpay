@@ -677,18 +677,33 @@ def test_all_three_sources_are_required(shop):
 def test_uploads_survive_a_page_load(shop):
     """Assembling three exports is real work. Nobody should be asked twice."""
     _upload_all(shop)
-    page = shop.get("/agents/three-way/upload").text
+    page = shop.get("/agents/three-way/connected").text
 
     assert "Ready to reconcile" in page
     assert "3 invoice" in page or "3 records" in page
-    for name in ("tally.csv", "rzp.csv", "hdfc.csv"):
+    # The two sources this tab still asks you for. Settlements are named by
+    # the settlement auditor now, not by an uploaded file.
+    for name in ("tally.csv", "hdfc.csv"):
         assert name in page
+
+
+def test_the_upload_tab_is_gone(shop):
+    """
+    Connected absorbed it: same screen, one more thing to supply.
+
+    Kept as a redirect rather than a 404 so an old bookmark still lands
+    somewhere useful.
+    """
+    hop = shop.get("/agents/three-way/upload", follow_redirects=False)
+    assert hop.headers["location"] == "/agents/three-way/connected"
+    assert "Upload" not in shop.get("/agents/three-way/connected").text.split(
+        "<main")[0]
 
 
 def test_clearing_removes_all_three(shop):
     _upload_all(shop)
     shop.post("/agents/three-way/forget")
-    page = shop.get("/agents/three-way/upload").text
+    page = shop.get("/agents/three-way/connected").text
     assert "Not ready yet" in page
 
 

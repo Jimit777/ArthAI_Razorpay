@@ -2089,39 +2089,6 @@ def _recon_run_card(held: dict, ready: bool, connected: bool = False) -> str:
 </div>"""
 
 
-def recon_upload_screen(held: dict) -> str:
-    """
-    Your own three exports. Works for any merchant with any bank.
-
-    Deliberately not framed as the lesser option. For the bank leg it is
-    currently the only honest one - there is no free API that hands an Indian
-    merchant their own statement, and the regulated alternative needs a
-    commercial relationship most merchants will never have.
-    """
-    ready = all(held.get(k) for k in ("invoice", "settlement", "bank"))
-    return f"""
-<div class="banner brand" style="margin-bottom:16px">
-  <span><b>Nothing here is filed, claimed or paid.</b> Your files are read,
-  joined and reported on. Nothing is sent anywhere.</span>
-</div>
-
-{_recon_run_card(held, ready)}
-{_recon_source_card("invoice", held)}
-{_recon_source_card("settlement", held)}
-{_recon_source_card("bank", held)}
-
-<div class="card tint">
-  <h2>Why the bank statement is a file and not a connection</h2>
-  <p class="sub" style="margin:4px 0 0;max-width:70ch">There is no free API
-     that hands an Indian merchant their own bank statement. The Account
-     Aggregator framework is the regulated answer and needs an AA or TSP
-     relationship &mdash; the same wall as a GSP for GST filing history. A
-     net-banking CSV export works for every bank, today, with no commercial
-     dependency, so that is what this asks for. If you have a corporate
-     account with an API, the importer takes the same shape.</p>
-</div>"""
-
-
 def settlements_from_auditor_card(held: dict, action: str) -> str:
     """
     The one control that fills the settlement side, shared by three-way recon
@@ -2176,7 +2143,18 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
 {_recon_source_card("invoice", held)}
 {_recon_source_card("bank", held)}
 {_recon_run_card(held, all(held.get(k) for k in
-                           ("invoice", "settlement", "bank")), connected=True)}"""
+                           ("invoice", "settlement", "bank")), connected=True)}
+
+<div class="card tint">
+  <h2>Why the bank statement is a file and not a connection</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">There is no free API
+     that hands an Indian merchant their own bank statement. The Account
+     Aggregator framework is the regulated answer and needs an AA or TSP
+     relationship &mdash; the same wall as a GSP for GST filing history. A
+     net-banking CSV export works for every bank, today, with no commercial
+     dependency, so that is what this asks for. If you have a corporate
+     account with an API, the importer takes the same shape.</p>
+</div>"""
 
 
 # --- the forward cash forecaster ------------------------------------------
