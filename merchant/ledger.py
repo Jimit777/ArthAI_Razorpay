@@ -2275,6 +2275,41 @@ class Ledger:
     # consider enough to run.
     PAYOUT_TIMING_SOURCES = ("invoice", "settlement")
 
+    def invoice_link_state(self) -> dict:
+        """
+        Why a Razorpay invoice is or is not matched to a settled payment.
+
+        Three things have to be true, and "no invoices linked" was reported
+        identically whichever failed, which made it look like a matter of
+        importing more invoices when usually it is not:
+          * an invoice exists at all
+          * Razorpay says a PAYMENT settled it - an unpaid invoice has none
+          * that payment was imported here, which simulator payments never
+            were: their ids are generated locally and were never behind a
+            Razorpay invoice
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) n,"
+            " SUM(CASE WHEN COALESCE(razorpay_payment_id,'') <> ''"
+            "     THEN 1 ELSE 0 END) with_payment"
+            " FROM live_sale_invoices WHERE business_id = ?",
+            (self._scoped(),)).fetchone()
+        matched = self.conn.execute(
+            "SELECT COUNT(*) n FROM live_sale_invoices i"
+            " JOIN payments p ON p.payment_id = i.razorpay_payment_id"
+            " JOIN business_runs br ON br.run_id = p.run_id"
+            " WHERE i.business_id = ? AND br.business_id = ?",
+            (self._scoped(), self._scoped())).fetchone()["n"]
+        imported_runs = self.conn.execute(
+            "SELECT COUNT(*) n FROM runs r JOIN business_runs br"
+            " ON br.run_id = r.run_id"
+            " WHERE br.business_id = ? AND r.source = 'razorpay'",
+            (self._scoped(),)).fetchone()["n"]
+        return {"invoices": row["n"] or 0,
+                "with_payment": row["with_payment"] or 0,
+                "matched": matched,
+                "razorpay_runs": imported_runs}
+
     def settled_payout_batch(self):
         """
         Payout timing over the settlements THIS platform produced.

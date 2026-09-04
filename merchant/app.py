@@ -2683,10 +2683,30 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
         billed = sum(1 for i in settled.invoices
                      if i.customer_name not in ("UPI", "CARD", "NETBANKING",
                                                 "WALLET", "SALE"))
-        source_line = (f"{billed} of them matched to a Razorpay invoice"
-                       if billed else
-                       "no Razorpay invoices linked yet, so the payment "
-                       "itself stands in for the sale")
+        # Name which of the three conditions failed. "No invoices linked"
+        # read as "import more invoices", which is usually not the fix.
+        link = led.invoice_link_state()
+        if link["matched"]:
+            source_line = (f"{link['matched']} matched to a Razorpay invoice, "
+                           f"so those carry your own customer and invoice date")
+        elif not link["invoices"]:
+            source_line = ("no Razorpay invoices imported yet, so the payment "
+                           "itself stands in for the sale. Sync them from "
+                           "Data &amp; integrations")
+        elif not link["with_payment"]:
+            source_line = (f"{link['invoices']} invoices imported, but none "
+                           f"records a payment against it. Razorpay only "
+                           f"names one once an invoice has been PAID, so "
+                           f"unpaid invoices cannot be matched")
+        elif not link["razorpay_runs"]:
+            source_line = ("invoices are linked to payments, but no Razorpay "
+                           "payments have been imported here to match them "
+                           "against - simulated payments never paid a real "
+                           "invoice")
+        else:
+            source_line = ("invoices and settled payments are both here, but "
+                           "none share a payment - these invoices were paid "
+                           "by payments this platform has not imported")
         ready = f"""
         <div class="banner brand" style="margin:0 0 12px">
           <b>{n_inv} settled payment{'s' if n_inv != 1 else ''} ready to check</b>

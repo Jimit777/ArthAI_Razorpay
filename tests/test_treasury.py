@@ -1743,3 +1743,37 @@ def test_a_linked_razorpay_invoice_becomes_the_sale_side(led):
     assert matched.date_issued == date(2026, 9, 1), "the invoice date was ignored"
     # every payment still counted, invoiced or not
     assert len(batch.invoices) == 4
+
+
+def test_the_page_names_which_invoice_link_condition_failed(led):
+    """
+    "No invoices linked" read as "import more invoices", which is usually not
+    the fix. Three separate things can be missing and each needs saying.
+    """
+    card = led.rate_card()
+    led.generate_mixed_batch(3)
+    led.commit_settlement(led.build_settlement(card))
+
+    assert led.invoice_link_state()["invoices"] == 0
+
+    # An invoice that Razorpay has not marked paid carries no payment.
+    led.conn.execute(
+        "INSERT INTO live_sale_invoices (invoice_id, business_id,"
+        " invoice_number, invoice_date, buyer_name, buyer_gstin,"
+        " place_of_supply, hsn_code, taxable_value)"
+        " VALUES ('inv_1',?,'INV-1','2026-09-01','A','','27','6109',1000)",
+        (led.business_id,))
+    led.conn.commit()
+    state = led.invoice_link_state()
+    assert state["invoices"] == 1 and state["with_payment"] == 0
+    assert state["matched"] == 0
+
+    # Paid, and by a payment this platform holds - now it matches.
+    pid = led.conn.execute(
+        "SELECT payment_id FROM payments LIMIT 1").fetchone()["payment_id"]
+    led.conn.execute(
+        "UPDATE live_sale_invoices SET razorpay_payment_id = ?"
+        " WHERE invoice_id = 'inv_1'", (pid,))
+    led.conn.commit()
+
+    assert led.invoice_link_state()["matched"] == 1
