@@ -2124,48 +2124,33 @@ def recon_upload_screen(held: dict) -> str:
 
 def recon_connected_screen(held: dict, source_kind: Optional[str],
                            last_pull: str = "") -> str:
-    """Settlements pulled from Razorpay; the other two still uploaded."""
-    if source_kind != "razorpay":
-        return f"""
-<div class="banner warn">
-  <span><b>No Razorpay account is connected to this business.</b> Connect one
-    in <a href="/data">Data &amp; integrations</a> and settlement reports are
-    pulled for you &mdash; you would still upload your invoices and your bank
-    statement, because neither of those is on the gateway.</span>
-</div>
+    """
+    Settlements come from the settlement auditor; the other two are uploaded.
 
-<div class="card tint">
-  <h2>What connecting changes, and what it does not</h2>
-  <p class="sub" style="margin:4px 0 0;max-width:70ch">One of the three
-     sources stops being a download. Razorpay&rsquo;s settlement recon report
-     is the only endpoint in this product that states, line by line, what a
-     gateway deducted and what it sent &mdash; so that leg becomes automatic
-     and current. Your invoices live in your accounting system and your
-     statement lives at your bank, so those two stay uploads on the
-     <a href="/agents/three-way/upload">Upload</a> tab.</p>
-</div>"""
-
+    No longer gated on a Razorpay connection: the settlement side is whatever
+    this platform already holds, however it got here - a simulated batch or a
+    real import - so demanding a gateway connection refused the tab to
+    businesses that had settlements ready to match.
+    """
     settled = held.get("settlement")
     return f"""
 <div class="src ok">
   <span class="src-dot"></span>
-  <div><b>Razorpay connected</b>
-    <div class="src-what">Settlement reports are pulled for this business.
-      {esc(last_pull)}</div></div>
+  <div><b>Settlements come from the settlement auditor</b>
+    <div class="src-what">Whatever this platform already holds, simulated or
+      imported. Your invoices and your bank statement are still yours to
+      upload &mdash; neither is on the gateway.</div></div>
 </div>
 
 <div class="card">
-  <h2>Pull settlements</h2>
-  <p class="sub" style="margin:3px 0 12px;max-width:68ch">One month of the
-     settlement recon report, straight from Razorpay. Payment lines only
-     &mdash; refunds, transfers and adjustments belong in a settlement audit
-     rather than in a three-way match against sales invoices.</p>
-  <form method="post" action="/agents/three-way/pull">
-    <div class="row">
-      <div><label>Year</label><input name="year" value="2026" required></div>
-      <div><label>Month</label><input name="month" value="07" required></div>
-      <div style="flex:0;align-self:flex-end"><button>Pull</button></div>
-    </div>
+  <h2>Settlements</h2>
+  <p class="sub" style="margin:3px 0 12px;max-width:68ch">Taken from the
+     settlement auditor &mdash; the batches this platform already holds,
+     whichever gateway they came from. Payment lines only: refunds, transfers
+     and adjustments belong in a settlement audit rather than in a three-way
+     match against sales invoices.</p>
+  <form method="post" action="/agents/three-way/use-settlements">
+    <button>Use my settlements</button>
   </form>
   {'<p class="sub" style="margin:11px 0 0;font-size:11.5px">'
    + str(settled["records"]) + ' settlement lines on file.</p>'

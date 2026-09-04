@@ -774,11 +774,24 @@ def test_razorpay_recon_rows_become_settlements():
     assert out[0].net_settled == 12000000 - 240000 - 43200
 
 
-def test_the_connected_tab_says_what_is_missing_without_an_account(shop):
+def test_the_connected_tab_takes_settlements_from_the_auditor(shop):
+    """
+    The settlement side is whatever this platform already holds, however it
+    got here - so the tab no longer demands a gateway connection, which used
+    to refuse it to businesses that had settlements ready to match.
+    """
     page = shop.get("/agents/three-way/connected").text
-    assert "No Razorpay account is connected" in page
-    # And is honest that connecting only replaces one of the three.
+    assert "settlement auditor" in page
+    assert "Use my settlements" in page
+    # Still honest that only one of the three is provided for you.
     assert "invoices" in page and "statement" in page
+
+
+def test_using_settlements_with_none_settled_is_refused(shop):
+    response = shop.post("/agents/three-way/use-settlements",
+                         follow_redirects=False)
+    assert "No settlements yet" in response.headers["location"].replace(
+        "%20", " ")
 
 
 def test_a_pull_without_an_account_is_refused(shop):

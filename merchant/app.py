@@ -4860,6 +4860,34 @@ async def upload_recon_source(request: Request,
         "/agents/three-way/upload?ok=" + quote(message), status_code=303)
 
 
+@app.post("/agents/three-way/use-settlements")
+def use_platform_settlements(ws: Workspace = Depends(required_workspace)):
+    """
+    Take the settlement side from the settlement auditor rather than pulling
+    it again from Razorpay.
+
+    The batches are already here, already parsed, and already the thing this
+    match is supposed to check against - and on test keys the recon report
+    that the pull read is permanently empty, so that button could only ever
+    return nothing.
+    """
+    from urllib.parse import quote
+
+    back = "/agents/three-way/connected"
+    with ledger(ws.business_id) as led:
+        batch = led.settled_payout_batch()
+        if batch is None:
+            return RedirectResponse(back + "?error=" + quote(
+                "No settlements yet. Settle a batch, or import one from "
+                "Razorpay on Data & integrations."), status_code=303)
+        stored = led.replace_recon_source(
+            "settlement", batch.settlements, "settlement auditor")
+
+    return RedirectResponse(back + "?ok=" + quote(
+        f"{stored} settlement line{'s' if stored != 1 else ''} taken from the "
+        f"settlement auditor."), status_code=303)
+
+
 @app.post("/agents/three-way/pull")
 async def pull_recon_settlements(request: Request,
                                  ws: Workspace = Depends(required_workspace)):
