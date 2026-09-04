@@ -551,3 +551,16 @@ def test_a_missing_settlement_date_is_not_a_period_boundary(led):
         assert "CROSSES_ACCOUNTING_PERIOD" not in kinds, (
             "a missing settlement date was read as 1 Jan 1970")
         assert kinds, "the real rate finding was lost too"
+
+
+def test_the_import_and_forget_controls_are_not_nested_forms(shop_razorpay):
+    """
+    A form inside a form is invalid HTML - the parser closes the outer one
+    early and the inner button lands wherever the browser decides, which is
+    how "Forget the stored secret" ended up floating off the card.
+    """
+    import re
+
+    page = shop_razorpay.get("/data").text
+
+    assert re.search(r"<form[^>]*>(?:(?!</form>).)*?<form", page, re.S) is None

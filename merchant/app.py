@@ -1509,9 +1509,12 @@ def sources_page(ws: Workspace = Depends(required_workspace),
                  if not has_secret else
                  '<div class="sub" style="margin:0">The secret is stored '
                  'encrypted, so this can run unattended.</div>')
-        forget = ('<form method="post" action="/sources/forget" '
-                  'style="display:inline;margin-left:9px">'
-                  '<button class="ghost">Forget the stored secret</button>'
+        # Rendered as a SIBLING of the sync form, never inside it. A form
+        # nested in a form is invalid HTML: the parser closes the outer one
+        # early and the button lands somewhere of the browser's choosing,
+        # which is exactly how it looked.
+        forget = ('<form method="post" action="/sources/forget">'
+                  '<button class="ghost small">Forget the stored secret</button>'
                   '</form>' if has_secret else "")
 
         # What is already imported, so the page can answer "did my
@@ -1551,12 +1554,15 @@ def sources_page(ws: Workspace = Depends(required_workspace),
            and tax. That is enough to check every rate and GST figure, though
            not settlement timing.</p>
         {on_file}
-        <form method="post" action="/sources/sync">
-          <div class="row">
-            {field}
-            <div style="flex:0"><button>Import</button>{forget}</div>
-          </div>
-        </form>
+        <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap">
+          <form method="post" action="/sources/sync" style="flex:1;min-width:240px">
+            <div class="row">
+              {field}
+              <div style="flex:0"><button>Import</button></div>
+            </div>
+          </form>
+          {forget}
+        </div>
       </div>"""
 
     body = f"""
