@@ -1714,6 +1714,18 @@ def test_a_settled_batch_is_offered_without_any_upload(led, tmp_path,
     assert "settled payment" in page and "ready to check" in page
     assert "Measure my payouts" in page, "the run button was still disabled"
 
+    # Same control as the three-way tab: settlements come from the auditor,
+    # never from a Razorpay pull that is empty on test keys.
+    assert "Use my settlements" in page and "settlement auditor" in page
+    assert "payout-timing/pull" not in page
+
+    taken = client.post("/agents/payout-timing/use-settlements",
+                        follow_redirects=False)
+    assert "settlement auditor" in taken.headers["location"].replace(
+        "%20", " ")
+    assert "settlement lines on file" in client.get(
+        "/agents/payout-timing/connected").text
+
 
 def test_a_linked_razorpay_invoice_becomes_the_sale_side(led):
     """

@@ -2122,6 +2122,36 @@ def recon_upload_screen(held: dict) -> str:
 </div>"""
 
 
+def settlements_from_auditor_card(held: dict, action: str) -> str:
+    """
+    The one control that fills the settlement side, shared by three-way recon
+    and payout timing.
+
+    Both agents want the same thing - the batches this platform already holds -
+    and both used to offer a Razorpay pull for it, which returns nothing on
+    test keys. One card, one button, one wording, so the two tabs cannot drift
+    apart in what they claim to read.
+    """
+    settled = held.get("settlement")
+    on_file = ("" if not settled else
+               f'<p class="sub" style="margin:11px 0 0;font-size:11.5px">'
+               f'{settled["records"]} settlement line'
+               f'{"s" if settled["records"] != 1 else ""} on file.</p>')
+    return f"""
+<div class="card">
+  <h2>Settlements</h2>
+  <p class="sub" style="margin:3px 0 12px;max-width:68ch">Taken from the
+     settlement auditor &mdash; the batches this platform already holds,
+     whichever gateway they came from. Payment lines only: refunds, transfers
+     and adjustments are a settlement audit's business, not a match against
+     your own sales.</p>
+  <form method="post" action="{esc(action)}">
+    <button>Use my settlements</button>
+  </form>
+  {on_file}
+</div>"""
+
+
 def recon_connected_screen(held: dict, source_kind: Optional[str],
                            last_pull: str = "") -> str:
     """
@@ -2132,7 +2162,6 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
     real import - so demanding a gateway connection refused the tab to
     businesses that had settlements ready to match.
     """
-    settled = held.get("settlement")
     return f"""
 <div class="src ok">
   <span class="src-dot"></span>
@@ -2142,20 +2171,7 @@ def recon_connected_screen(held: dict, source_kind: Optional[str],
       upload &mdash; neither is on the gateway.</div></div>
 </div>
 
-<div class="card">
-  <h2>Settlements</h2>
-  <p class="sub" style="margin:3px 0 12px;max-width:68ch">Taken from the
-     settlement auditor &mdash; the batches this platform already holds,
-     whichever gateway they came from. Payment lines only: refunds, transfers
-     and adjustments belong in a settlement audit rather than in a three-way
-     match against sales invoices.</p>
-  <form method="post" action="/agents/three-way/use-settlements">
-    <button>Use my settlements</button>
-  </form>
-  {'<p class="sub" style="margin:11px 0 0;font-size:11.5px">'
-   + str(settled["records"]) + ' settlement lines on file.</p>'
-   if settled else ''}
-</div>
+{settlements_from_auditor_card(held, "/agents/three-way/use-settlements")}
 
 {_recon_source_card("invoice", held)}
 {_recon_source_card("bank", held)}

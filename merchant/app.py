@@ -2739,6 +2739,11 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
                  f'<p class="sub" style="margin:2px 0 12px;font-size:11.5px">'
                  f'{detail}</p>')
 
+    # The same control the three-way tab uses, so "where do settlements come
+    # from" has one answer across the platform instead of two.
+    take = (views.settlements_from_auditor_card(
+        held, "/agents/payout-timing/use-settlements") if connected else "")
+
     upload_kinds = (("invoice",) if connected
                     else Ledger.PAYOUT_TIMING_SOURCES)
     uploads = "".join(f"""
@@ -2776,8 +2781,9 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
      back to generated data.</p>"""
 
     return f"""
+{take}
 <div class="card">
-  <h2>{'Pulled from Razorpay' if connected else 'Your own exports'}</h2>
+  <h2>{'Measure your payouts' if connected else 'Your own exports'}</h2>
   <p class="sub" style="margin:6px 0 14px">Measures when each sale actually
      settled against the T+{rules_payout.SETTLEMENT_WORKING_DAYS} working-day
      cycle. No bank statement needed.</p>
@@ -4860,20 +4866,19 @@ async def upload_recon_source(request: Request,
         "/agents/three-way/upload?ok=" + quote(message), status_code=303)
 
 
-@app.post("/agents/three-way/use-settlements")
-def use_platform_settlements(ws: Workspace = Depends(required_workspace)):
+def _take_platform_settlements(ws: Workspace, back: str) -> RedirectResponse:
     """
     Take the settlement side from the settlement auditor rather than pulling
     it again from Razorpay.
 
-    The batches are already here, already parsed, and already the thing this
-    match is supposed to check against - and on test keys the recon report
+    The batches are already here, already parsed, and already the thing these
+    agents are supposed to check against - and on test keys the recon report
     that the pull read is permanently empty, so that button could only ever
-    return nothing.
+    return nothing. Shared by three-way recon and payout timing: they read the
+    same `settlement` source, so they should fill it the same way.
     """
     from urllib.parse import quote
 
-    back = "/agents/three-way/connected"
     with ledger(ws.business_id) as led:
         batch = led.settled_payout_batch()
         if batch is None:
@@ -4886,6 +4891,17 @@ def use_platform_settlements(ws: Workspace = Depends(required_workspace)):
     return RedirectResponse(back + "?ok=" + quote(
         f"{stored} settlement line{'s' if stored != 1 else ''} taken from the "
         f"settlement auditor."), status_code=303)
+
+
+@app.post("/agents/three-way/use-settlements")
+def use_platform_settlements(ws: Workspace = Depends(required_workspace)):
+    return _take_platform_settlements(ws, "/agents/three-way/connected")
+
+
+@app.post("/agents/payout-timing/use-settlements")
+def use_platform_settlements_for_payouts(
+        ws: Workspace = Depends(required_workspace)):
+    return _take_platform_settlements(ws, "/agents/payout-timing/connected")
 
 
 @app.post("/agents/three-way/pull")
