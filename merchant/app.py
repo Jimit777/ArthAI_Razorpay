@@ -2684,7 +2684,7 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
     # settled a batch should not have to work out that this agent can
     # already read it.
     settled = led.settled_payout_batch()
-    if settled is not None:
+    if settled is not None and connected:
         n_inv = len(settled.invoices)
         billed = sum(1 for i in settled.invoices
                      if i.customer_name not in ("UPI", "CARD", "NETBANKING",
@@ -2739,6 +2739,8 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
                  f'<p class="sub" style="margin:2px 0 12px;font-size:11.5px">'
                  f'{detail}</p>')
 
+    upload_kinds = (("invoice",) if connected
+                    else Ledger.PAYOUT_TIMING_SOURCES)
     uploads = "".join(f"""
     <form method="post" action="/agents/payout-timing/upload"
           enctype="multipart/form-data" style="margin-bottom:10px">
@@ -2748,8 +2750,7 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
         <div><input type="file" name="upload" accept=".csv,.xlsx" required></div>
         <div style="flex:0"><button class="btn ghost small">Upload</button></div>
       </div>
-    </form>""" for kind in (Ledger.PAYOUT_TIMING_SOURCES if not connected
-                            else ("invoice",)))
+    </form>""" for kind in upload_kinds)
 
     # No pull, no uploads on this tab: Connected reads the settlements
     # this platform made, which is the whole point of it. Razorpay's
@@ -2782,7 +2783,7 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
      cycle. No bank statement needed.</p>
   {ready}
   {"" if connected else rows}
-  {"" if connected else uploads}
+  {uploads}
   {run}
 </div>"""
 
