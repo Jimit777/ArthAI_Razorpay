@@ -2751,29 +2751,10 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
     </form>""" for kind in (Ledger.PAYOUT_TIMING_SOURCES if not connected
                             else ("invoice",)))
 
-    pull = ""
-    if connected:
-        from merchant.sources import Sources
-
-        has_secret = Sources(led.conn).stored_secret(ws.business_id) is not None
-        # Without an encryption key the secret is verified and dropped rather
-        # than stored, so it has to be typed again here - the same field
-        # /data shows, for the same reason. Asking for it beats failing with
-        # "connect Razorpay first" at a business that plainly is connected.
-        secret_field = ("" if has_secret else """
-      <div style="margin:6px 0 8px"><label style="font-size:12px">Key secret</label>
-        <input name="key_secret" type="password" required
-          placeholder="needed each time until an encryption key is set"></div>""")
-        pull = f"""
-    <form method="post" action="/agents/payout-timing/pull"
-          style="margin-bottom:10px">
-      <label style="font-size:12.5px">Your settlements</label>
-      <p class="sub" style="margin:2px 0 8px;font-size:11.5px">Pulled straight
-         from Razorpay's settlement recon report. Test-mode keys do not settle,
-         so this returns nothing until it points at a live account.</p>
-      {secret_field}
-      <button class="btn ghost small">Pull from Razorpay</button>
-    </form>"""
+    # No pull, no uploads on this tab: Connected reads the settlements
+    # this platform made, which is the whole point of it. Razorpay's
+    # recon report is empty on test keys anyway, and offering an upload
+    # here duplicated the Upload tab next to it.
 
     # A settled batch here is enough on its own; the uploaded sources are an
     # alternative, not a prerequisite.
@@ -2800,8 +2781,8 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
      settled against the T+{rules_payout.SETTLEMENT_WORKING_DAYS} working-day
      cycle. No bank statement needed.</p>
   {ready}
-  {rows}
-  {pull}{uploads}
+  {"" if connected else rows}
+  {"" if connected else uploads}
   {run}
 </div>"""
 
