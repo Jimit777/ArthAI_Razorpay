@@ -3339,6 +3339,43 @@ class Ledger:
                 "instruments": dict(Counter(i for i, _b in made)),
                 "faults": dict(Counter(b for _i, b in made))}
 
+    def delete_sale(self, payment_id: str) -> bool:
+        """
+        Remove one simulated sale and its order.
+
+        Deliberately does NOT reach into a settlement that already included
+        it. `payments`/`settlement_lines` are a snapshot of what the gateway
+        paid out on a given day; deleting the sale afterwards does not unmake
+        that batch, and quietly editing a settled run to match would rewrite
+        history the auditor has already read. Delete the settlement too if
+        that is what you meant.
+        """
+        row = self.conn.execute(
+            "SELECT order_id FROM live_payments"
+            " WHERE payment_id = ? AND business_id = ?",
+            (payment_id, self._scoped())).fetchone()
+        self.conn.execute(
+            "DELETE FROM live_payments WHERE payment_id = ? AND business_id = ?",
+            (payment_id, self._scoped()))
+        if row:
+            self.conn.execute(
+                "DELETE FROM live_orders WHERE order_id = ? AND business_id = ?",
+                (row["order_id"], self._scoped()))
+        self.conn.commit()
+        return row is not None
+
+    def delete_all_sales(self) -> int:
+        """Every simulated sale and order this business holds."""
+        n = self.conn.execute(
+            "SELECT COUNT(*) n FROM live_orders WHERE business_id = ?",
+            (self._scoped(),)).fetchone()["n"]
+        self.conn.execute("DELETE FROM live_payments WHERE business_id = ?",
+                          (self._scoped(),))
+        self.conn.execute("DELETE FROM live_orders WHERE business_id = ?",
+                          (self._scoped(),))
+        self.conn.commit()
+        return n
+
     def delete_run(self, run_id: str) -> bool:
         """
         Remove one settlement and everything hanging off it.

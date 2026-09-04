@@ -2382,3 +2382,54 @@ def test_the_payout_pull_asks_for_the_secret_it_needs(client, monkeypatch):
                            follow_redirects=False)
     assert "key secret" in response.headers["location"].replace("%20", " ")
     assert "Connect Razorpay first" not in response.headers["location"]
+
+
+def test_one_simulated_sale_can_be_deleted(client):
+    _start(client)
+    client.post("/data/simulator/batch", data={"count": "6"})
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        pid = led.orders(limit=1)[0]["payment_id"]
+
+    client.post(f"/sales/{pid}/delete")
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert len(led.orders(limit=50)) == 5
+
+
+def test_delete_all_clears_the_simulator(client):
+    _start(client)
+    client.post("/data/simulator/batch", data={"count": "8"})
+
+    client.post("/sales/delete-all")
+
+    page = client.get("/data/simulator").text
+    assert "No sales yet" in page
+
+
+def test_deleting_sales_does_not_unmake_a_settlement(client):
+    """
+    A settlement is a snapshot of what the gateway paid out that day.
+    Deleting the sale afterwards does not unmake the batch, and quietly
+    editing a settled run to match would rewrite history the auditor has
+    already read.
+    """
+    _start(client)
+    client.post("/data/simulator/batch", data={"count": "6"})
+
+    import merchant.app as appmod
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        run_id = led.settlements()[0]["run_id"]
+
+    client.post("/sales/delete-all")
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        assert run_id in {r["run_id"] for r in led.settlements()}
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM payments WHERE run_id = ?",
+            (run_id,)).fetchone()["n"] == 6, "the settled batch lost its rows"

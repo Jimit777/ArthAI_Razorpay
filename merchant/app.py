@@ -815,6 +815,11 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
                 f'<input type="hidden" name="payment_id" value="{views.esc(o["payment_id"])}">'
                 f'<button class="ghost small">refund</button></form>')
           if o["payment_id"] else '<span class="pill">unpaid</span>'}</td>
+        <td class="r">{
+          f'<form method="post" action="/sales/{views.esc(o["payment_id"])}/delete"'
+          f' style="display:inline"><button class="ghost small"'
+          f' style="color:var(--danger)">delete</button></form>'
+          if o["payment_id"] else ""}</td>
       </tr>""" for o in orders)
 
     # The fault switch lives HERE, not in the merchant's settings. No real
@@ -949,6 +954,12 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
         </label>
       </form>"""
 
+    clear_sales = (f"""
+      <form method="post" action="/sales/delete-all" style="display:inline"
+            onsubmit="return confirm('Delete all {len(orders)} sales? Settlements already made are untouched.')">
+        <button class="ghost small" style="color:var(--danger)">Delete all</button>
+      </form>""" if orders else "")
+
     warn = "" if audit_on else (
         '<div class="banner warn">The settlement auditor is turned off for this '
         'business. Settlements will not be checked. '
@@ -972,18 +983,21 @@ def simulator_page(ws: Workspace = Depends(required_workspace)):  # noqa: D401
     <div><h2>Sales in this simulator</h2>
       <p class="sub" style="margin:2px 0 0">{mix_line}</p></div>
     <span class="sp"></span>
-    {settle}
+    {settle}{clear_sales}
   </div>
+  <div style="overflow-x:auto">
   <table>
     <tr><th>Payment</th><th>Item</th><th>Method</th><th class="r">Amount</th>
-        <th class="r">Deducted</th><th class="r">When</th><th class="r">Status</th></tr>
-    {rows or '<tr><td colspan="7" class="empty">'
+        <th class="r">Deducted</th><th class="r">When</th><th class="r">Status</th>
+        <th class="r"></th></tr>
+    {rows or '<tr><td colspan="8" class="empty">'
      '<div style="font-weight:560;color:var(--ink);margin-bottom:4px">'
      'No sales yet</div>'
      'Generate a month above. The gateway deducts its fee as it goes, and '
      'once the batch is settled the auditor checks whether each fee was '
      'right.</td></tr>'}
   </table>
+  </div>
 </div>"""
     return views.page("Simulator", body, "data", **shell)
 
@@ -1785,6 +1799,27 @@ def record_sale(ws: Workspace = Depends(required_workspace),
     with ledger(resolved) as led:
         order_id = led.create_order(paise, description or "Sale")
         led.capture_payment(order_id, method, network, card_type, intl)
+    return RedirectResponse("/data/simulator", status_code=303)
+
+
+@app.post("/sales/delete-all")
+def delete_all_sales(ws: Workspace = Depends(required_workspace)):
+    """Clear the simulator's sales. Settlements already made are untouched."""
+    from urllib.parse import quote
+
+    with ledger(ws.business_id) as led:
+        n = led.delete_all_sales()
+    return RedirectResponse(
+        "/data/simulator?ok=" + quote(
+            f"{n} sale{'s' if n != 1 else ''} deleted. Settlements already "
+            f"made are untouched."), status_code=303)
+
+
+@app.post("/sales/{payment_id}/delete")
+def delete_one_sale(payment_id: str,
+                    ws: Workspace = Depends(required_workspace)):
+    with ledger(ws.business_id) as led:
+        led.delete_sale(payment_id)
     return RedirectResponse("/data/simulator", status_code=303)
 
 
