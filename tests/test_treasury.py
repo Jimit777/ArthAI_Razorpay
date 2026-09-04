@@ -1689,3 +1689,57 @@ def test_a_late_settlement_is_measured_and_priced(led):
 
     assert result.summary.n_sla_miss == 8
     assert result.decision.float_cost_paise > 0, "a delay cost nothing"
+
+
+def test_a_settled_batch_is_offered_without_any_upload(led, tmp_path,
+                                                       monkeypatch):
+    """
+    A merchant who has just settled a batch should not have to work out that
+    this agent can already read it, nor upload anything to prove it.
+    """
+    from fastapi.testclient import TestClient
+
+    import merchant.app as appmod
+
+    monkeypatch.setattr(appmod, "DB", str(tmp_path / "pt.db"))
+    client = TestClient(appmod.app)
+    client.post("/signup", data={"name": "P", "email": "p@x.in",
+                                 "password": "a-long-password"})
+    client.post("/businesses", data={"name": "Payout"})
+    client.post("/sources/simulator")
+    client.post("/data/simulator/batch", data={"count": "8", "delay": "3"})
+
+    page = client.get("/agents/payout-timing/connected").text
+
+    assert "settled payment" in page and "ready to check" in page
+    assert "Measure my payouts" in page, "the run button was still disabled"
+
+
+def test_a_linked_razorpay_invoice_becomes_the_sale_side(led):
+    """
+    The sale should be the merchant's real invoice - its customer, its issue
+    date - not the payment standing in for it.
+    """
+    card = led.rate_card()
+    led.generate_mixed_batch(4)
+    led.commit_settlement(led.build_settlement(card))
+
+    pid = led.conn.execute(
+        "SELECT payment_id FROM payments LIMIT 1").fetchone()["payment_id"]
+    led.conn.execute(
+        "INSERT INTO live_sale_invoices (invoice_id, business_id,"
+        " invoice_number, invoice_date, buyer_name, buyer_gstin,"
+        " place_of_supply, hsn_code, taxable_value, razorpay_payment_id)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("inv_1", led.business_id, "INV-001", "2026-09-01", "Anita Traders",
+         "", "27", "6109", 100_000, pid))
+    led.conn.commit()
+
+    batch = led.settled_payout_batch()
+    matched = [i for i in batch.invoices if i.invoice_id == pid][0]
+
+    assert matched.customer_name == "Anita Traders"
+    from datetime import date
+    assert matched.date_issued == date(2026, 9, 1), "the invoice date was ignored"
+    # every payment still counted, invoiced or not
+    assert len(batch.invoices) == 4

@@ -2673,6 +2673,29 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
     held = led.recon_sources_held()
     missing = led.payout_timing_missing()
 
+    # Settlements made here are the readiest source and need no upload at
+    # all, so say so before asking for files. A merchant who has just
+    # settled a batch should not have to work out that this agent can
+    # already read it.
+    settled = led.settled_payout_batch()
+    if settled is not None:
+        n_inv = len(settled.invoices)
+        billed = sum(1 for i in settled.invoices
+                     if i.customer_name not in ("UPI", "CARD", "NETBANKING",
+                                                "WALLET", "SALE"))
+        source_line = (f"{billed} of them matched to a Razorpay invoice"
+                       if billed else
+                       "no Razorpay invoices linked yet, so the payment "
+                       "itself stands in for the sale")
+        ready = f"""
+        <div class="banner brand" style="margin:0 0 12px">
+          <b>{n_inv} settled payment{'s' if n_inv != 1 else ''} ready to check</b>
+          <span>Settled on this platform &mdash; {source_line}. Press
+            &ldquo;Measure my payouts&rdquo; below; nothing needs uploading.</span>
+        </div>"""
+    else:
+        ready = ""
+
     rows = ""
     for kind in Ledger.PAYOUT_TIMING_SOURCES:
         on_file = held.get(kind)
@@ -2726,7 +2749,9 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
       <button class="btn ghost small">Pull from Razorpay</button>
     </form>"""
 
-    can_run = not missing
+    # A settled batch here is enough on its own; the uploaded sources are an
+    # alternative, not a prerequisite.
+    can_run = (settled is not None) or not missing
     run = f"""
   <form method="post" action="/agents/payout-timing/run" style="margin-top:6px">
     <input type="hidden" name="source" value="connected">
@@ -2737,9 +2762,10 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
     </label>
     <button class="btn"{'' if can_run else ' disabled'}>Measure my payouts</button>
   </form>""" if can_run else f"""
-  <p class="sub" style="margin:6px 0 0">Still need your
-     {' and '.join(PAYOUT_SOURCE_WORD[m] for m in missing)} before this can
-     run. It will not fall back to generated data.</p>"""
+  <p class="sub" style="margin:6px 0 0">Nothing to measure yet. Settle a batch
+     on the simulator, or upload your
+     {' and '.join(PAYOUT_SOURCE_WORD[m] for m in missing)}. It will not fall
+     back to generated data.</p>"""
 
     return f"""
 <div class="card">
@@ -2747,6 +2773,7 @@ def _payout_timing_sources_card(led, ws, *, connected: bool) -> str:
   <p class="sub" style="margin:6px 0 14px">Measures when each sale actually
      settled against the T+{rules_payout.SETTLEMENT_WORKING_DAYS} working-day
      cycle. No bank statement needed.</p>
+  {ready}
   {rows}
   {pull}{uploads}
   {run}

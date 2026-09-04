@@ -860,6 +860,10 @@ class Ledger:
         # importer actually was.
         _add_column(self.store.conn, "runs", "source",
                     "TEXT DEFAULT 'simulator'")
+        # The payment Razorpay says settled an invoice - the join payout
+        # timing needs between a real sale and a real settlement.
+        _add_column(self.store.conn, "live_sale_invoices",
+                    "razorpay_payment_id", "TEXT")
         # Resolution memory predates business scoping - CLAUDE.md section 12
         # was written when this was a single-business tool. Without this
         # column one merchant's confirmed resolution could be recalled for
@@ -1313,6 +1317,18 @@ class Ledger:
         invoices, skipped = from_razorpay_batch(raw_items)
         business_id = self._scoped()
         now = int(time.time())
+
+        # Razorpay states the payment that settled an invoice, and that link
+        # is what lets the payout timing agent ask when a REAL sale settled
+        # rather than inferring a sale from the payment itself. Kept here
+        # rather than on OutwardInvoice, which the GST agent also uses and
+        # has no business knowing about settlements.
+        paid_by = {}
+        for raw in raw_items or []:
+            rid = str(raw.get("id") or "")
+            pid = str(raw.get("payment_id") or "")
+            if rid and pid:
+                paid_by[rid] = pid
 
         # OR REPLACE: re-syncing the same invoice from Razorpay (an edit, or
         # just running sync again) should refresh the row, not collide with
@@ -2295,14 +2311,35 @@ class Ledger:
         def when(ts):
             return _dt.fromtimestamp(ts, _tz.utc).date() if ts else _date.today()
 
+        # Real Razorpay invoices, where one is linked to the payment. The
+        # sale side is then the merchant's actual invoice - its number, its
+        # customer, its issue date - rather than the payment standing in for
+        # it. Payments with no invoice still count: dropping them would make
+        # the delay picture depend on which sales happened to be invoiced.
+        billed = {r["razorpay_payment_id"]: r for r in self.conn.execute(
+            "SELECT razorpay_payment_id, invoice_number, invoice_date,"
+            "       buyer_name FROM live_sale_invoices"
+            " WHERE business_id = ? AND COALESCE(razorpay_payment_id,'') <> ''",
+            (self._scoped(),))}
+
         invoices, settlements = [], []
         for r in rows:
             fee = (r["fee"] or 0) + (r["tax"] or 0)
-            invoices.append(Invoice(
-                invoice_id=r["payment_id"],
-                customer_name=(r["method"] or "sale").upper(),
-                amount=r["amount"], date_issued=when(r["created_at"]),
-                status="issued"))
+            inv = billed.get(r["payment_id"])
+            if inv:
+                invoices.append(Invoice(
+                    invoice_id=r["payment_id"],
+                    customer_name=inv["buyer_name"] or "Customer",
+                    amount=r["amount"],
+                    date_issued=(_date.fromisoformat(inv["invoice_date"][:10])
+                                 if inv["invoice_date"] else when(r["created_at"])),
+                    status="issued"))
+            else:
+                invoices.append(Invoice(
+                    invoice_id=r["payment_id"],
+                    customer_name=(r["method"] or "sale").upper(),
+                    amount=r["amount"], date_issued=when(r["created_at"]),
+                    status="issued"))
             settlements.append(Settlement(
                 txn_id=r["payment_id"], gross_amount=r["amount"],
                 fee_deducted=fee, net_settled=r["amount"] - fee,
