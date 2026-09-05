@@ -826,23 +826,44 @@ def google_button(label: str = "Continue with Google") -> str:
 
 
 def auth_page(title: str, subtitle: str, body: str, footer: str = "") -> str:
-    """The signed-out shell. No rail, no business - there is no context yet."""
+    """
+    The signed-out shell: the form on the left, what this product is on the
+    right.
+
+    Nobody arrives here knowing what ArthAI does. A centred card on an empty
+    page spends the only screen we get before sign-in saying nothing, so the
+    space to the right of the form carries the claim instead - and it is the
+    claim the whole product is built to make good on, not a stock photograph.
+
+    The right column is hidden under 768px rather than stacked. On a phone it
+    would push the form below the fold, and someone reaching for a login on
+    their phone already knows why they are here.
+    """
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} &middot; ArthAI</title><style>{CSS}</style></head>
-<body><main style="max-width:400px;margin:0 auto;padding-top:76px">
-  <div style="display:flex;align-items:center;gap:9px;margin-bottom:22px">
-    {LOGO_SVG}
-    <span class="wordmark" style="font-size:17px">ArthAI</span>
+<body class="auth-body"><div class="auth-split">
+
+  <div class="auth-pane">
+    <div class="auth-form">
+      <div class="auth-brand">{LOGO_SVG}
+        <span class="wordmark" style="font-size:17px">ArthAI</span></div>
+      <h1 class="auth-h1">{esc(title)}</h1>
+      <p class="auth-sub">{esc(subtitle)}</p>
+      {body}
+      {f'<p class="auth-foot">{footer}</p>' if footer else ''}
+    </div>
   </div>
-  <div class="card">
-    <h1 style="font-size:17px">{esc(title)}</h1>
-    <p class="sub">{esc(subtitle)}</p>
-    {body}
-  </div>
-  {f'<p class="sub" style="text-align:center;margin-top:14px">{footer}</p>'
-   if footer else ''}
-</main></body></html>"""
+
+  <aside class="auth-brand-pane">
+    <div class="auth-pitch">
+      <h2 class="auth-pitch-head">The Autonomous Finance Controller.</h2>
+      <p class="auth-pitch-sub">Stop paying for gateway errors, missed ITC,
+         and compliance delays. ArthAI reconciles your ledger to the paise.</p>
+    </div>
+  </aside>
+
+</div></body></html>"""
 
 
 def page(title: str, body: str, active: str = "", business=None,
@@ -3202,10 +3223,73 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
   font-size:13.5px; font-weight:600; text-decoration:none; cursor:pointer }
 .btn-google:hover { background:var(--line-2) }
 .btn-google svg { flex:none; display:block }
-.auth-or { display:flex; align-items:center; gap:10px; margin:16px 0;
+.auth-or { display:flex; align-items:center; gap:12px; margin:20px 0;
   color:var(--faint); font-size:11.5px }
 .auth-or::before, .auth-or::after { content:""; flex:1; height:1px;
-  background:var(--line) }
+  background:var(--line-2) }
+
+/* --- the signed-out split screen ----------------------------------------
+   Form left, claim right. See auth_page's own docstring for why the right
+   column is hidden rather than stacked on a phone. */
+.auth-body { min-height:100vh; background:var(--surface) }
+.auth-split { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);
+  min-height:100vh }
+.auth-pane { display:flex; align-items:center; justify-content:center;
+  padding:40px 32px; background:var(--surface) }
+.auth-form { width:100%; max-width:400px }
+.auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:38px }
+.auth-h1 { font-family:var(--font-display); font-size:2rem; font-weight:700;
+  letter-spacing:-.035em; color:var(--ink); margin:0 0 6px; line-height:1.15 }
+.auth-sub { color:var(--muted); font-size:13.5px; margin:0 0 26px }
+.auth-foot { color:var(--muted); font-size:12.5px; text-align:center;
+  margin:22px 0 0 }
+
+/* The form's own rhythm. Generous enough that a label, its field and the
+   next label are three separate things rather than one grey block. */
+.auth-form label { font-size:12.5px; font-weight:600; color:var(--ink-2);
+  margin-bottom:7px }
+.auth-form input { padding:.75rem 1rem; font-size:14px; border-radius:8px }
+.auth-form form > div { margin-bottom:18px }
+.auth-form button[type="submit"], .auth-form form > button {
+  width:100%; padding:.75rem; font-size:14px; font-weight:700;
+  border-radius:8px; margin-top:2px }
+.auth-form .btn-google { padding:.7rem 1rem; border-radius:8px }
+
+.auth-brand-pane { position:relative; overflow:hidden; display:flex;
+  align-items:center; padding:56px 60px; color:#fff;
+  background:linear-gradient(150deg,#1e1b4b 0%,#1e293b 55%,#0f172a 100%) }
+/* Depth without an asset: a faint ledger grid, and one light source behind
+   the headline. Both are gradients, so there is nothing to load and nothing
+   to fail offline. */
+.auth-brand-pane::before { content:""; position:absolute; inset:0;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.045) 0 1px,
+      transparent 1px 64px),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.045) 0 1px,
+      transparent 1px 64px);
+  mask-image:radial-gradient(120% 100% at 20% 30%, #000 20%, transparent 78%);
+  -webkit-mask-image:radial-gradient(120% 100% at 20% 30%, #000 20%,
+    transparent 78%) }
+.auth-brand-pane::after { content:""; position:absolute; inset:0;
+  background:radial-gradient(70% 60% at 15% 25%, rgba(99,102,241,.34),
+    transparent 68%) }
+/* 26ch, not 20: the parent's cap wins over the children's, so a tight one
+   here squeezed the subheadline into a six-line ribbon regardless of its own
+   34ch measure. */
+.auth-pitch { position:relative; z-index:1; max-width:26ch }
+.auth-pitch-head { font-family:var(--font-display); font-size:3rem;
+  font-weight:800; letter-spacing:-.04em; line-height:1.05; margin:0 0 22px;
+  text-wrap:balance }
+.auth-pitch-sub { font-size:1.25rem; line-height:1.55; margin:0;
+  color:#cbd5e1; font-weight:400 }
+
+@media (max-width:1100px) { .auth-pitch-head { font-size:2.4rem }
+  .auth-pitch-sub { font-size:1.1rem } .auth-brand-pane { padding:44px } }
+@media (max-width:768px) {
+  .auth-split { grid-template-columns:1fr }
+  .auth-brand-pane { display:none }
+  .auth-pane { padding:44px 22px }
+}
 
 .dash-card { padding:26px 28px 22px; border-radius:16px;
   box-shadow:var(--shadow-lift) }
