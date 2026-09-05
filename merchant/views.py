@@ -173,7 +173,7 @@ h2 { font-size:13.5px; margin:0 0 2px; letter-spacing:-.015em; font-weight:700 }
   box-shadow:var(--shadow) }
 .card.tint { background:var(--brand-wash); border-color:transparent }
 .card.flush { padding:0; overflow:hidden }
-.card-head { padding:11px 16px; border-bottom:1px solid var(--line-2);
+.card-head { padding:13px 18px; border-bottom:1px solid var(--line);
   display:flex; align-items:center; gap:12px }
 .card-head h2 { margin:0 }
 
@@ -220,17 +220,27 @@ details[open] > summary::before { transform:rotate(90deg) }
 
 /* --- tables ----------------------------------------------------------- */
 table { width:100%; border-collapse:collapse; font-size:12.6px }
-th { text-align:left; font-weight:600; color:var(--muted); font-size:10px;
-  text-transform:uppercase; letter-spacing:.05em; padding:7px 14px;
-  background:var(--raised); border-bottom:1px solid var(--line-2) }
-td { padding:7px 14px; border-bottom:1px solid var(--line-2);
+th { text-align:left; font-family:var(--font-display); font-weight:600;
+  color:var(--muted); font-size:.7rem;
+  text-transform:uppercase; letter-spacing:.05em; padding:9px 14px;
+  background:var(--raised); border-bottom:1px solid var(--line) }
+td { padding:9px 14px; border-bottom:1px solid var(--line-2);
   font-variant-numeric:tabular-nums; color:var(--ink-2) }
+tbody tr:hover td { background:var(--raised) }
 tr:last-child td { border-bottom:0 }
 td.mono, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
   font-size:12px }
 td.r, th.r { text-align:right }
-.pill { display:inline-block; border-radius:4px; padding:1px 6px;
-  font-size:10.5px; font-weight:600; background:var(--line-2); color:var(--muted) }
+.pill { display:inline-block; border-radius:999px; padding:3px 9px;
+  font-size:10.5px; font-weight:600; letter-spacing:.02em;
+  background:var(--line-2); color:var(--muted); white-space:nowrap;
+  border:1px solid transparent }
+/* A hairline in the pill's own hue. At this size a wash alone reads as a
+   smudge of colour; an edge gives it a shape the eye can find in a table. */
+.pill.good { border-color:rgba(5,150,105,.18) }
+.pill.warn { border-color:rgba(180,83,9,.18) }
+.pill.danger { border-color:rgba(220,38,38,.18) }
+.pill.brand { border-color:rgba(37,99,235,.18) }
 .pill.good { background:var(--good-wash); color:var(--good) }
 .pill.warn { background:var(--warn-wash); color:var(--warn) }
 .pill.danger { background:var(--danger-wash); color:var(--danger) }
@@ -238,12 +248,22 @@ td.r, th.r { text-align:right }
 .pill.brand { background:var(--brand-wash); color:var(--brand-ink) }
 
 /* --- stats ------------------------------------------------------------ */
+/* The grid's own background shows through the 1px gaps AS the dividers -
+   and through any cell an odd count leaves empty. --line is the right weight
+   for a divider and far too dark for a whole empty cell, which rendered as a
+   grey block in the corner of the report's 5-stat grid, so the lighter
+   --line-2 does both jobs: still a visible rule at 1px, invisible at 128px. */
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(128px,1fr));
-  gap:2px; background:var(--line-2); border-radius:10px; overflow:hidden }
-.stat { background:var(--surface); padding:11px 14px }
-.stat b { display:block; font-size:19px; letter-spacing:-.03em; line-height:1.25;
-  font-weight:660 }
-.stat span { color:var(--muted); font-size:11.3px }
+  gap:1px; background:var(--line-2); border-radius:var(--radius);
+  overflow:hidden; border:1px solid var(--line); box-shadow:var(--shadow) }
+.stat { background:var(--surface); padding:14px 16px }
+.stat b { display:block; font-family:var(--font-display); font-size:21px;
+  letter-spacing:-.03em; line-height:1.25; font-weight:800; color:var(--ink);
+  font-variant-numeric:tabular-nums }
+/* The same eyebrow the dashboard's counting cards use, so a figure's label
+   looks the same wherever the figure is. */
+.stat span { color:var(--muted); font-size:.7rem; font-weight:600;
+  text-transform:uppercase; letter-spacing:.05em; font-family:var(--font-display) }
 .stat.good b { color:var(--good) } .stat.bad b { color:var(--danger) }
 
 /* --- money ------------------------------------------------------------ */
@@ -252,41 +272,58 @@ td.r, th.r { text-align:right }
 .money .lbl { color:var(--muted) }
 .money .val { text-align:right; font-variant-numeric:tabular-nums;
   color:var(--ink-2) }
-.money .total { border-top:1px solid var(--line); padding-top:9px;
-  font-weight:640; color:var(--ink) }
+.money .total { border-top:1px solid var(--line); padding-top:10px;
+  margin-top:4px; font-family:var(--font-display); font-weight:700;
+  font-size:13.5px; letter-spacing:-.015em; color:var(--ink) }
 
 /* --- findings --------------------------------------------------------- */
-details.finding { border:1px solid var(--line); border-radius:8px;
-  margin-bottom:5px; background:var(--surface); box-shadow:var(--shadow) }
+details.finding { border:1px solid var(--line); border-radius:10px;
+  margin-bottom:6px; background:var(--surface); box-shadow:var(--shadow);
+  transition:box-shadow .12s ease, border-color .12s ease }
+details.finding:hover { box-shadow:var(--shadow-lift) }
 details.finding.rec { border-left:3px solid var(--danger) }
-details.finding[open] { border-color:var(--brand) }
+details.finding[open] { border-color:var(--brand);
+  box-shadow:var(--shadow-lift), 0 0 0 3px var(--brand-wash) }
 details.finding > summary { cursor:pointer; padding:8px 14px;
   display:grid;
   grid-template-columns:150px 1fr 1fr 96px 80px; gap:10px; align-items:center;
   font-size:12.4px; list-style:none }
 summary::-webkit-details-marker { display:none }
-details.finding > summary:hover { background:var(--raised) }
+details.finding > summary:hover { background:var(--line-2);
+  border-radius:9px }
 .detail { padding:2px 14px 14px; border-top:1px solid var(--line-2) }
 .detail p { margin:13px 0 9px; color:var(--ink-2) }
 .numbers { display:grid; grid-template-columns:repeat(auto-fit,minmax(96px,1fr));
-  gap:9px; font-size:11.3px; color:var(--muted); padding:9px 12px;
-  background:var(--raised); border-radius:8px; margin:12px 0 }
-.numbers b { display:block; color:var(--ink); font-size:12.6px;
-  font-variant-numeric:tabular-nums }
-pre { margin:0; padding:12px; font-size:11.5px; line-height:1.5;
+  gap:11px; font-size:.7rem; color:var(--muted); padding:12px 14px;
+  background:var(--raised); border:1px solid var(--line-2);
+  border-radius:10px; margin:12px 0; text-transform:uppercase;
+  letter-spacing:.04em; font-weight:600; font-family:var(--font-display) }
+.numbers b { display:block; color:var(--ink); font-size:13.5px;
+  font-weight:700; text-transform:none; letter-spacing:-.01em;
+  font-variant-numeric:tabular-nums; margin-top:3px }
+pre { margin:0; padding:14px; font-size:11.5px; line-height:1.6;
   white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  background:var(--raised); border:1px solid var(--line); border-radius:8px;
-  overflow-x:auto; color:var(--ink-2) }
+  background:var(--raised); border:1px solid var(--line-2);
+  border-radius:10px; overflow-x:auto; color:var(--ink-2) }
 
 /* --- misc ------------------------------------------------------------- */
-.banner { border-radius:7px; padding:9px 12px; font-size:12.3px;
-  margin-bottom:11px; display:flex; gap:10px; align-items:flex-start }
+/* A left edge in the banner's own colour rather than a flat wash on all
+   four sides: it reads as an annotation on the page instead of a block
+   pasted over it, and it lines up with .card's tone edge. */
+.banner { border-radius:10px; padding:11px 14px; font-size:12.3px;
+  margin-bottom:12px; display:flex; gap:10px; align-items:flex-start;
+  border:1px solid transparent; border-left-width:3px }
+.banner.warn { border-color:rgba(180,83,9,.2); border-left-color:var(--warn) }
+.banner.brand { border-color:rgba(37,99,235,.2);
+  border-left-color:var(--brand) }
+.banner.danger { border-color:rgba(220,38,38,.2);
+  border-left-color:var(--danger) }
 .banner.warn { background:var(--warn-wash); color:var(--warn) }
 .banner.brand { background:var(--brand-wash); color:var(--brand-ink) }
 .banner a { color:inherit; text-decoration:underline }
 .empty { color:var(--muted); font-size:12.6px; padding:26px 16px;
   text-align:center }
-.progress { height:6px; background:var(--line-2); border-radius:4px;
+.progress { height:6px; background:var(--line-2); border-radius:999px;
   overflow:hidden }
 
 /* --- the agent's terminal ----------------------------------------------- */
@@ -390,14 +427,14 @@ COMPONENTS += """
 .agent-head { border-bottom:1px solid var(--line); margin:0 0 18px }
 .agent-title { display:flex; align-items:flex-start; gap:14px;
   flex-wrap:wrap; padding-bottom:13px }
-.agent-title h1 { margin:0 }
+.agent-title h1 { margin:0; font-size:20px; letter-spacing:-.03em }
 .agent-meta { margin-left:auto; display:flex; align-items:center; gap:9px;
   flex-wrap:wrap }
 .tabs { display:flex; gap:2px; flex-wrap:wrap; margin-bottom:-1px }
-.tab { padding:8px 13px; font-size:12.8px; font-weight:540; color:var(--muted);
+.tab { padding:9px 14px; font-size:12.8px; font-weight:600; color:var(--muted);
   border-bottom:2px solid transparent; text-decoration:none;
-  white-space:nowrap }
-.tab:hover { color:var(--ink) }
+  white-space:nowrap; transition:color .12s ease, border-color .12s ease }
+.tab:hover { color:var(--ink); border-bottom-color:var(--line) }
 .tab.on { color:var(--brand-ink); border-bottom-color:var(--brand) }
 
 /* --- agent cards on the hub ------------------------------------------- */
@@ -405,17 +442,22 @@ COMPONENTS += """
 .agent-card.muted { opacity:.62 }
 .agent-card-head { display:flex; align-items:flex-start; gap:10px }
 .agent-card-head > div:first-child { flex:1 }
-.agent-card-name { font-weight:600; font-size:14px; letter-spacing:-.01em }
+.agent-card-name { font-family:var(--font-display); font-weight:700;
+  font-size:14.5px; letter-spacing:-.02em }
 .agent-card-foot { margin-top:auto }
 .minis { display:flex; gap:18px; flex-wrap:wrap }
-.mini b { display:block; font-size:17px; font-weight:600; letter-spacing:-.02em;
+.mini b { display:block; font-family:var(--font-display); font-size:18px;
+  font-weight:800; letter-spacing:-.03em; color:var(--ink);
   font-variant-numeric:tabular-nums }
-.mini span { font-size:11.3px; color:var(--muted) }
+.mini span { font-size:.7rem; color:var(--muted); font-weight:600;
+  text-transform:uppercase; letter-spacing:.05em;
+  font-family:var(--font-display) }
 
 /* --- category flows: home and the agents hub --------------------------- */
 .flow-section { margin:22px 0 26px }
-.flow-header { font-size:11.5px; letter-spacing:.09em; text-transform:uppercase;
-  color:var(--muted); font-weight:600; margin-bottom:9px }
+.flow-header { font-family:var(--font-display); font-size:.75rem;
+  letter-spacing:.05em; text-transform:uppercase;
+  color:var(--muted); font-weight:600; margin-bottom:10px }
 .track-scroll { overflow-x:auto; padding-bottom:4px; margin:0 -2px }
 .track { display:flex; align-items:stretch; gap:0; min-width:min-content }
 .track .card { flex:0 0 280px; width:280px }
@@ -433,21 +475,24 @@ COMPONENTS += """
 COMPONENTS += """
 /* --- a reconciliation finding ----------------------------------------- */
 .finding-card { background:var(--surface); border:1px solid var(--line);
-  border-radius:10px; padding:16px 18px; margin-bottom:11px;
+  border-radius:var(--radius); padding:16px 18px; margin-bottom:12px;
   box-shadow:var(--shadow) }
 .finding-card-top { display:flex; align-items:flex-start; gap:12px;
   margin-bottom:9px }
 .finding-card-top > div:first-child { flex:1 }
-.finding-card-who { font-weight:600; font-size:14px; letter-spacing:-.01em }
+.finding-card-who { font-family:var(--font-display); font-weight:700;
+  font-size:14.5px; letter-spacing:-.02em }
 .finding-card-inv { color:var(--muted); font-size:11.8px; margin-top:2px }
 .finding-card-why { margin:0 0 13px; color:var(--ink-2); font-size:13.2px;
   max-width:68ch }
 
 .facts { display:flex; flex-wrap:wrap; gap:22px; padding:12px 0;
   border-top:1px solid var(--line-2); border-bottom:1px solid var(--line-2) }
-.fact span { display:block; font-size:10.8px; letter-spacing:.05em;
-  text-transform:uppercase; color:var(--muted); margin-bottom:3px }
-.fact b { font-size:15px; font-weight:600; letter-spacing:-.02em;
+.fact span { display:block; font-family:var(--font-display); font-size:.7rem;
+  font-weight:600; letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); margin-bottom:4px }
+.fact b { font-family:var(--font-display); font-size:16px; font-weight:700;
+  letter-spacing:-.025em; color:var(--ink);
   font-variant-numeric:tabular-nums }
 .fact em { display:block; font-style:normal; font-size:11.2px;
   color:var(--muted); margin-top:1px }
