@@ -13,8 +13,8 @@ if [ ! -d .venv ]; then
 fi
 source .venv/bin/activate
 
-if [ -z "$LEDGERLINE_SECRET_KEY" ]; then
-  echo "NOTE: LEDGERLINE_SECRET_KEY is not set."
+if [ -z "$ARTHAI_SECRET_KEY" ]; then
+  echo "NOTE: ARTHAI_SECRET_KEY is not set."
   echo "      API secrets will not be stored at all - each sync will ask."
   echo "      Generate one with:  python -m merchant.vault"
   echo

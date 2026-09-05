@@ -223,10 +223,10 @@ def test_a_forwarded_header_is_ignored_unless_this_install_is_behind_a_proxy(mon
         headers = {"x-forwarded-for": "1.2.3.4"}
         client = type("C", (), {"host": "10.0.0.9"})()
 
-    monkeypatch.delenv("LEDGERLINE_BEHIND_PROXY", raising=False)
+    monkeypatch.delenv("ARTHAI_BEHIND_PROXY", raising=False)
     assert client_address(_Request()) == "10.0.0.9"
 
-    monkeypatch.setenv("LEDGERLINE_BEHIND_PROXY", "1")
+    monkeypatch.setenv("ARTHAI_BEHIND_PROXY", "1")
     assert client_address(_Request()) == "1.2.3.4"
 
 

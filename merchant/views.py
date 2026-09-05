@@ -1588,7 +1588,7 @@ def risk_with_api_screen(config: Optional[dict], vault_ready: bool = True
     vault_note = "" if vault_ready else (
         '<p class="sub" style="margin:9px 0 0;font-size:11.5px;'
         'color:var(--warn)">No encryption key is configured, so the API key '
-        'will not be stored. Set <span class="mono">LEDGERLINE_SECRET_KEY'
+        'will not be stored. Set <span class="mono">ARTHAI_SECRET_KEY'
         '</span> to keep it between runs.</p>')
 
     return f"""

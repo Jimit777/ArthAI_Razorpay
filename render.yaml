@@ -49,7 +49,7 @@ services:
       # Set these in the Render dashboard, never here - this file is public.
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: LEDGERLINE_SECRET_KEY
+      - key: ARTHAI_SECRET_KEY
         sync: false
       - key: GOOGLE_CLIENT_ID
         sync: false
@@ -63,7 +63,7 @@ services:
       # The session cookie is set without Secure (see merchant/app.py). Render
       # terminates TLS in front of the app, so this tells the rate limiter to
       # read the forwarded client address rather than the proxy's own.
-      - key: LEDGERLINE_BEHIND_PROXY
+      - key: ARTHAI_BEHIND_PROXY
         value: "1"
 
     # A persistent disk keeps merchant.db across restarts and redeploys.

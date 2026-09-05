@@ -218,3 +218,37 @@ def test_without_a_vault_nothing_is_stored_at_all(tmp_path, monkeypatch):
     assert sources.get(biz)["razorpay_secret_encrypted"] is None
     assert sources.stored_secret(biz) is None
     led.close()
+
+
+def test_the_pre_rename_env_names_still_work(monkeypatch):
+    """
+    The vault key is not a label.
+
+    An install whose environment still says LEDGERLINE_SECRET_KEY must keep
+    decrypting the gateway secrets it already holds - renaming the product
+    cannot quietly become "every stored credential is now unreadable".
+    """
+    from merchant.vault import ENV_ALLOW_LIVE, ENV_KEY, LEGACY_ENV, Vault
+
+    key = Vault.generate_key()
+    monkeypatch.delenv(ENV_KEY, raising=False)
+    monkeypatch.setenv(LEGACY_ENV[ENV_KEY], key)
+    monkeypatch.delenv(ENV_ALLOW_LIVE, raising=False)
+    monkeypatch.setenv(LEGACY_ENV[ENV_ALLOW_LIVE], "1")
+
+    vault = Vault.from_env()
+    assert vault is not None
+    assert vault.decrypt(vault.encrypt("rzp_live_secret")) == "rzp_live_secret"
+    assert live_keys_allowed()
+
+
+def test_the_new_env_name_wins_over_the_old_one(monkeypatch):
+    """Both set means the operator is mid-migration; the new name is intent."""
+    from merchant.vault import ENV_KEY, LEGACY_ENV, Vault
+
+    new_key = Vault.generate_key()
+    monkeypatch.setenv(ENV_KEY, new_key)
+    monkeypatch.setenv(LEGACY_ENV[ENV_KEY], Vault.generate_key())
+
+    token = Vault([new_key]).encrypt("secret")
+    assert Vault.from_env().decrypt(token) == "secret"

@@ -494,7 +494,7 @@ theft two steps instead of one.
 
 ```bash
 python -m merchant.vault                       # generates a key
-export LEDGERLINE_SECRET_KEY=<the key>         # environment, never the repo
+export ARTHAI_SECRET_KEY=<the key>         # environment, never the repo
 ```
 
 Fernet — AES-128-CBC with an HMAC-SHA256 tag. The authentication matters as
@@ -509,13 +509,13 @@ holding credentials everyone believed were encrypted. Switching a business back
 to the simulator deletes the stored secret, because a credential that outlives
 the reason it existed is one nobody remembers to remove.
 
-`LEDGERLINE_SECRET_KEY` accepts a comma-separated list for rotation: the first
+`ARTHAI_SECRET_KEY` accepts a comma-separated list for rotation: the first
 key encrypts, all of them decrypt.
 
 ### Live keys: what actually gates them
 
 Live Razorpay credentials now require **both** a configured vault and an
-explicit `LEDGERLINE_ALLOW_LIVE_KEYS=1`. The opt-in alone would enable them on
+explicit `ARTHAI_ALLOW_LIVE_KEYS=1`. The opt-in alone would enable them on
 an install with nowhere safe to put them, which is the exact failure the vault
 exists to prevent.
 
@@ -639,7 +639,7 @@ limited" would mean "that email is registered", leaking exactly what the login
 form is careful to hide. So attempts are counted whether or not the account
 exists, failed signups count too, and the responses are identical.
 
-`X-Forwarded-For` is only trusted when `LEDGERLINE_BEHIND_PROXY=1`. Trusting it
+`X-Forwarded-For` is only trusted when `ARTHAI_BEHIND_PROXY=1`. Trusting it
 unconditionally would let anyone set it per request and have an unlimited
 budget — a limiter that can be bypassed by typing is worse than none, because
 it looks like one.

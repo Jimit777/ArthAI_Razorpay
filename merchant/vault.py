@@ -50,8 +50,25 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-ENV_KEY = "LEDGERLINE_SECRET_KEY"
-ENV_ALLOW_LIVE = "LEDGERLINE_ALLOW_LIVE_KEYS"
+ENV_KEY = "ARTHAI_SECRET_KEY"
+ENV_ALLOW_LIVE = "ARTHAI_ALLOW_LIVE_KEYS"
+
+# The names before the rename to ArthAI. Still read, because the vault key is
+# not a label: an install whose Render environment still says LEDGERLINE_
+# would stop decrypting every gateway secret it holds the moment this file
+# changed, and "rotate your name" is not a sentence anyone should have to act
+# on under deadline. New name wins where both are set.
+LEGACY_ENV = {ENV_KEY: "LEDGERLINE_SECRET_KEY",
+              ENV_ALLOW_LIVE: "LEDGERLINE_ALLOW_LIVE_KEYS",
+              "ARTHAI_BEHIND_PROXY": "LEDGERLINE_BEHIND_PROXY"}
+
+
+def env(name: str) -> str:
+    """The value of `name`, falling back to its pre-rename spelling."""
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    return os.environ.get(LEGACY_ENV.get(name, ""), "").strip()
 
 
 class VaultUnavailable(RuntimeError):
@@ -84,7 +101,7 @@ class Vault:
         A silent plaintext fallback is how a file ends up holding credentials
         that everyone believed were encrypted.
         """
-        raw = os.environ.get(ENV_KEY, "").strip()
+        raw = env(ENV_KEY)
         if not raw:
             return None
         try:
@@ -138,7 +155,7 @@ def live_keys_allowed() -> bool:
     someone enable live keys on an install with nowhere safe to put them, which
     is the exact failure this module exists to prevent.
     """
-    return (os.environ.get(ENV_ALLOW_LIVE, "").strip() == "1"
+    return (env(ENV_ALLOW_LIVE) == "1"
             and Vault.from_env() is not None)
 
 

@@ -121,8 +121,8 @@ class Razorpay:
             raise ValueError(
                 "This install accepts test-mode keys only (rzp_test_...). "
                 "Live credentials need an encryption key configured "
-                "(LEDGERLINE_SECRET_KEY) and an explicit opt-in "
-                "(LEDGERLINE_ALLOW_LIVE_KEYS=1) - and even then TLS, login "
+                "(ARTHAI_SECRET_KEY) and an explicit opt-in "
+                "(ARTHAI_ALLOW_LIVE_KEYS=1) - and even then TLS, login "
                 "rate limiting and an access log are still missing.")
         token = base64.b64encode(f"{key_id}:{key_secret}".encode()).decode()
         self._headers = {"Authorization": f"Basic {token}"}
@@ -445,7 +445,7 @@ class Sources:
             message += " The key is stored encrypted."
         elif api_key and remember:
             message += (" No encryption key is configured, so the API key was not "
-                        "stored - set LEDGERLINE_SECRET_KEY to keep it.")
+                        "stored - set ARTHAI_SECRET_KEY to keep it.")
 
         self.conn.execute(
             "INSERT INTO data_sources (business_id, kind, connected_at,"

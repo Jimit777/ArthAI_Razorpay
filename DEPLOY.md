@@ -31,7 +31,7 @@ Render runs one ordinary long-lived process, so neither has to be rebuilt.
    | Variable | What it is |
    |---|---|
    | `ANTHROPIC_API_KEY` | powers the agents; without it every run fails |
-   | `LEDGERLINE_SECRET_KEY` | encrypts stored gateway credentials |
+   | `ARTHAI_SECRET_KEY` | encrypts stored gateway credentials |
    | `GOOGLE_CLIENT_ID` | public half of Google sign-in |
    | `GOOGLE_CLIENT_SECRET` | private half — treat like a password |
    | `GOOGLE_REDIRECT_URI` | where Google returns people after sign-in |
@@ -42,7 +42,13 @@ Render runs one ordinary long-lived process, so neither has to be rebuilt.
    > to be copied from. Open it, paste each value into Render, and leave it
    > on your machine.
 
-   If you need a fresh `LEDGERLINE_SECRET_KEY`:
+   > **Renaming an existing deployment.** These used to be `LEDGERLINE_*`.
+   > The app still reads the old names, so nothing breaks if you leave them
+   > — but do not delete the old row before adding the new one. The secret
+   > key encrypts your stored gateway credentials: lose it and they become
+   > unreadable, and no rename is worth that.
+
+   If you need a fresh `ARTHAI_SECRET_KEY`:
 
    ```bash
    python3 -c "import secrets; print(secrets.token_urlsafe(48))"

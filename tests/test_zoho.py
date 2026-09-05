@@ -253,7 +253,7 @@ def test_a_complete_bill_is_importable():
 def store(tmp_path, monkeypatch):
     import sqlite3
 
-    monkeypatch.setenv("LEDGERLINE_SECRET_KEY", Vault.generate_key())
+    monkeypatch.setenv("ARTHAI_SECRET_KEY", Vault.generate_key())
     conn = sqlite3.connect(tmp_path / "z.db")
     conn.row_factory = sqlite3.Row
     return ZohoConnections(conn)
@@ -266,7 +266,7 @@ def test_connecting_without_an_encryption_key_is_refused(tmp_path, monkeypatch):
     """
     import sqlite3
 
-    monkeypatch.delenv("LEDGERLINE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("ARTHAI_SECRET_KEY", raising=False)
     conn = sqlite3.connect(tmp_path / "z.db")
     conn.row_factory = sqlite3.Row
     assert ZohoConnections(conn).begin(
@@ -329,7 +329,7 @@ def shop(tmp_path, monkeypatch):
     import merchant.app as appmod
 
     monkeypatch.setattr(appmod, "DB", str(tmp_path / "app.db"))
-    monkeypatch.setenv("LEDGERLINE_SECRET_KEY", Vault.generate_key())
+    monkeypatch.setenv("ARTHAI_SECRET_KEY", Vault.generate_key())
     client = TestClient(appmod.app)
     client.post("/signup", data={"email": "meera@x.in",
                                  "password": "a-good-password"})

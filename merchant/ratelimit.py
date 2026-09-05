@@ -86,9 +86,10 @@ def client_address(request) -> str:
     random value per request and have an unlimited budget - a rate limiter that
     can be bypassed by typing is worse than none, because it looks like one.
     """
-    import os
+    from merchant.vault import env
 
-    if os.environ.get("LEDGERLINE_BEHIND_PROXY", "").strip() == "1":
+    # LEDGERLINE_BEHIND_PROXY is still honoured; see merchant.vault.LEGACY_ENV.
+    if env("ARTHAI_BEHIND_PROXY") == "1":
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
             return forwarded.split(",")[0].strip()

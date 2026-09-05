@@ -1882,7 +1882,7 @@ def zoho_page(request: Request, ws: Workspace = Depends(required_workspace),
             'there is nowhere safe to keep the Zoho credentials and the '
             'connection is refused. Generate one with '
             '<code>python -m merchant.vault</code> and set '
-            'LEDGERLINE_SECRET_KEY.</div>')
+            'ARTHAI_SECRET_KEY.</div>')
 
     if connection is not None and connection["refresh_token_encrypted"]:
         body = f"""
