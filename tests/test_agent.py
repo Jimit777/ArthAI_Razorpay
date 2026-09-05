@@ -16,6 +16,7 @@ Said plainly rather than papered over.
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -367,11 +368,53 @@ def test_a_failed_call_escalates_and_is_never_called_clean(audited, open_varianc
 
 
 def test_classify_batch_labels_every_open_variance(open_variances):
+    """
+    Every open record is judged exactly once, and the verdicts come back in
+    INPUT order.
+
+    Call order is no longer input order - the batch runs six at a time after
+    a lone first call, so which record finishes second is up to the network.
+    What must not change is the order of the answers: the audit log and the
+    saved findings should read the way the batch was read.
+    """
     scripted = ScriptedClassifier(_answer())
     verdicts = classify_batch(open_variances, scripted)
     assert len(verdicts) == len(open_variances)
-    assert scripted.calls == [v.payment_id for v in open_variances]
+    assert sorted(scripted.calls) == sorted(v.payment_id
+                                            for v in open_variances)
+    assert [v.payment_id for v in verdicts] == [v.payment_id
+                                                for v in open_variances]
     assert all(isinstance(v, Verdict) for v in verdicts)
+
+
+def test_the_batch_warms_the_prompt_cache_before_going_wide(open_variances):
+    """
+    The first record runs alone on purpose: it writes the cached prompt prefix
+    the rest read instead of paying for. Opening six at once means six cache
+    misses and a slower, dearer batch.
+    """
+    import threading
+
+    in_flight, peak = [], []
+    lock = threading.Lock()
+    inner = ScriptedClassifier(_answer())
+
+    class Watched:
+        def classify(self, variance, on_event=None):
+            with lock:
+                in_flight.append(variance.payment_id)
+                peak.append(len(in_flight))
+            try:
+                time.sleep(0.02)
+                return inner.classify(variance)
+            finally:
+                with lock:
+                    in_flight.remove(variance.payment_id)
+
+    classify_batch(open_variances, Watched())
+
+    assert peak[0] == 1, "the first call must not share the wire with any other"
+    assert max(peak) > 1, "the rest must not run one at a time"
 
 
 def test_the_agent_only_ever_sees_records_the_detector_could_not_resolve(audited):

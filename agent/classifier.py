@@ -32,7 +32,9 @@ a contained change rather than a rewrite.
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Protocol
 
@@ -46,6 +48,15 @@ from engine.taxonomy import ACTION_FOR, RECOVERABLE, Action, ExceptionCode
 MODEL = "claude-opus-5"
 MAX_TOKENS = 16_000
 MAX_ITERATIONS = 8
+
+# How many records are judged at once. Same number the recon and risk agents
+# have always used, so one answer covers the platform.
+#
+# Six, not more: each record is an independent tool-using conversation, and
+# the ceiling here is the API's own rate limit rather than this machine. Six
+# took a 31-record batch from 6m18s to about a minute - past that the returns
+# flatten and 429s start costing more time than the concurrency saves.
+MAX_WORKERS = 6
 
 # How hard the agent thinks. Thinking bills as output tokens and output is 83%
 # of what a run costs, so this is the main cost dial.
@@ -479,30 +490,71 @@ def classify_batch(variances: list[Variance], classifier: Classifier,
     """
     Label every variance the detector left open.
 
-    Sequential on purpose: sixty records is a demo, not a workload, and a
-    serial run keeps the audit log in a readable order. The first call pays for
-    the cached prefix and the rest read it.
+    The first record runs alone, then the rest run MAX_WORKERS at a time.
+    Sequential was the old answer - "sixty records is a demo, not a workload" -
+    and it was true right up until someone put a stopwatch on the demo: at
+    twelve seconds a call, thirty-one open records took six and a half
+    minutes.
+
+    The lone first call is not ceremony. It writes the cached prompt prefix
+    every later call reads instead of paying for; opening six at once means
+    six cache misses and a slower, dearer batch than this one.
+
+    Verdicts come back in INPUT order regardless of which finished first, so
+    the audit log still reads the way the batch was read.
 
     Stops early on an error that will not fix itself. An exhausted credit
     balance or a bad key fails identically on every remaining record, and
     grinding through them turns one clear problem into a batch of escalations
-    that look like results. Better to say what happened and stop.
+    that look like results. Better to say what happened and stop - so a fatal
+    verdict cancels what has not started rather than only what has not been
+    submitted.
     """
-    verdicts = []
-    for i, variance in enumerate(variances, 1):
+    if not variances:
+        return []
+
+    total = len(variances)
+    lock = threading.Lock()
+    state = {"fatal": None, "done": 0}
+
+    def say(i: int, variance: Variance) -> None:
         if progress:
-            print(f"  [{i}/{len(variances)}] {variance.payment_id} ...", flush=True)
+            print(f"  [{i}/{total}] {variance.payment_id} ...", flush=True)
+
+    def judge(item: tuple[int, Variance]) -> Optional[Verdict]:
+        i, variance = item
+        with lock:
+            if state["fatal"] is not None:
+                return None
         verdict = classifier.classify(variance)
-        verdicts.append(verdict)
+        with lock:
+            state["done"] += 1
+            say(state["done"], variance)
+            if _is_fatal(verdict.error) and state["fatal"] is None:
+                state["fatal"] = (state["done"], verdict.error)
+        return verdict
 
-        if _is_fatal(verdict.error):
-            remaining = len(variances) - i
-            print(f"\n  !! stopping after {i} of {len(variances)} records.")
-            print(f"     {verdict.error}")
-            if remaining:
-                print(f"     {remaining} records not attempted - they would all "
-                      f"fail the same way.")
-            print("     Nothing here is a measurement of the system.\n", flush=True)
-            break
+    # The cache-warming first record.
+    say(1, variances[0])
+    first = classifier.classify(variances[0])
+    verdicts: list[Optional[Verdict]] = [first]
+    if _is_fatal(first.error):
+        state["fatal"] = (1, first.error)
+        state["done"] = 1
+    else:
+        state["done"] = 1
+        rest = list(enumerate(variances[1:], 2))
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            verdicts.extend(pool.map(judge, rest))
 
-    return verdicts
+    if state["fatal"] is not None:
+        reached, error = state["fatal"]
+        skipped = sum(1 for v in verdicts if v is None)
+        print(f"\n  !! stopping after {reached} of {total} records.")
+        print(f"     {error}")
+        if skipped:
+            print(f"     {skipped} records not attempted - they would all "
+                  f"fail the same way.")
+        print("     Nothing here is a measurement of the system.\n", flush=True)
+
+    return [v for v in verdicts if v is not None]

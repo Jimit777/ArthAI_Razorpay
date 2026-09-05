@@ -1,4 +1,4 @@
-# Settlement Deduction Auditor
+# ArthAI
 
 > Context file for Claude Code. Read this fully before writing any code.
 > Project owner is solo, strong on the problem domain, weaker on implementation.
@@ -8,9 +8,10 @@
 
 ## 0. TL;DR
 
-We are building an **AI agent that audits every rupee a payment gateway deducted
-from a merchant's settlement** — and tells the merchant which deductions were
-correct, which were overcharges they can recover, and which put a tax credit at risk.
+We are building **ArthAI**, an **AI agent that audits every rupee a payment
+gateway deducted from a merchant's settlement** — and tells the merchant which
+deductions were correct, which were overcharges they can recover, and which put
+a tax credit at risk.
 
 **Pitch line:**
 > "You got ₹7,370 instead of ₹9,000. We tell you where every rupee of the

@@ -1,9 +1,9 @@
-# Settlement Deduction Auditor
+# ArthAI
 
 > You got ₹7,370 instead of ₹9,000. We tell you where every rupee of the
 > difference went — and which parts you should be angry about.
 
-An AI agent that audits every rupee a payment gateway deducted from a
+ArthAI is an AI agent that audits every rupee a payment gateway deducted from a
 merchant's settlement, and says which deductions were correct, which are
 recoverable overcharges, and which put a tax credit at risk.
 

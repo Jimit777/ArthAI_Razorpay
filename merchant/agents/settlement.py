@@ -93,11 +93,37 @@ def run_settlement_audit(ctx: AgentContext) -> None:
                 open_ones = []
 
             say(trace.needs_judgment(len(open_ones)))
-            for i, variance in enumerate(open_ones, 1):
-                ctx.progress(done=i - 1, current=variance.payment_id,
-                             current_instrument=variance.instrument_label,
-                             current_signals=[s.candidate_code
-                                              for s in variance.signals])
+
+            # --- one at a time, then six at a time --------------------------
+            #
+            # This loop used to be strictly sequential, on the reasoning that
+            # sixty records is a demo rather than a workload. It is - but at
+            # twelve seconds a call and thirty-one records needing judgment,
+            # the demo stood still for six and a half minutes, which is longer
+            # than the entire pitch. Every other agent on this platform
+            # already runs six at a time.
+            #
+            # The first record still goes alone, for two reasons that both
+            # matter. It writes the cached prompt prefix the other thirty
+            # then read instead of paying for - starting six at once means
+            # six cache misses. And it is the one record whose tool calls are
+            # streamed live, so the audience sees HOW a verdict is reached
+            # before the rest arrive as finished blocks.
+            #
+            # After that, each record's narration is emitted as one block
+            # when its verdict lands, under a lock. Streaming six records'
+            # reasoning line by line into one terminal would interleave them
+            # into something nobody can read.
+            import threading
+            from concurrent.futures import ThreadPoolExecutor
+
+            from agent.classifier import MAX_WORKERS
+
+            speak = threading.Lock()
+            counter = {"done": 0, "stop": False}
+
+            def narrate(variance) -> None:
+                """The evidence this record was judged on. Caller holds the lock."""
                 say(trace.looking_at(variance.payment_id,
                                      variance.instrument_label, variance.amount))
                 say(trace.the_gap(variance.actual_fee, variance.expected_fee,
@@ -107,52 +133,90 @@ def run_settlement_audit(ctx: AgentContext) -> None:
                     say(trace.evidence(signal.rule, str(signal.candidate_code),
                                        signal.source))
 
-                # Streamed from inside the call rather than after it. Emitting
-                # tool calls once classify() returns leaves the screen still for
-                # the fifteen seconds the interesting part is happening.
-                def live(kind: str, detail: str = "") -> None:
-                    if kind == "weighing":
-                        say(trace.weighing())
-                    elif kind == "tool":
-                        say(trace.tool_call(detail))
-
-                verdict = classifier.classify(variance, on_event=live)
-                verdicts.append(verdict)
-
-                if verdict.error:
-                    say(trace.classify_failed(verdict.error))
-                else:
-                    say(trace.verdict(
-                        verdict.exception_code, verdict.action,
-                        verdict.confidence,
-                        money_at_stake(variance, verdict.exception_code),
-                        verdict.output_tokens, verdict.latency_ms / 1000))
-                    if verdict.invented_figures:
-                        say(trace.reviewed_invented(verdict.invented_figures))
-                    elif verdict.corrections:
-                        for correction in verdict.corrections:
-                            say(trace.reviewed_corrected(correction))
+            def report(variance, verdict) -> None:
+                """One record's whole block, atomically."""
+                with speak:
+                    if verdict.error:
+                        say(trace.classify_failed(verdict.error))
                     else:
-                        say(trace.reviewed_clean())
+                        say(trace.verdict(
+                            verdict.exception_code, verdict.action,
+                            verdict.confidence,
+                            money_at_stake(variance, verdict.exception_code),
+                            verdict.output_tokens, verdict.latency_ms / 1000))
+                        if verdict.invented_figures:
+                            say(trace.reviewed_invented(verdict.invented_figures))
+                        elif verdict.corrections:
+                            for correction in verdict.corrections:
+                                say(trace.reviewed_corrected(correction))
+                        else:
+                            say(trace.reviewed_clean())
 
-                # Each verdict is streamed as it lands rather than held until
-                # the batch finishes. Twenty seconds of nothing followed by
-                # everything at once tells a watcher less than the same
-                # information arriving as it is decided.
-                ctx.progress(done=i, result={
-                    "payment_id": variance.payment_id,
-                    "instrument": variance.instrument_label,
-                    "code": verdict.exception_code,
-                    "action": verdict.action,
-                    "confidence": verdict.confidence,
-                    "stake": rupees(money_at_stake(variance,
-                                                   verdict.exception_code)),
-                    "corrected": bool(verdict.corrections),
-                    "error": verdict.error,
-                })
-                if "credit balance" in (verdict.error or ""):
-                    ctx.progress(note="Stopped: API credit exhausted.")
-                    break
+                    counter["done"] += 1
+                    # Streamed as it lands rather than held until the batch
+                    # finishes. Twenty seconds of nothing followed by
+                    # everything at once tells a watcher less than the same
+                    # information arriving as it is decided.
+                    ctx.progress(done=counter["done"], result={
+                        "payment_id": variance.payment_id,
+                        "instrument": variance.instrument_label,
+                        "code": verdict.exception_code,
+                        "action": verdict.action,
+                        "confidence": verdict.confidence,
+                        "stake": rupees(money_at_stake(
+                            variance, verdict.exception_code)),
+                        "corrected": bool(verdict.corrections),
+                        "error": verdict.error,
+                    })
+                    if "credit balance" in (verdict.error or ""):
+                        ctx.progress(note="Stopped: API credit exhausted.")
+                        counter["stop"] = True
+
+            def judge(variance):
+                """Classify one record and emit its block. Runs on a worker."""
+                if counter["stop"]:
+                    return None
+                verdict = classifier.classify(variance)
+                with speak:
+                    narrate(variance)
+                report(variance, verdict)
+                return verdict
+
+        # A second check, not a redundant one: the block above empties
+        # open_ones when the classifier cannot be built at all (no network, no
+        # credentials), and the old `for` loop absorbed that silently where
+        # indexing [0] does not.
+        if ctx.use_agent and open_ones:
+            # The cache-warming first record, narrated live.
+            first, rest = open_ones[0], open_ones[1:]
+            ctx.progress(done=0, current=first.payment_id,
+                         current_instrument=first.instrument_label,
+                         current_signals=[s.candidate_code
+                                          for s in first.signals])
+            with speak:
+                narrate(first)
+
+            def live(kind: str, detail: str = "") -> None:
+                if kind == "weighing":
+                    say(trace.weighing())
+                elif kind == "tool":
+                    say(trace.tool_call(detail))
+
+            first_verdict = classifier.classify(first, on_event=live)
+            report(first, first_verdict)
+            verdicts.append(first_verdict)
+
+            # Then the rest, six in flight. Verdicts are collected in input
+            # order, not completion order - the audit log and the saved
+            # findings should read the way the batch was read, not the way
+            # the network happened to answer.
+            if rest and not counter["stop"]:
+                ctx.progress(phase=f"Judging the remaining {len(rest)} "
+                                   f"record(s), {MAX_WORKERS} at a time")
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                    for verdict in pool.map(judge, rest):
+                        if verdict is not None:
+                            verdicts.append(verdict)
         elif open_ones:
             ctx.progress(note="Agent skipped. These records stay unresolved.")
         else:

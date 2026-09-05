@@ -2287,6 +2287,63 @@ def test_a_business_with_no_data_is_not_called_healthy(led):
     assert "No agent has looked at anything yet" in brief["headline"]
 
 
+def test_deleting_settlements_does_not_leave_the_brief_claiming_health(led):
+    """
+    Regression, reported from the running app: deleting every settlement left
+    the vendor and chargeback findings behind, so gross went to zero while the
+    leak stayed positive - and the brief fell through to its healthy fallback
+    and told a merchant with live overbilling that margin retention was
+    optimal.
+
+    Without a gross to divide by it states the amount instead of a share. It
+    must never state health.
+    """
+    _plant_insight_runs(led, overbilled=625190, contested=0, float_cost=0)
+
+    brief = _brief_for(led)
+
+    assert "optimal" not in brief["headline"].lower()
+    assert "Rs 6,251.90" in brief["headline"]
+    assert "%" not in brief["headline"], "no gross to be a percentage of"
+    assert brief["tone"] in ("warn", "danger")
+
+
+def test_reset_clears_every_agent_but_not_the_setup(led):
+    """
+    "Delete all" has to mean all, or the dashboard keeps reading history the
+    merchant believes they erased. What it must NOT take is the setup - the
+    business, its rate cards, where its data comes from - or the audit log,
+    which is the record of the reset itself.
+    """
+    card = led.rate_card()
+    led.generate_mixed_batch(10)
+    led.commit_settlement(led.build_settlement(card))
+    _plant_insight_runs(led, overbilled=625190, contested=400000,
+                        float_cost=13116)
+    before = {t: led.conn.execute(
+        f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
+        for t in ("payments", "vendor_terms_findings", "chargeback_findings",
+                  "business_payout_timing_runs")}
+    assert all(before.values()), "the fixture must actually plant something"
+
+    removed = led.reset()
+
+    assert removed, "reset reports what it removed"
+    for table in before:
+        assert led.conn.execute(
+            f"SELECT COUNT(*) n FROM {table}").fetchone()["n"] == 0, table
+    # The setup survives.
+    assert led.businesses.get(led.business_id) is not None
+    assert led.conn.execute(
+        "SELECT COUNT(*) n FROM business_rate_card").fetchone()["n"] > 0
+    assert _brief_for(led)["tone"] == "quiet"
+
+
+def test_reset_is_reported_honestly_when_there_was_nothing_to_remove(led):
+    """An empty reset says so rather than claiming a wipe it did not do."""
+    assert led.reset() == {}
+
+
 def test_the_lead_insight_is_money_lost_not_the_biggest_number(led):
     """
     Ranking on rupees alone compared unlike things and the biggest always won:

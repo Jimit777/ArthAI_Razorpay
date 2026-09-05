@@ -3543,6 +3543,77 @@ class Ledger:
             self.delete_run(run_id)
         return len(ids)
 
+    # Everything one business's agents have produced or been given, and
+    # nothing that defines the business itself.
+    #
+    # Deliberately EXCLUDES: businesses, memberships, business_agents,
+    # data_sources, zoho_connections and the rate cards. Those are the
+    # setup - who owns this business, which agents are on, where its data
+    # comes from and what its contract says. A reset is "forget what you
+    # found", not "forget who I am and make me connect Razorpay again".
+    #
+    # access_log is excluded too, and that one is not a convenience: the
+    # audit log is the record of what was done, including this reset. A
+    # wipe that erases its own trace is the exact thing an audit log exists
+    # to prevent.
+    BUSINESS_OWNED_TABLES = (
+        # settlement audit
+        "business_runs", "resolution_memory",
+        # the other agents' runs
+        "business_chargeback_runs", "business_gstr1_runs", "business_itc_runs",
+        "business_payout_timing_runs", "business_recon_runs",
+        "business_tds_runs", "business_vendor_terms_runs",
+        # their findings
+        "chargeback_findings", "dispute_evidence_items",
+        "gst_correction_findings", "gst_offset_findings", "gst_qrmp_findings",
+        "itc_findings", "payout_timing_findings", "recon_findings",
+        "tds_findings", "vendor_terms_findings",
+        # the data they were given
+        "gst_filing_cycles", "live_disputes", "live_gst_ledger_balances",
+        "live_gstr2b", "live_orders", "live_payments",
+        "live_purchase_line_items", "live_purchases", "live_sale_invoices",
+        "live_tds_credits", "live_tds_deductions", "recon_sources",
+        "supplier_filing_history", "supplier_snapshots", "treasury_inputs",
+        "watch_checks", "watch_raised",
+    )
+
+    def reset(self) -> dict:
+        """
+        Forget everything every agent has found or been given, for this
+        business only.
+
+        Deleting settlements used to leave the other agents' findings behind,
+        so the Home brief kept reporting supplier overbilling from a run whose
+        data was gone. "Delete all" has to mean all, or the dashboard is
+        reading history the merchant believes they erased.
+
+        Settlement runs go through delete_run so the run-owned tables
+        (payments, settlement_lines, bank_credits, refunds ...) are cleared
+        by the one function that knows what a run owns - rather than this
+        list growing a second, drifting copy of that knowledge.
+
+        Returns a table -> rows-removed map, so the caller can say what went
+        instead of claiming a wipe it did not verify.
+        """
+        removed = {}
+        runs = self.delete_all_runs()
+        if runs:
+            removed["settlement runs"] = runs
+
+        for table in self.BUSINESS_OWNED_TABLES:
+            try:
+                n = self.conn.execute(
+                    f"SELECT COUNT(*) n FROM {table} WHERE business_id = ?",
+                    (self._scoped(),)).fetchone()["n"]
+            except Exception:                               # noqa: BLE001
+                continue                    # a table this install never made
+            if n:
+                self.conn.execute(f"DELETE FROM {table} WHERE business_id = ?",
+                                  (self._scoped(),))
+                removed[table] = n
+        self.conn.commit()
+        return removed
+
     def imported_payments(self, limit: int = 200) -> list:
         """
         The transactions themselves, newest first - what the gateway said

@@ -1496,8 +1496,14 @@ def _synthesize_insights(led, ws, summary: dict, candidates: list) -> dict:
 
     # --- A: margin leakage -------------------------------------------------
     leak = recoverable + float_cost + overbilled
-    if leak > 0 and gross > 0:
-        share = leak / gross * 100
+    if leak > 0:
+        # The percentage needs a gross to be a percentage OF. Requiring one to
+        # fire at all was a bug with teeth: delete every settlement and the
+        # vendor and chargeback findings survive, so leak stayed positive
+        # while gross went to zero - and this fell through to the healthy
+        # fallback, which told a merchant with Rs 6,251 of live overbilling
+        # that margin retention was optimal.
+        share = leak / gross * 100 if gross else None
         parts = []
         actions = []
         if recoverable:
@@ -1512,13 +1518,19 @@ def _synthesize_insights(led, ws, summary: dict, candidates: list) -> dict:
             parts.append(f"{rupees(float_cost)} lost to late settlement")
             actions.append(act("Payout timing", "See the delays",
                                route_for("payout_timing").href))
+        if share is None:
+            headline = f"{rupees(leak)} has leaked out of your business."
+            detail = ("No settled volume on file to measure it against &mdash; "
+                      "import or simulate a settlement batch and this becomes "
+                      "a percentage. " + _join_clauses(parts).capitalize() + ".")
+        else:
+            headline = (f"Hidden leaks are costing you {share:.2f}% of your "
+                        f"gross volume.")
+            detail = (f"{rupees(leak)} across three agents, against "
+                      f"{rupees(gross)} settled: " + _join_clauses(parts) + ".")
         return {
-            "headline": (f"Hidden leaks are costing you {share:.2f}% of your "
-                         f"gross volume."),
-            "detail": (f"{rupees(leak)} across three agents, against "
-                       f"{rupees(gross)} settled: "
-                       + _join_clauses(parts) + "."),
-            "tone": "danger" if share >= 1 else "warn",
+            "headline": headline, "detail": detail,
+            "tone": "danger" if (share or 0) >= 1 else "warn",
             "actions": actions[:3],
         }
 
@@ -1583,6 +1595,9 @@ def _synthesize_insights(led, ws, summary: dict, candidates: list) -> dict:
     # agent that has run and found nothing is good news. An agent that has
     # never run has found nothing because nobody asked it, which is not the
     # same thing and must not be reported as health.
+    # "Nothing is wrong" is only sayable when something was actually looked
+    # at. No candidates AND no gross means no agent has run, which is not
+    # health - and reporting it as health is how a dashboard lies.
     if not candidates and gross == 0:
         return {
             "headline": "No agent has looked at anything yet.",
@@ -1774,6 +1789,19 @@ def sources_page(ws: Workspace = Depends(required_workspace),
   {''.join(f'<p class="sub" style="margin:0 0 4px;font-size:11.5px">'
            f'&middot; missing: {views.esc(m)}</p>'
            for m in security["missing"])}
+</div>
+
+<div class="card" style="border-color:var(--danger)">
+  <h2>Start this business over</h2>
+  <p class="sub" style="margin:5px 0 12px;max-width:66ch">Removes every
+     settlement, invoice, purchase, dispute and finding every agent holds for
+     this business, including the runs behind the Home brief. Your account,
+     this business, its rate cards, its connected sources and the activity log
+     all stay &mdash; this forgets what the agents found, not who you are.</p>
+  <form method="post" action="/reset"
+        onsubmit="return confirm('Delete every finding and every record for this business? This cannot be undone.')">
+    <button class="btn" style="background:var(--danger)">Reset this business</button>
+  </form>
 </div>"""
     return views.page("Data source", body, "data", **shell)
 
@@ -8232,6 +8260,48 @@ def set_supplier_behaviour(behaviour: list[str] = Form(default=[]),
         led.businesses.set_supplier_behaviour(
             ws.business_id, join_behaviours(behaviour))
     return RedirectResponse("/data/simulator", status_code=303)
+
+
+@app.post("/reset")
+def reset_business(request: Request,
+                   ws: Workspace = Depends(required_workspace)):
+    """
+    Forget everything every agent has found or been given, for this business.
+
+    Also clears the in-memory run registries. Three agents keep their results
+    in a dict rather than a table - deliberately, because a forecast is a
+    projection and not a ledger entry - so a database-only wipe would leave
+    the cash forecast, the three-way match and the supplier scan still on
+    screen after the merchant was told their data was gone.
+
+    Setup survives: the business, who owns it, which agents are on, where its
+    data comes from and its rate cards. A reset is "forget what you found",
+    not "make me connect Razorpay again". So does the access log, which is the
+    record OF this reset.
+    """
+    from urllib.parse import quote
+
+    ws.require_owner("resetting this business", request)
+
+    with ledger(ws.business_id) as led:
+        AccessLog(led.conn).record(
+            Action.RUN_AUDIT, user=ws.user, business_id=ws.business_id,
+            target="reset", detail="reset every agent's data for this business")
+        removed = led.reset()
+
+    for registry, lock in ((RUNS, _lock), (CASH_RUNS, _cash_lock),
+                           (RISK_RUNS, _risk_lock), (RECON_RUNS, _recon_lock)):
+        with lock:
+            for key in [k for k, v in registry.items()
+                        if v.get("business_id") == ws.business_id]:
+                registry.pop(key, None)
+
+    rows = sum(removed.values())
+    message = (f"Reset. {rows} record{'s' if rows != 1 else ''} removed across "
+               f"{len(removed)} table{'s' if len(removed) != 1 else ''}."
+               if removed else "Nothing to reset - this business was already "
+                               "empty.")
+    return RedirectResponse("/data?ok=" + quote(message), status_code=303)
 
 
 @app.post("/settings/gateway")
