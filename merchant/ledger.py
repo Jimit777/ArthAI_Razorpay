@@ -1414,6 +1414,43 @@ class Ledger:
         self.conn.commit()
         return run_id
 
+    def gst_interest_burn(self) -> dict:
+        """
+        What an unresolved GSTR-3B mismatch is costing per day, and so far.
+
+        Section 50 interest runs daily on tax that was under-declared, and it
+        only stops when the shortfall is paid - which makes it the one figure
+        on this platform that gets worse while the merchant does nothing. The
+        Home brief needs it as a rate, not a running total, because a rate is
+        what makes waiting expensive rather than merely regrettable.
+
+        The daily figure is DERIVED from what the correction engine already
+        computed - accrued interest over days overdue - rather than
+        re-deriving it from the rate. Two formulas for one number is how they
+        drift apart, and the engine's is the one with the tests.
+
+        Only locked periods count. An open one is still correctable through
+        GSTR-1A at no interest, so counting it would bill the merchant for a
+        problem they can still fix for free.
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(f.interest_paise), 0) accrued,"
+            "       COALESCE(SUM(CASE WHEN f.days_overdue > 0"
+            "         THEN f.interest_paise / f.days_overdue ELSE 0 END), 0)"
+            "         per_day,"
+            "       COUNT(*) periods"
+            " FROM gst_correction_findings f"
+            " JOIN business_gstr1_runs r ON r.run_id = f.run_id"
+            " WHERE f.business_id = ? AND f.window_state = 'locked'"
+            "   AND f.interest_paise > 0"
+            "   AND r.run_id = (SELECT run_id FROM business_gstr1_runs"
+            "                   WHERE business_id = ?"
+            "                   ORDER BY created_at DESC, rowid DESC LIMIT 1)",
+            (self._scoped(), self._scoped())).fetchone()
+        return {"accrued_paise": row["accrued"],
+                "per_day_paise": row["per_day"],
+                "periods": row["periods"]}
+
     def latest_gstr1_run(self):
         return self.conn.execute(
             "SELECT * FROM business_gstr1_runs WHERE business_id = ?"

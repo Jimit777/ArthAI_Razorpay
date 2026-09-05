@@ -1168,6 +1168,7 @@ def overview_page(user: User = Depends(current_user),
         decisions = _open_decisions(led, ws)
         summary = led.dashboard_summary()
         candidates = _insight_candidates(led, ws, summary)
+        brief = _synthesize_insights(led, ws, summary, candidates)
         card = led.rate_card()
         actionable = sum(
             1 for r in audited for f in led.store.findings(r["run_id"])
@@ -1183,7 +1184,7 @@ def overview_page(user: User = Depends(current_user),
   {views.dashboard_waterfall(summary, ask_embed)}
   {views.dashboard_side_panel(summary)}
 </div>
-{views.dashboard_bottom(summary, candidates)}"""
+{views.dashboard_bottom(summary, candidates, brief)}"""
 
     # --- one queue, all agents ---------------------------------------------
     if decisions:
@@ -1427,6 +1428,186 @@ def _insight_candidates(led, ws, summary: dict) -> list:
     # Within a tier, rupees decide, which is what a merchant means by "worst".
     out.sort(key=lambda d: (d.get("tier", 2), -d["urgency"]))
     return out[:4]
+
+
+def _synthesize_insights(led, ws, summary: dict, candidates: list) -> dict:
+    """
+    One paragraph that reads across agents, and the two or three places to go
+    and act on it.
+
+    _insight_candidates ranks each agent's own worst number. That answers
+    "which agent is shouting loudest", which is not the question a merchant
+    has - they want to know whether the business is leaking, whether it can
+    cover what is coming, and whether anything is getting worse while they
+    read. Those three questions each need figures from more than one agent,
+    so no single agent can answer them and this function does.
+
+    Every rupee here is an integer paise, every division happens in this
+    function, and what comes back is finished text plus a tone plus links.
+    The template does no arithmetic - it cannot, and it should not have to.
+
+    The three syntheses, worst-first:
+
+      A  margin leakage    settlement + payout timing + vendor terms, as a
+                           share of gross - three agents' findings are the
+                           same thing (money that left) seen three ways
+      B  liquidity         a projected shortfall against money already
+                           recoverable - the pairing that turns "you are
+                           short" into "and here is where it comes from"
+      C  compliance burn   Section 50 interest per day, plus supplier credit
+                           at risk - the only cost here that grows on its own
+
+    Returns {headline, detail, tone, actions}. `actions` are the agent links,
+    reusing the candidates already built rather than re-deriving hrefs.
+    """
+    from merchant.nav import route_for
+
+    def act(agent: str, label: str, href: str) -> dict:
+        return {"agent": agent, "label": label, "href": href}
+
+    # --- the figures, gathered once ---------------------------------------
+    gross = summary.get("gross_paise", 0)
+    recoverable = summary.get("recoverable_paise", 0)
+    overbilled = summary.get("vendor_overbilled_paise", 0)
+    itc_at_risk = summary.get("itc_at_risk_paise", 0)
+
+    pt_run = led.latest_payout_timing_run()
+    float_cost = (pt_run["total_float_cost"] or 0) if pt_run else 0
+
+    cb_run = led.latest_chargeback_run()
+    contested = 0
+    if cb_run:
+        contested = led.conn.execute(
+            "SELECT COALESCE(SUM(amount_paise),0) s FROM chargeback_findings"
+            " WHERE run_id = ? AND action = 'draft_evidence_pack'",
+            (cb_run["run_id"],)).fetchone()["s"]
+
+    burn = led.gst_interest_burn()
+
+    _cash_key, cash = _latest_cash_run(ws.business_id)
+    forecast = ((cash or {}).get("payload") or {}).get("forecast") or {}
+    trough = forecast.get("trough") or {}
+    # Same gate _open_decisions and _insight_candidates already apply: a
+    # trough the forecaster itself called "none" or "watch" is not a shortfall
+    # to raise here either.
+    shortfall = (trough.get("shortfall", 0)
+                 if forecast.get("action", "none") not in ("none", "watch")
+                 else 0)
+
+    # --- A: margin leakage -------------------------------------------------
+    leak = recoverable + float_cost + overbilled
+    if leak > 0 and gross > 0:
+        share = leak / gross * 100
+        parts = []
+        actions = []
+        if recoverable:
+            parts.append(f"{rupees(recoverable)} the gateway overcharged")
+            actions.append(act("Settlement", "Review overcharges",
+                               route_for("settlement_audit").href))
+        if overbilled:
+            parts.append(f"{rupees(overbilled)} suppliers overbilled")
+            actions.append(act("Vendor terms", "Check supplier invoices",
+                               route_for("vendor_terms").href))
+        if float_cost:
+            parts.append(f"{rupees(float_cost)} lost to late settlement")
+            actions.append(act("Payout timing", "See the delays",
+                               route_for("payout_timing").href))
+        return {
+            "headline": (f"Hidden leaks are costing you {share:.2f}% of your "
+                         f"gross volume."),
+            "detail": (f"{rupees(leak)} across three agents, against "
+                       f"{rupees(gross)} settled: "
+                       + _join_clauses(parts) + "."),
+            "tone": "danger" if share >= 1 else "warn",
+            "actions": actions[:3],
+        }
+
+    # --- B: liquidity against recovery -------------------------------------
+    recoverable_now = recoverable + contested
+    if shortfall and recoverable_now > shortfall // 2:
+        day = trough.get("day", "?")
+        covered = min(recoverable_now, shortfall) / shortfall * 100
+        actions = [act("Cash forecast", "See the forecast",
+                       f"/agents/cash-forecaster?key={_cash_key}")]
+        if contested:
+            actions.append(act("Chargebacks", "Send the evidence packs",
+                               route_for("chargeback").href))
+        if recoverable:
+            actions.append(act("Settlement", "File the disputes",
+                               route_for("settlement_audit").href))
+        return {
+            "headline": (f"A {rupees(shortfall)} cash shortfall is projected "
+                         f"for day {day}."),
+            "detail": (f"You are already owed {rupees(recoverable_now)} in "
+                       f"drafted chargebacks and gateway disputes - enough to "
+                       f"cover {covered:.0f}% of it. Winning them is the "
+                       f"cheapest money available to you before that date."),
+            "tone": "warn",
+            "actions": actions[:3],
+        }
+
+    # --- C: compliance burn ------------------------------------------------
+    per_day = burn["per_day_paise"]
+    if per_day or itc_at_risk:
+        actions = []
+        if per_day:
+            actions.append(act("Output tax", "Pay down the interest",
+                               route_for("gst_filing").href))
+        if itc_at_risk:
+            actions.append(act("Input credit", "Chase the suppliers",
+                               route_for("gst_itc").href))
+        if per_day:
+            headline = (f"Unresolved tax compliance is costing you "
+                        f"{rupees(per_day)} a day.")
+            detail = (f"{rupees(burn['accrued_paise'])} of section 50 interest "
+                      f"has already accrued across {burn['periods']} locked "
+                      f"period{'s' if burn['periods'] != 1 else ''}, and it "
+                      f"keeps running until the shortfall is paid.")
+        else:
+            headline = (f"{rupees(itc_at_risk)} of supplier credit is at risk "
+                        f"of reversal.")
+            detail = ("Your suppliers have not filed the returns these claims "
+                      "depend on. The credit is yours only while their filing "
+                      "holds up.")
+        if per_day and itc_at_risk:
+            detail += (f" Separately, {rupees(itc_at_risk)} of supplier credit "
+                       f"is at risk of reversal.")
+        return {
+            "headline": headline, "detail": detail, "tone": "warn",
+            "actions": actions[:3],
+        }
+
+    # --- nothing fired -----------------------------------------------------
+    #
+    # Two different silences, and conflating them is how a dashboard lies. An
+    # agent that has run and found nothing is good news. An agent that has
+    # never run has found nothing because nobody asked it, which is not the
+    # same thing and must not be reported as health.
+    if not candidates and gross == 0:
+        return {
+            "headline": "No agent has looked at anything yet.",
+            "detail": ("Import a settlement or run a simulated batch, and "
+                       "this brief will start reading across your agents."),
+            "tone": "quiet",
+            "actions": [act("Data", "Add your data", "/data")],
+        }
+
+    return {
+        "headline": "Margin retention is optimal.",
+        "detail": ("No recoverable overcharges, no supplier overbilling, no "
+                   "float cost, no interest running and no cash shortfall "
+                   "projected. Nothing across your agents needs you today."),
+        "tone": "good",
+        "actions": [act(c["agent"], f"Open {c['agent'].lower()}", c["href"])
+                    for c in candidates[:2]],
+    }
+
+
+def _join_clauses(parts: list) -> str:
+    """"a, b and c" - the Oxford-free join English actually uses in a list."""
+    if len(parts) <= 1:
+        return "".join(parts)
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 

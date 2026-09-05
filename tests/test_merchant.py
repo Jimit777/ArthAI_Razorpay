@@ -1990,6 +1990,15 @@ def _summary(**over):
     return base
 
 
+def _brief(**over) -> dict:
+    """A synthesised brief, the shape app.py's _synthesize_insights returns."""
+    base = {"headline": "Margin retention is optimal.",
+            "detail": "Nothing across your agents needs you today.",
+            "tone": "good", "actions": []}
+    base.update(over)
+    return base
+
+
 def test_the_counting_cards_show_the_real_counts():
     """Transactions, Customers and Vendors each state a real count off a
     real table, including the money figure the vendor agent found."""
@@ -1997,7 +2006,7 @@ def test_the_counting_cards_show_the_real_counts():
         payment_count=14, method_count=3,
         customer_count=8, customer_registered=5,
         vendor_count=10, vendor_overbilled_paise=1875570,
-    ), [])
+    ), [], _brief())
 
     assert "Transactions" in html and ">14<" in html
     assert "across 3 payment methods" in html
@@ -2010,7 +2019,7 @@ def test_the_counting_cards_show_the_real_counts():
 def test_a_counting_card_with_nothing_behind_it_says_so():
     """A business that has never run an agent gets an honest "nothing yet",
     never a zero dressed up as a real measurement."""
-    html = views.dashboard_bottom(_summary(), [])
+    html = views.dashboard_bottom(_summary(), [], _brief())
 
     assert "no settlements recorded yet" in html
     assert "no sales invoices loaded yet" in html
@@ -2021,29 +2030,47 @@ def test_the_insights_panel_does_not_nest_anchors():
     """Regression: the panel used to be an <a> wrapping the runner-up rows,
     which are themselves <a>s. Nested anchors are invalid HTML - the parser
     closes the outer one early and ejects the rest of the card out of it,
-    which is exactly what it did on screen."""
-    html = views.insights_panel([
-        {"agent": "Settlement", "headline": "Rs 720.92",
-         "subtext": "recoverable overcharges", "tone": "danger",
-         "href": "/agents/settlement", "urgency": 72092},
-        {"agent": "Payout timing", "headline": "Rs 131.16",
-         "subtext": "float cost", "tone": "warn",
-         "href": "/agents/payout-timing", "urgency": 13116},
-    ])
+    which is exactly what it did on screen. The brief's action links are the
+    same hazard, one layer further in."""
+    html = views.insights_panel(
+        _brief(headline="Hidden leaks are costing you 3.85% of gross.",
+               tone="danger",
+               actions=[{"agent": "Settlement", "label": "Review overcharges",
+                         "href": "/agents/settlement"}]),
+        [{"agent": "Settlement", "headline": "Rs 720.92",
+          "subtext": "recoverable overcharges", "tone": "danger",
+          "href": "/agents/settlement", "urgency": 72092},
+         {"agent": "Payout timing", "headline": "Rs 131.16",
+          "subtext": "float cost", "tone": "warn",
+          "href": "/agents/payout-timing", "urgency": 13116}])
 
     # The panel itself must not be an anchor while it contains anchors.
     assert not html.strip().startswith("<a")
     assert 'class="card insights-panel' in html
-    assert html.count("<a ") == 2, (
-        "expected exactly the lead link and one runner-up row")
+    assert html.count("<a ") == 3, "one action plus two runner-up rows"
     assert "Payout timing" in html
+
+
+def test_the_panel_renders_the_brief_and_never_computes_it():
+    """
+    Every figure here is finished text from _synthesize_insights. The panel's
+    job is typography - the moment it starts formatting money or dividing by
+    gross, two places own the same arithmetic and they drift.
+    """
+    html = views.insights_panel(
+        _brief(headline="Hidden leaks are costing you 3.85% of your gross volume.",
+               detail="Rs 6,383.06 across three agents.", tone="danger"), [])
+
+    assert "3.85% of your gross volume" in html
+    assert "Rs 6,383.06 across three agents." in html
+    assert "tone-danger" in html
 
 
 def test_the_insights_panel_is_calm_when_nothing_is_wrong():
     """No findings is a real, reassuring answer - not an empty state to
     paper over with a placeholder."""
-    html = views.insights_panel([])
-    assert "Nothing is waiting on you" in html
+    html = views.insights_panel(_brief(), [])
+    assert "Margin retention is optimal" in html
     assert "<a " not in html
 
 
@@ -2106,6 +2133,158 @@ def test_insight_candidates_are_capped_at_four_and_sorted_by_urgency(led):
     assert {c["agent"] for c in candidates} <= {
         "Settlement", "Suppliers", "Vendor terms", "Chargebacks",
         "Payout timing", "Three-way recon", "Cash forecast"}
+
+
+# --- the Controller's Brief: one reading across every agent ---------------
+#
+# _insight_candidates answers "which agent is shouting loudest".
+# _synthesize_insights answers the questions a merchant actually has, each of
+# which needs figures from more than one agent - so these tests plant runs in
+# several agents at once and check the sentence that comes back.
+
+def _ws(led):
+    from types import SimpleNamespace
+    return SimpleNamespace(business_id=led.business_id)
+
+
+def _brief_for(led):
+    import merchant.app as appmod
+
+    ws = _ws(led)
+    summary = led.dashboard_summary()
+    return appmod._synthesize_insights(
+        led, ws, summary, appmod._insight_candidates(led, ws, summary))
+
+
+def test_synthesis_a_states_leakage_as_a_share_of_gross(led):
+    """
+    Three agents each found money that left. Their sum against gross is the
+    number a merchant runs a business on, and no single agent can compute it.
+    """
+    card = led.rate_card()
+    led.generate_mixed_batch(20)
+    led.commit_settlement(led.build_settlement(card))
+    _plant_insight_runs(led, overbilled=625190, contested=0, float_cost=13116)
+
+    brief = _brief_for(led)
+
+    assert "% of your gross volume" in brief["headline"]
+    assert "Rs 6,383.06" in brief["detail"], "the three figures, summed"
+    assert "suppliers overbilled" in brief["detail"]
+    assert "late settlement" in brief["detail"]
+    # And it says where to go, not just what is wrong.
+    assert {a["agent"] for a in brief["actions"]} == {"Vendor terms",
+                                                     "Payout timing"}
+
+
+def test_synthesis_b_pairs_a_shortfall_with_what_is_already_recoverable(led):
+    """
+    "You are short" is an alarm. "You are short, and you are already owed
+    more than half of it" is a plan - and it needs the cash forecaster and
+    the chargeback agent to be read together.
+    """
+    import merchant.app as appmod
+
+    _plant_insight_runs(led, overbilled=0, contested=400000, float_cost=0)
+    appmod.CASH_RUNS[f"cash_{led.business_id}"] = {
+        "business_id": led.business_id, "state": "done",
+        "payload": {"forecast": {"action": "act",
+                                 "trough": {"day": 12, "shortfall": 500000}}}}
+    try:
+        brief = _brief_for(led)
+    finally:
+        appmod.CASH_RUNS.pop(f"cash_{led.business_id}", None)
+
+    assert "Rs 5,000.00 cash shortfall" in brief["headline"]
+    assert "day 12" in brief["headline"]
+    assert "Rs 4,000.00" in brief["detail"], "what is already recoverable"
+    assert "80%" in brief["detail"], "the share of the gap it covers"
+
+
+def test_synthesis_b_stays_quiet_when_recovery_would_barely_dent_it(led):
+    """
+    Below half, "this will cover it" is not true, and saying it anyway is
+    worse than saying nothing - the merchant needs to raise cash, not wait on
+    a dispute.
+    """
+    import merchant.app as appmod
+
+    _plant_insight_runs(led, overbilled=0, contested=10000, float_cost=0)
+    appmod.CASH_RUNS[f"cash_{led.business_id}"] = {
+        "business_id": led.business_id, "state": "done",
+        "payload": {"forecast": {"action": "act",
+                                 "trough": {"day": 12, "shortfall": 500000}}}}
+    try:
+        brief = _brief_for(led)
+    finally:
+        appmod.CASH_RUNS.pop(f"cash_{led.business_id}", None)
+
+    assert "cash shortfall" not in brief["headline"]
+
+
+def test_synthesis_c_reports_the_interest_as_a_rate(led):
+    """
+    Section 50 interest is the one cost on this platform that grows while the
+    merchant does nothing. A running total says it happened; a per-day rate
+    says it is still happening, which is the fact that changes behaviour.
+    """
+    led.conn.execute(
+        "INSERT INTO business_gstr1_runs (run_id, business_id, created_at)"
+        " VALUES ('g1', ?, 0)", (led.business_id,))
+    led.conn.execute(
+        "INSERT INTO gst_correction_findings (run_id, business_id, period,"
+        " window_state, interest_paise, days_overdue)"
+        " VALUES ('g1', ?, '2026-04', 'locked', 90000, 30)",
+        (led.business_id,))
+    led.conn.commit()
+
+    brief = _brief_for(led)
+
+    assert "Rs 30.00 a day" in brief["headline"]
+    assert "Rs 900.00" in brief["detail"], "what has already accrued"
+    assert "1 locked period" in brief["detail"]
+
+
+def test_an_open_period_is_not_billed_as_interest(led):
+    """
+    An open period is still correctable through GSTR-1A at no cost. Counting
+    it would charge the merchant for a problem they can still fix for free.
+    """
+    led.conn.execute(
+        "INSERT INTO business_gstr1_runs (run_id, business_id, created_at)"
+        " VALUES ('g1', ?, 0)", (led.business_id,))
+    led.conn.execute(
+        "INSERT INTO gst_correction_findings (run_id, business_id, period,"
+        " window_state, interest_paise, days_overdue)"
+        " VALUES ('g1', ?, '2026-04', 'open', 90000, 30)",
+        (led.business_id,))
+    led.conn.commit()
+
+    assert led.gst_interest_burn()["per_day_paise"] == 0
+
+
+def test_a_healthy_business_gets_a_positive_reading_not_an_empty_card(led):
+    """Nothing wrong is a real answer, and worth saying in those words."""
+    card = led.rate_card()
+    led.generate_mixed_batch(10)
+    led.commit_settlement(led.build_settlement(card))
+
+    brief = _brief_for(led)
+
+    assert brief["tone"] == "good"
+    assert "Margin retention is optimal" in brief["headline"]
+
+
+def test_a_business_with_no_data_is_not_called_healthy(led):
+    """
+    Two different silences. An agent that ran and found nothing is good news;
+    an agent nobody has run has found nothing because nobody asked. Reporting
+    the second as health is how a dashboard lies.
+    """
+    brief = _brief_for(led)
+
+    assert brief["tone"] == "quiet"
+    assert "No agent has looked at anything yet" in brief["headline"]
 
 
 def test_the_lead_insight_is_money_lost_not_the_biggest_number(led):

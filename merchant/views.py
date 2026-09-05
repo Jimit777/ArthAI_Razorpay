@@ -1273,7 +1273,7 @@ def stat_card(title: str, value: str, sub: str, dots: int = 0,
     return f'<div class="card stat-card">{inner}</div>'
 
 
-def dashboard_bottom(summary: dict, candidates: list) -> str:
+def dashboard_bottom(summary: dict, candidates: list, brief: dict) -> str:
     """
     The reference's second row: a few counting cards on the left, and the
     tall glossy Insights panel on the right.
@@ -1317,48 +1317,46 @@ def dashboard_bottom(summary: dict, candidates: list) -> str:
     return f"""
 <div class="dash-row2">
   <div class="stat-stack">{"".join(cards)}</div>
-  {insights_panel(candidates)}
+  {insights_panel(brief, candidates)}
 </div>"""
 
 
-def insights_panel(candidates: list) -> str:
+def insights_panel(brief: dict, candidates: list) -> str:
     """
-    The tall glossy Insights card - the single most urgent agent finding,
-    with the runners-up listed beneath it.
+    The Controller's Brief - one paragraph that reads across every agent, and
+    the two or three places to go and act on it.
 
-    The headline is still that agent's own real number and its own
-    reasoning; the gloss is visual weight earned by rank, never a
-    fabricated score standing in for one. With nothing to report the panel
-    says exactly that, because "no agent has anything for you" is a real
-    and reassuring answer, not an empty state to hide.
+    This used to be a stack of each agent's own worst number, which answers
+    "which agent is shouting loudest" rather than the question a merchant
+    actually has. app.py's _synthesize_insights answers that question instead
+    and hands this function finished text: every rupee, percentage and sum is
+    already computed and formatted there. Nothing below does arithmetic.
+
+    The runner-up rows stay underneath, because the synthesis is a reading of
+    the numbers and a reader should still be able to see the numbers.
     """
-    if not candidates:
-        return """
-  <div class="card insights-panel quiet">
-    <div class="insight-agent">Insights</div>
-    <div class="insights-quiet-head">Nothing is waiting on you.</div>
-    <p class="sub" style="margin:0">No agent has found anything worth your
-       attention in what it has been given so far.</p>
-  </div>"""
+    tone = brief.get("tone", "brand")
+    actions = "".join(f"""
+      <a class="brief-action" href="{esc(a["href"])}">
+        <span class="ba-label">{esc(a["label"])}</span>
+        <span class="ba-agent">{esc(a["agent"])}</span>
+      </a>""" for a in brief.get("actions", []))
 
-    head, rest = candidates[0], candidates[1:]
     more = "".join(f"""
       <a class="insights-more-row" href="{esc(c["href"])}">
         <span class="im-agent">{esc(c["agent"])}</span>
         <span class="im-head">{esc(c["headline"])}</span>
-      </a>""" for c in rest)
+      </a>""" for c in candidates[:3])
 
-    # The panel is a <div>, not an <a>: the runner-up rows below are
-    # themselves links, and an <a> inside an <a> is invalid HTML - the
-    # parser closes the outer one early and throws the rest of the card
-    # out of it. The headline gets its own link instead.
+    # A <div>, not an <a>: every action and every runner-up row below is
+    # itself a link, and an <a> inside an <a> is invalid - the parser closes
+    # the outer one early and throws the rest of the card out of it.
     return f"""
-  <div class="card insights-panel tone-{esc(head["tone"])}">
-    <a class="insights-lead" href="{esc(head["href"])}">
-      <span class="insight-agent">Insights · {esc(head["agent"])}</span>
-      <span class="insights-headline">{esc(head["headline"])}</span>
-      <span class="insights-sub">{esc(head["subtext"])}</span>
-    </a>
+  <div class="card insights-panel tone-{esc(tone)}">
+    <div class="insight-agent">ArthAI Synthesis</div>
+    <p class="brief-headline">{esc(brief.get("headline", ""))}</p>
+    <p class="brief-detail">{esc(brief.get("detail", ""))}</p>
+    {f'<div class="brief-actions">{actions}</div>' if actions else ""}
     {f'<div class="insights-more">{more}</div>' if more else ""}
   </div>"""
 
@@ -3368,6 +3366,36 @@ a.stat-card:hover { box-shadow:var(--shadow-lift); transform:translateY(-1px) }
   bottom:0; width:3px; background:var(--brand); z-index:2 }
 .insights-panel.tone-danger::before { background:#f87171 }
 .insights-panel.tone-warn::before { background:#fbbf24 }
+.insights-panel.tone-good::before { background:#34d399 }
+.insights-panel.tone-quiet::before { background:#64748b }
+
+/* --- the Controller's Brief ---------------------------------------------
+   A paragraph, not a figure. The synthesis reads across agents, so its
+   headline is a sentence and gets sentence typography - large, tight, but
+   set in the body face at a readable measure rather than the display face
+   at poster size, which is for single numbers. */
+.brief-headline { font-family:var(--font-display); font-size:20px;
+  font-weight:700; letter-spacing:-.025em; line-height:1.3;
+  margin:12px 0 8px; max-width:34ch }
+.brief-detail { font-size:12.8px; line-height:1.6; margin:0;
+  color:rgba(255,255,255,.82); max-width:44ch }
+.brief-actions { display:flex; flex-direction:column; gap:6px;
+  margin:18px 0 0 }
+/* Minimal, not buttons: these sit on the panel's own dark ground, where a
+   filled button would compete with the headline for the one thing the eye
+   should land on first. A hairline and a hover fill is enough to read as
+   pressable. */
+.brief-action { display:flex; align-items:baseline; justify-content:space-between;
+  gap:10px; padding:8px 12px; border-radius:9px; text-decoration:none;
+  color:#fff; background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.14);
+  transition:background .12s ease, border-color .12s ease }
+.brief-action:hover { background:rgba(255,255,255,.15);
+  border-color:rgba(255,255,255,.3) }
+.brief-action .ba-label { font-size:12.4px; font-weight:600 }
+.brief-action .ba-agent { font-size:10.5px; letter-spacing:.04em;
+  text-transform:uppercase; color:rgba(255,255,255,.62); font-weight:600;
+  white-space:nowrap }
 /* The reference's glossy sweep - a light source in the top-right corner. */
 .insights-panel::after { content:""; position:absolute; inset:0;
   pointer-events:none;
