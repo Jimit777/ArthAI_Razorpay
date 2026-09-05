@@ -27,7 +27,7 @@ pointed it.
 
 ## Key rotation
 
-LEDGERLINE_SECRET_KEY may be a comma-separated list. The first key encrypts;
+ARTHAI_SECRET_KEY may be a comma-separated list. The first key encrypts;
 every key is tried when decrypting. That is the standard rotation pattern: add
 the new key at the front, let the old one linger until everything has been
 re-encrypted, then drop it.

@@ -47,7 +47,7 @@ ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 
 # The state cookie is short-lived: it only has to survive the round trip to
 # Google's consent screen and back.
-STATE_COOKIE = "ledgerline_oauth_state"
+STATE_COOKIE = "arthai_oauth_state"
 STATE_MAX_AGE = 600
 
 ENV_CLIENT_ID = "GOOGLE_CLIENT_ID"

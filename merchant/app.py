@@ -1333,7 +1333,7 @@ def _insight_candidates(led, ws, summary: dict) -> list:
     if led.settlements() and summary["recoverable_paise"] > 0:
         out.append({
             "agent": "Settlement", "headline": rupees(summary["recoverable_paise"]),
-            "subtext": "recoverable overcharges", "tone": "danger",
+            "subtext": "recoverable overcharges", "tone": "danger", "tier": 0,
             "href": route_for("settlement_audit").href,
             "urgency": summary["recoverable_paise"],
         })
@@ -1341,7 +1341,7 @@ def _insight_candidates(led, ws, summary: dict) -> list:
     if led.last_check() and summary["itc_at_risk_paise"] > 0:
         out.append({
             "agent": "Suppliers", "headline": rupees(summary["itc_at_risk_paise"]),
-            "subtext": "input credit at risk", "tone": "danger",
+            "subtext": "input credit at risk", "tone": "danger", "tier": 1,
             "href": route_for("gst_itc").href,
             "urgency": summary["itc_at_risk_paise"],
         })
@@ -1355,7 +1355,7 @@ def _insight_candidates(led, ws, summary: dict) -> list:
         if overbilled:
             out.append({
                 "agent": "Vendor terms", "headline": rupees(overbilled),
-                "subtext": "overbilled by suppliers", "tone": "warn",
+                "subtext": "overbilled by suppliers", "tone": "warn", "tier": 0,
                 "href": route_for("vendor_terms").href, "urgency": overbilled,
             })
 
@@ -1368,7 +1368,7 @@ def _insight_candidates(led, ws, summary: dict) -> list:
         if drafted:
             out.append({
                 "agent": "Chargebacks", "headline": rupees(drafted),
-                "subtext": "in drafted representments", "tone": "warn",
+                "subtext": "in drafted representments", "tone": "warn", "tier": 2,
                 "href": route_for("chargeback").href, "urgency": drafted,
             })
 
@@ -1376,7 +1376,7 @@ def _insight_candidates(led, ws, summary: dict) -> list:
     if pt_run and (pt_run["total_float_cost"] or 0) > 0:
         out.append({
             "agent": "Payout timing", "headline": rupees(pt_run["total_float_cost"]),
-            "subtext": "float cost from late settlement", "tone": "warn",
+            "subtext": "float cost from late settlement", "tone": "warn", "tier": 2,
             "href": route_for("payout_timing").href,
             "urgency": pt_run["total_float_cost"],
         })
@@ -1388,7 +1388,7 @@ def _insight_candidates(led, ws, summary: dict) -> list:
         if at_stake:
             out.append({
                 "agent": "Three-way recon", "headline": rupees(at_stake),
-                "subtext": "unreconciled across sources", "tone": "warn",
+                "subtext": "unreconciled across sources", "tone": "warn", "tier": 2,
                 "href": route_for("three_way_recon").href, "urgency": at_stake,
             })
 
@@ -1406,12 +1406,26 @@ def _insight_candidates(led, ws, summary: dict) -> list:
             out.append({
                 "agent": "Cash forecast",
                 "headline": f"Day {trough.get('day', '?')}",
-                "subtext": f"short by {rupees(shortfall)}", "tone": "danger",
+                "subtext": f"short by {rupees(shortfall)}", "tone": "danger", "tier": 1,
                 "href": f"/agents/cash-forecaster?key={cash_key}",
                 "urgency": shortfall,
             })
 
-    out.sort(key=lambda d: -d["urgency"])
+    # Rank by what the number MEANS first, size second.
+    #
+    # Sorting on rupees alone compared quantities that are not the same kind
+    # of thing, and the biggest one always won: a chargeback book of
+    # Rs 1,57,461 being contested (most of which the merchant keeps) led the
+    # panel over Rs 6,251 a supplier definitely overbilled. The lead card
+    # then read as "this is what you are losing" about money that is mostly
+    # not lost.
+    #
+    #   tier 0  money taken that should not have been - certain, recoverable
+    #   tier 1  a credit or a balance at risk on a deadline
+    #   tier 2  under dispute, or the cost of time rather than a wrong charge
+    #
+    # Within a tier, rupees decide, which is what a merchant means by "worst".
+    out.sort(key=lambda d: (d.get("tier", 2), -d["urgency"]))
     return out[:4]
 
 

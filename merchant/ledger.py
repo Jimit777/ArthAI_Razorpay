@@ -3625,24 +3625,47 @@ class Ledger:
             "  WHERE br.business_id = ? GROUP BY bc.utr)",
             (self._scoped(),)).fetchone()["paise"]
 
+        # One verdict per payment, and the LATEST one - not every verdict
+        # ever passed on it. Auditing the same batch twice wrote a second
+        # variance row per payment (60 payments, 120 rows on this developer's
+        # own database), so a straight SUM reported twice the money as
+        # recoverable. Deduping to MAX(id) also means a payment re-audited
+        # after a rate-card fix is counted on the new answer, not the old one:
+        # a re-audit should be able to REMOVE money from this figure, which
+        # summing every row can never do.
         recoverable = self.conn.execute(
-            "SELECT COALESCE(SUM(v.money_at_stake), 0) paise FROM variances v"
-            " JOIN business_runs br ON br.run_id = v.run_id"
-            " WHERE br.business_id = ? AND v.action = 'dispute'",
+            "SELECT COALESCE(SUM(money_at_stake), 0) paise FROM ("
+            "  SELECT v.payment_id, v.money_at_stake, v.action,"
+            "         ROW_NUMBER() OVER (PARTITION BY v.payment_id"
+            "                            ORDER BY v.id DESC) rn"
+            "  FROM variances v JOIN business_runs br ON br.run_id = v.run_id"
+            "  WHERE br.business_id = ?)"
+            " WHERE rn = 1 AND action = 'dispute'",
             (self._scoped(),)).fetchone()["paise"]
 
         from engine.gst.taxonomy import AT_RISK, NO_ACTION
 
+        # Same deduplication, same reason: re-checking a purchase register
+        # writes a second finding per invoice, and an invoice's input credit
+        # is at risk once, not once per check.
+        latest_itc = (
+            "SELECT claimed_tax, money_at_stake, exception_code FROM ("
+            "  SELECT claimed_tax, money_at_stake, exception_code,"
+            "         ROW_NUMBER() OVER ("
+            "           PARTITION BY COALESCE(NULLIF(invoice_id, ''),"
+            "                                 supplier_gstin || '|' ||"
+            "                                 invoice_number)"
+            "           ORDER BY id DESC) rn"
+            "  FROM itc_findings WHERE business_id = ?) WHERE rn = 1")
+
         itc_safe = self.conn.execute(
-            "SELECT COALESCE(SUM(claimed_tax), 0) paise FROM itc_findings"
-            f" WHERE business_id = ? AND exception_code IN"
-            f" ({','.join('?' * len(NO_ACTION))})",
+            f"SELECT COALESCE(SUM(claimed_tax), 0) paise FROM ({latest_itc})"
+            f" WHERE exception_code IN ({','.join('?' * len(NO_ACTION))})",
             (self._scoped(), *(str(c) for c in NO_ACTION))).fetchone()["paise"]
 
         itc_at_risk = self.conn.execute(
-            "SELECT COALESCE(SUM(money_at_stake), 0) paise FROM itc_findings"
-            f" WHERE business_id = ? AND exception_code IN"
-            f" ({','.join('?' * len(AT_RISK))})",
+            f"SELECT COALESCE(SUM(money_at_stake), 0) paise FROM ({latest_itc})"
+            f" WHERE exception_code IN ({','.join('?' * len(AT_RISK))})",
             (self._scoped(), *(str(c) for c in AT_RISK))).fetchone()["paise"]
 
         # --- the counting cards: Transactions, Customers, Vendors ----------

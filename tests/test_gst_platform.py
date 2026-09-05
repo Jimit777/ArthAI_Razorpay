@@ -709,6 +709,69 @@ def test_dashboard_summary_matches_hand_computed_totals(shop):
     assert summary["itc_at_risk_paise"] == at_risk > 0
 
 
+def test_auditing_the_same_batch_twice_does_not_double_the_recoverable(shop):
+    """
+    A second audit is a second opinion on the same money, not more money.
+
+    Every other figure on this card was deduplicated when repeated imports
+    were found inflating gross; recoverable was left summing every variance
+    row, so re-auditing one batch doubled the headline number the Insights
+    card leads with.
+    """
+    import merchant.app as appmod
+
+    _sold_and_audited(shop)
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        run_id = led.conn.execute(
+            "SELECT run_id FROM variances LIMIT 1").fetchone()["run_id"]
+        # Make this run's verdicts disputes, so the figure is non-zero and a
+        # doubling would actually show.
+        led.conn.execute("UPDATE variances SET action = 'dispute',"
+                         " money_at_stake = 5000 WHERE run_id = ?", (run_id,))
+        led.conn.commit()
+        once = led.dashboard_summary()["recoverable_paise"]
+        assert once > 0
+
+        # Audit the same payments again - same verdicts, new rows.
+        led.conn.execute(
+            "INSERT INTO variances (run_id, payment_id, money_at_stake, action)"
+            " SELECT run_id, payment_id, money_at_stake, action FROM variances"
+            " WHERE run_id = ?", (run_id,))
+        led.conn.commit()
+
+        assert led.dashboard_summary()["recoverable_paise"] == once
+
+
+def test_a_re_audit_can_take_money_off_the_recoverable_figure(shop):
+    """
+    The point of keeping only the latest verdict: a payment re-judged as a
+    dismissal stops being counted. Summing every row could only ever add.
+    """
+    import merchant.app as appmod
+
+    _sold_and_audited(shop)
+
+    with appmod.ledger() as led:
+        led.business_id = led.businesses.all()[0]["business_id"]
+        row = led.conn.execute(
+            "SELECT run_id, payment_id FROM variances LIMIT 1").fetchone()
+        led.conn.execute("UPDATE variances SET action = 'dispute',"
+                         " money_at_stake = 5000 WHERE payment_id = ?",
+                         (row["payment_id"],))
+        led.conn.commit()
+        before = led.dashboard_summary()["recoverable_paise"]
+
+        led.conn.execute(
+            "INSERT INTO variances (run_id, payment_id, money_at_stake, action)"
+            " VALUES (?, ?, 5000, 'dismiss')",
+            (row["run_id"], row["payment_id"]))
+        led.conn.commit()
+
+        assert led.dashboard_summary()["recoverable_paise"] == before - 5000
+
+
 def test_dashboard_summary_is_scoped_to_one_business(tmp_path):
     """A second business with no runs at all must see zeros, not the first
     business's totals - the same scoping guarantee every other cross-run

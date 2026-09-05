@@ -2047,6 +2047,36 @@ def test_the_insights_panel_is_calm_when_nothing_is_wrong():
     assert "<a " not in html
 
 
+def _plant_insight_runs(led, *, overbilled: int, contested: int,
+                        float_cost: int) -> None:
+    """
+    Three agents' finished runs, planted directly.
+
+    The demo seeders plant SOURCE data - a run still has to happen for there
+    to be a finding to headline - so the ranking tests below write the runs
+    and their findings themselves rather than driving three agents.
+    """
+    led.conn.execute(
+        "INSERT INTO business_vendor_terms_runs (run_id, business_id, n_items,"
+        " created_at) VALUES ('vt_1', ?, 1, 0)", (led.business_id,))
+    led.conn.execute(
+        "INSERT INTO vendor_terms_findings (run_id, business_id, code,"
+        " money_at_stake_paise) VALUES ('vt_1', ?, 'OVERBILLED', ?)",
+        (led.business_id, overbilled))
+    led.conn.execute(
+        "INSERT INTO business_chargeback_runs (run_id, business_id, n_disputes,"
+        " created_at) VALUES ('cb_1', ?, 1, 0)", (led.business_id,))
+    led.conn.execute(
+        "INSERT INTO chargeback_findings (run_id, business_id, action,"
+        " amount_paise) VALUES ('cb_1', ?, 'draft_evidence_pack', ?)",
+        (led.business_id, contested))
+    led.conn.execute(
+        "INSERT INTO business_payout_timing_runs (run_id, business_id,"
+        " n_settled, total_float_cost, created_at) VALUES ('pt_1', ?, 10, ?, 0)",
+        (led.business_id, float_cost))
+    led.conn.commit()
+
+
 def test_insight_candidates_are_capped_at_four_and_sorted_by_urgency(led):
     """Seeds three agents' real demo data plus a hand-planted fourth (a
     payout-timing run has no demo seeder of its own to call directly), and
@@ -2056,28 +2086,51 @@ def test_insight_candidates_are_capped_at_four_and_sorted_by_urgency(led):
 
     import merchant.app as appmod
 
-    led.seed_vendor_terms_demo(40)
-    led.seed_chargeback_demo(30)
-    led.conn.execute(
-        "INSERT INTO business_payout_timing_runs (run_id, business_id,"
-        " n_settled, total_float_cost, created_at) VALUES"
-        " ('pt_1', ?, 10, 999999900, 0)", (led.business_id,))
-    led.conn.commit()
+    _plant_insight_runs(led, overbilled=625190, contested=15746100,
+                        float_cost=999999900)
 
     ws = SimpleNamespace(business_id=led.business_id)
     summary = led.dashboard_summary()
     candidates = appmod._insight_candidates(led, ws, summary)
 
     assert 1 <= len(candidates) <= 4
-    urgencies = [c["urgency"] for c in candidates]
-    assert urgencies == sorted(urgencies, reverse=True), \
-        "candidates must be worst-first"
-    # The hand-planted payout-timing float cost is deliberately the largest
-    # figure of anything plantable here, so it has to lead.
-    assert candidates[0]["agent"] == "Payout timing"
+    # Worst-first WITHIN a tier. Across tiers, meaning beats size - see the
+    # ranking test below, and _insight_candidates' own comment.
+    for tier in {c["tier"] for c in candidates}:
+        sizes = [c["urgency"] for c in candidates if c["tier"] == tier]
+        assert sizes == sorted(sizes, reverse=True), "worst-first in a tier"
+    # Vendor terms is money a supplier definitely overbilled, so it leads the
+    # hand-planted float cost even though that figure is far larger: a cost
+    # of time is not the same kind of thing as a wrong charge.
+    assert candidates[0]["agent"] == "Vendor terms"
     assert {c["agent"] for c in candidates} <= {
         "Settlement", "Suppliers", "Vendor terms", "Chargebacks",
         "Payout timing", "Three-way recon", "Cash forecast"}
+
+
+def test_the_lead_insight_is_money_lost_not_the_biggest_number(led):
+    """
+    Ranking on rupees alone compared unlike things and the biggest always won:
+    a chargeback book being contested - most of which the merchant keeps -
+    led the panel over money a supplier definitely overbilled. The lead card
+    then read as "this is what you are losing" about money mostly not lost.
+    """
+    from types import SimpleNamespace
+
+    import merchant.app as appmod
+
+    _plant_insight_runs(led, overbilled=625190, contested=15746100,
+                        float_cost=13116)
+
+    ws = SimpleNamespace(business_id=led.business_id)
+    candidates = appmod._insight_candidates(led, ws, led.dashboard_summary())
+    by_agent = {c["agent"]: c for c in candidates}
+
+    assert "Vendor terms" in by_agent and "Chargebacks" in by_agent
+    assert by_agent["Chargebacks"]["urgency"] > by_agent["Vendor terms"]["urgency"], \
+        "the premise: the contested book is the bigger number"
+    assert candidates[0]["agent"] == "Vendor terms", \
+        "certain, recoverable loss must outrank a number merely being disputed"
 
 
 def test_an_agent_with_nothing_worth_flagging_contributes_no_candidate(led):
