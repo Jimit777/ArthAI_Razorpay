@@ -1,4 +1,4 @@
-# Ledgerline — Platform Reference
+# ArthAI — Platform Reference
 
 > A record of what has actually been built, as of 31 August 2026. Where
 > `CLAUDE.md` is the brief this project was built from, this file is the

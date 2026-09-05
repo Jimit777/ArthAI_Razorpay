@@ -254,7 +254,7 @@ argument, and it is a test (`test_bank_credits_tie_out_to_the_paise`).
 
 ---
 
-## Ledgerline — the platform
+## ArthAI — the platform
 
 ```bash
 ./run_platform.sh        # then open http://localhost:8000
@@ -272,7 +272,7 @@ than a tool.
 ### This is not where sales happen
 
 It is where they get **checked afterwards**. A merchant's money already flows
-through their gateway; Ledgerline reads what the gateway *did* to it and says
+through their gateway; ArthAI reads what the gateway *did* to it and says
 which parts were wrong. Nobody types a sale into it.
 
 That distinction is load-bearing and the app used to hide it — the first screen

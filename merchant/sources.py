@@ -91,12 +91,8 @@ KIND_LABEL = {
 }
 
 KIND_BLURB = {
-    SourceKind.RAZORPAY:
-        "Read this merchant's real settlement reports straight from Razorpay. "
-        "This is what the product does in production.",
-    SourceKind.SIMULATOR:
-        "Manufacture settlements locally so the auditor has something to work "
-        "on without a connected account. Demo data - no real gateway.",
+    SourceKind.RAZORPAY: "Real settlement reports, straight from Razorpay.",
+    SourceKind.SIMULATOR: "Generated settlements - no gateway needed.",
 }
 
 

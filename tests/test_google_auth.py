@@ -84,9 +84,9 @@ def test_an_explicit_redirect_uri_wins_over_the_request(configured, monkeypatch)
     """Google matches this string exactly, so a proxy rewriting the host
     must not be allowed to change it."""
     monkeypatch.setenv(google_auth.ENV_REDIRECT_URI,
-                       "https://ledgerline.example/auth/google/callback")
+                       "https://artha.example/auth/google/callback")
     assert google_auth.redirect_uri("http://127.0.0.1:8000/") == \
-        "https://ledgerline.example/auth/google/callback"
+        "https://artha.example/auth/google/callback"
 
 
 # --- what validate_claims must refuse --------------------------------------

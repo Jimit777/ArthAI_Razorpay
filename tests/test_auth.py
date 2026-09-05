@@ -164,7 +164,7 @@ def test_login_says_nothing_about_which_half_was_wrong(auth):
 def test_the_first_account_runs_the_platform(auth):
     """Somebody has to reach /admin, and there is nobody to grant it."""
     a, led = auth
-    first = a.register("founder@ledgerline.in", "a-good-password")
+    first = a.register("founder@artha.ai", "a-good-password")
     second = a.register("merchant@boutique.in", "a-good-password")
     assert first.is_operator
     assert not second.is_operator
@@ -177,7 +177,7 @@ def test_an_operator_is_not_automatically_an_owner(auth):
     merchant is owed.
     """
     a, led = auth
-    op = a.register("founder@ledgerline.in", "a-good-password")
+    op = a.register("founder@artha.ai", "a-good-password")
     merchant = a.register("meera@boutique.in", "a-good-password")
     biz = led.businesses.create("Meera's Boutique")
     a.add_member(biz, merchant.user_id, Role.OWNER)
@@ -247,7 +247,7 @@ def test_signing_up_signs_you_in(client):
 
 
 def test_admin_is_operator_only(client):
-    _signup(client, "founder@ledgerline.in")          # first: operator
+    _signup(client, "founder@artha.ai")          # first: operator
     assert client.get("/admin").status_code == 200
 
     client.get("/logout")
@@ -259,7 +259,7 @@ def test_admin_is_operator_only(client):
 
 def test_the_admin_link_is_hidden_from_non_operators(client):
     """A control that is visible and then refuses you is worse than absent."""
-    _signup(client, "founder@ledgerline.in")
+    _signup(client, "founder@artha.ai")
     client.post("/businesses", data={"name": "Ops Co"})
     assert 'href="/admin"' in client.get("/").text
 

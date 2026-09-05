@@ -202,7 +202,7 @@ def test_the_operator_sees_refusals_but_not_what_was_read(client):
     a business they are not in. They do not need, and are not entitled to, what
     that business's settlements say.
     """
-    _owner(client, "founder@ledgerline.in")          # first account: operator
+    _owner(client, "founder@artha.ai")          # first account: operator
     client.post("/sale", data={"rupees": "4321.00", "instrument": "upi"})
     run_id = client.post("/settle", follow_redirects=False
                          ).headers["location"].rsplit("/", 1)[-1]

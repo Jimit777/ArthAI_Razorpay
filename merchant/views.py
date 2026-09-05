@@ -584,7 +584,7 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
 
     return f"""
   <aside class="rail">
-    <div class="logo"><span class="mark">L</span>Ledgerline</div>
+    <div class="logo"><span class="mark">A</span>ArthAI</div>
     <nav>
       {''.join(blocks)}
     </nav>
@@ -731,11 +731,11 @@ def auth_page(title: str, subtitle: str, body: str, footer: str = "") -> str:
     """The signed-out shell. No rail, no business - there is no context yet."""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} &middot; Ledgerline</title><style>{CSS}</style></head>
+<title>{esc(title)} &middot; ArthAI</title><style>{CSS}</style></head>
 <body><main style="max-width:400px;margin:0 auto;padding-top:76px">
   <div style="display:flex;align-items:center;gap:9px;margin-bottom:22px">
-    <span class="mark">L</span>
-    <span style="font-weight:680;letter-spacing:-.02em">Ledgerline</span>
+    <span class="mark">A</span>
+    <span style="font-weight:680;letter-spacing:-.02em">ArthAI</span>
   </div>
   <div class="card">
     <h1 style="font-size:17px">{esc(title)}</h1>
@@ -799,7 +799,7 @@ def page(title: str, body: str, active: str = "", business=None,
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} &middot; Ledgerline</title><style>{CSS}</style></head>
+<title>{esc(title)} &middot; ArthAI</title><style>{CSS}</style></head>
 <body><div class="app">
 {_rail(active, agents, enabled, source, viewer, role)}
   <div>
@@ -3915,14 +3915,11 @@ def chargeback_demo_screen(latest_link: str = "") -> str:
 </div>
 
 <div class="card tint">
-  <h2>What "evidence complete" actually means</h2>
-  <p class="sub" style="margin:4px 0 0;max-width:70ch">Every reason code
-     here is checked against a real, published table of which evidence
-     types a card network expects for it - not a guess. A dispute with
-     some but not all of what's required still gets a drafted letter; the
-     letter says plainly what's missing rather than arguing around the
-     gap. A reason code outside that table is never given a made-up
-     checklist - it goes to a person instead.</p>
+  <h2>What "evidence complete" means</h2>
+  <p class="sub" style="margin:4px 0 0;max-width:70ch">Checked against a
+     published table of what each reason code actually requires. Partial
+     evidence still gets a drafted letter naming what's missing; an
+     unrecognised reason code goes to a person instead.</p>
 </div>"""
 
 

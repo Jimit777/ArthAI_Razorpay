@@ -1,5 +1,5 @@
 """
-Ledgerline - agentic financial services for Indian merchants.
+ArthAI - agentic financial services for Indian merchants.
 
   ./run_platform.sh        then open http://localhost:8000
 
@@ -93,7 +93,7 @@ except OSError:
 
 COOKIE = "business_id"
 
-app = FastAPI(title="Ledgerline")
+app = FastAPI(title="ArthAI")
 
 # agent runs in flight, keyed by target. In-process on purpose: this is a
 # single-operator tool, and a job queue would be a moving part with nothing to do.
@@ -542,7 +542,7 @@ def signup_page(error: str = "", user: Optional[User] = Depends(maybe_user)):
     banner = (f'<div class="banner warn"><span>{views.esc(error)}</span></div>'
               if error else "")
     return HTMLResponse(views.auth_page(
-        "Create an account", "Ledgerline audits what your gateway deducted.",
+        "Create an account", "ArthAI audits what your gateway deducted.",
         f"""
     {note}{banner}
     {views.google_button("Sign up with Google")
@@ -1021,11 +1021,11 @@ def _welcome(user: User) -> str:
         f'<li><b>{views.esc(a.name)}</b> &mdash; {views.esc(a.tagline)}</li>'
         for a in live)
 
-    return views.page("Ledgerline", f"""
+    return views.page("ArthAI", f"""
 <div class="card" style="padding:34px">
   <h1>Welcome, {views.esc(user.name)}</h1>
   <p class="sub" style="max-width:620px;font-size:13.5px">
-    Your money already flows through your payment gateway. Ledgerline reads what
+    Your money already flows through your payment gateway. ArthAI reads what
     the gateway <i>did</i> to it &mdash; and tells you which parts were wrong.
     It is not where sales happen. It is where they get checked afterwards.</p>
 
@@ -1450,16 +1450,12 @@ def sources_page(ws: Workspace = Depends(required_workspace),
 
     security = posture()
     if security["encrypted_at_rest"]:
-        storage_note = (
-            "<b>The secret is encrypted at rest</b> with a key held outside "
-            "the database, so a copy of the file is not a copy of the "
-            "credential. Only the public key id is stored in the clear.")
+        storage_note = ("<b>Encrypted at rest.</b> Only the key id is "
+                        "stored in the clear.")
     else:
-        storage_note = (
-            "<b>Test-mode keys only.</b> No encryption key is configured "
-            "(LEDGERLINE_SECRET_KEY), so the secret is used to verify the "
-            "connection and then dropped &mdash; never written to disk. Each "
-            "sync will ask for it again.")
+        storage_note = ("<b>Test-mode keys only.</b> No encryption key "
+                        "configured, so the secret is used once and "
+                        "dropped &mdash; never written to disk.")
 
     razorpay_inner = f"""
     <form method="post" action="/sources/razorpay">
@@ -1473,18 +1469,17 @@ def sources_page(ws: Workspace = Depends(required_workspace),
         <div style="flex:0"><button>Connect</button></div>
       </div>
     </form>
-    <p class="sub" style="margin:12px 0 0;font-size:12px">{storage_note}</p>
-    <p class="sub" style="margin:8px 0 0;font-size:12px">
-      Test mode does not settle, so expect zero settlements until this points
-      at a live account.</p>"""
+    <p class="sub" style="margin:12px 0 0;font-size:12px">{storage_note}
+      Test mode never settles, so expect zero until this points at a live
+      account.</p>"""
 
     simulator_inner = """
     <form method="post" action="/sources/simulator">
       <button class="ghost">Use the simulator</button>
     </form>
     <p class="sub" style="margin:12px 0 0;font-size:12px">
-      Record sales and settle them locally. The auditor cannot tell the
-      difference, which is the point.</p>"""
+      Local, generated settlements &mdash; the auditor can't tell the
+      difference.</p>"""
 
     status = ""
     if current and current["last_message"]:
@@ -1539,20 +1534,17 @@ def sources_page(ws: Workspace = Depends(required_workspace),
             on_file = """
         <div class="banner warn" style="margin:0 0 12px">
           <b>Nothing imported yet</b>
-          <span>Press Import below. If it finds nothing, your payments may
-            still be authorised rather than captured &mdash; only a captured
-            payment carries the fee this auditor checks.</span>
+          <span>Press Import below. A zero result usually means your
+            payments are authorised, not yet captured.</span>
         </div>"""
 
         sync = f"""
       <div class="card">
         <h2>Import from Razorpay</h2>
         <p class="sub" style="margin:3px 0 12px">Reads the settlement recon
-           report first &mdash; the only place a gateway states, line by line,
-           what it deducted. Test mode never settles, so on a test account it
-           falls back to your captured payments, which carry Razorpay's own fee
-           and tax. That is enough to check every rate and GST figure, though
-           not settlement timing.</p>
+           report first. Test mode never settles, so it falls back to your
+           captured payments &mdash; enough to check every rate and GST
+           figure, not settlement timing.</p>
         {on_file}
         <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap">
           <form method="post" action="/sources/sync" style="flex:1;min-width:240px">
@@ -1585,11 +1577,8 @@ def sources_page(ws: Workspace = Depends(required_workspace),
       if security["live_keys"] else '<span class="pill">refused</span>'}</div>
   </div>
   {''.join(f'<p class="sub" style="margin:0 0 4px;font-size:11.5px">'
-           f'&middot; still missing: {views.esc(m)}</p>'
+           f'&middot; missing: {views.esc(m)}</p>'
            for m in security["missing"])}
-  <p class="sub" style="margin:10px 0 0;font-size:11.5px">Listed rather than
-     glossed: an install that looks safe and is not is worse than one that
-     admits what it lacks.</p>
 </div>"""
     return views.page("Data source", body, "data", **shell)
 
@@ -3807,12 +3796,9 @@ def gst_filing_page(ws: Workspace = Depends(required_workspace),
         connected_card = f"""
 <div class="card" style="margin-bottom:16px">
   <h2>Pull invoices from Razorpay</h2>
-  <p class="sub" style="margin:6px 0 12px">Reads your real Invoices - GSTIN,
-     HSN/SAC code and tax rate are only populated when you entered them
-     yourself through the Razorpay Dashboard (the API cannot set them), so
-     an invoice missing any of that is classified honestly, never guessed.
-     Alongside Demo Mode, never instead of it - everything past layer 1
-     runs exactly the same either way.</p>
+  <p class="sub" style="margin:6px 0 12px">GSTIN, HSN/SAC and tax rate only
+     populate if you entered them in the Razorpay Dashboard - the API can't
+     set them. Missing ones are classified honestly, never guessed.</p>
   <form method="post" action="/agents/gst-filing/sync-invoices">
     <div class="row">
       {field}
@@ -3836,11 +3822,8 @@ def gst_filing_page(ws: Workspace = Depends(required_workspace),
 {connected_card}
 <div class="card tint" style="margin-bottom:16px">
   <h2 style="font-size:14px">Your GST registration</h2>
-  <p class="sub" style="margin:4px 0 12px">Needed to fill SellerDtls in the
-     real GSTR-1 and e-invoice JSON exports - this system has never had
-     anywhere else to get your GSTIN or registered address from. Nothing
-     is verified against the GSTN registry; this is you telling the export
-     what to say about you.</p>
+  <p class="sub" style="margin:4px 0 12px">Fills SellerDtls in your GSTR-1
+     and e-invoice exports. Not verified against the GSTN registry.</p>
   <form method="post" action="/agents/gst-filing/profile">
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <input name="gstin" placeholder="GSTIN, e.g. 27ABCDE1234F1Z5"
@@ -3861,10 +3844,9 @@ def gst_filing_page(ws: Workspace = Depends(required_workspace),
 </div>
 <div class="card">
   <h2>Demo Mode</h2>
-  <p class="sub" style="margin:6px 0 14px">A generated month of sales, plus
-     four earlier filing periods. Problems are planted on purpose &mdash; a
-     missing e-invoice, an unpriced HSN code, and periods locked by a
-     shortfall &mdash; so you can see how each is handled.</p>
+  <p class="sub" style="margin:6px 0 14px">A generated month plus four prior
+     periods, with planted problems: a missing e-invoice, an unpriced HSN
+     code, a shortfall-locked period.</p>
   <form method="post" action="/agents/gst-filing/demo">
     <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;
       color:var(--muted);margin-bottom:12px">
@@ -9276,7 +9258,7 @@ def admin_page(op: User = Depends(operator),
 
     body = f"""
 <h1>Platform</h1>
-<p class="sub">Signed in as an operator. This is about Ledgerline, not about
+<p class="sub">Signed in as an operator. This is about ArthAI, not about
    any one merchant&rsquo;s money.</p>
 {banner}
 

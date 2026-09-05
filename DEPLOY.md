@@ -1,4 +1,4 @@
-# Deploying Ledgerline
+# Deploying ArthAI
 
 The app runs on **Render**, unchanged. There is no build step, no container,
 and no separate database server — `render.yaml` in the repo root describes
