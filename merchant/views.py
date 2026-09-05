@@ -25,6 +25,38 @@ from engine.expected_value import rupees
 from merchant.auth import ROLE_LABEL
 from merchant.gateway import BEHAVIOUR_LABEL, BEHAVIOUR_NOTE, Behaviour
 
+# The wordmark. An "A" built from a rising stroke and a falling one that
+# meet at the crossbar - it reads as the letter, and as the ledger line the
+# whole product is about. Geometric so it holds at 22px in the rail, where
+# it is only ever seen. Inline rather than a file because everything this
+# app serves is one self-contained response with no asset pipeline behind it.
+LOGO_SVG = """<svg class="mark" viewBox="0 0 24 24" width="24" height="24" \
+aria-hidden="true" focusable="false"><rect width="24" height="24" rx="7" \
+fill="url(#lg)"/><path d="M7 17.2 12 6.8l5 10.4" fill="none" stroke="#fff" \
+stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/>\
+<path d="M9.5 14.1h5" fill="none" stroke="#fff" stroke-width="2.1" \
+stroke-linecap="round" opacity=".78"/><defs><linearGradient id="lg" \
+x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">\
+<stop stop-color="#3b82f6"/><stop offset="1" stop-color="#1d4ed8"/>\
+</linearGradient></defs></svg>"""
+
+
+# Plus Jakarta Sans for anything the eye lands on first - the wordmark,
+# headings, and every figure - and Inter for running text and tables, where
+# its narrower, quieter shapes read better at 13px. Both carry proper tabular
+# figures, which is non-negotiable on a page that is mostly money in columns.
+# display=swap so a slow font never blanks the page.
+#
+# Kept OUT of TOKENS deliberately. report.py inlines TOKENS into a standalone
+# HTML file that gets opened in a venue with no wifi, and tests/test_report.py
+# asserts that file references nothing external - so the served app opts into
+# the webfont and the offline artefact falls back to the system stack in
+# --font, which is the same design one rung down.
+WEBFONT = """\
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700\
+&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap');
+"""
+
 TOKENS = """
 :root {
   /* Light, deliberately, with no dark variant.
@@ -36,21 +68,35 @@ TOKENS = """
      dark mode renders native inputs, selects and scrollbars dark anyway, and
      the form controls end up fighting the page. */
   color-scheme: light;
-  --bg:#f6f7f9; --surface:#fff; --raised:#fbfcfd;
-  --ink:#0f1724; --ink-2:#374151; --muted:#6b7280; --faint:#9ca3af;
-  --line:#e6e8ec; --line-2:#eef0f3;
-  --brand:#2b6cf0; --brand-ink:#1d4ed8; --brand-wash:#eef4ff;
-  --good:#0f9d58; --good-wash:#e8f6ee;
-  --warn:#b45309; --warn-wash:#fff8e6;
-  --danger:#c2410c; --danger-wash:#fff1ea;
+  /* One slate ramp for every neutral, so nothing on the page is a grey that
+     was picked in isolation - the ground, the hairlines and the type all sit
+     on the same axis, faintly cool, faintly blue, agreeing with the brand. */
+  --bg:#f8fafc; --surface:#ffffff; --raised:#f8fafc;
+  --ink:#0f172a; --ink-2:#334155; --muted:#64748b; --faint:#94a3b8;
+  --line:#e2e8f0; --line-2:#f1f5f9;
+  --brand:#2563eb; --brand-ink:#1d4ed8; --brand-wash:#eff6ff;
+  --good:#059669; --good-wash:#ecfdf5;
+  --warn:#b45309; --warn-wash:#fffbeb;
+  --danger:#dc2626; --danger-wash:#fef2f2;
   --violet:#6d38d6; --violet-wash:#f3edff;
-  --shadow:0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
+  /* Two layers, both nearly invisible on their own: a tight contact shadow
+     that separates the card from the ground, and a slightly wider one that
+     gives it height. One heavy shadow reads as a drop-shadow effect; two
+     light ones read as a surface. */
+  --shadow:0 1px 3px rgba(15,23,42,.05), 0 1px 2px rgba(15,23,42,.025);
+  --shadow-lift:0 4px 12px -2px rgba(15,23,42,.07),
+                0 2px 6px -2px rgba(15,23,42,.04);
+  --radius:12px;
+  --font:'Inter',ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --font-display:'Plus Jakarta Sans','Inter',ui-sans-serif,-apple-system,
+                 "Segoe UI",Roboto,sans-serif;
 }
 * { box-sizing:border-box }
 html, body { height:100% }
 body { margin:0; background:var(--bg); color:var(--ink);
-  font:13.5px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
-  -webkit-font-smoothing:antialiased }
+  font:13.5px/1.55 var(--font);
+  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale }
+h1, h2, h3 { font-family:var(--font-display) }
 a { color:var(--brand-ink); text-decoration:none }
 
 """
@@ -64,19 +110,22 @@ SHELL = """/* --- frame --------------------------------------------------------
   min-height:100vh }
 .rail { background:var(--surface); border-right:1px solid var(--line);
   display:flex; flex-direction:column; position:sticky; top:0; height:100vh }
-.rail .logo { display:flex; align-items:center; gap:8px; padding:14px 14px 10px;
-  font-weight:680; letter-spacing:-.02em; font-size:14.5px; color:var(--ink) }
-.mark { width:21px; height:21px; border-radius:5px; background:var(--brand);
-  color:#fff; display:grid; place-items:center; font-size:12px; font-weight:700 }
+.rail .logo { display:flex; align-items:center; gap:9px; padding:16px 14px 12px;
+  color:var(--ink) }
+.wordmark { font-family:var(--font-display); font-weight:800;
+  letter-spacing:-.035em; font-size:16px }
+.mark { width:24px; height:24px; flex:none; display:block;
+  border-radius:7px }
 .rail nav { padding:2px 8px; overflow-y:auto; flex:1 }
 .group { font-size:10px; letter-spacing:.09em; text-transform:uppercase;
   color:var(--faint); padding:13px 7px 4px; font-weight:600 }
 .rail .flow-group { font-size:10px; color:var(--faint); padding:7px 8px 2px 30px;
   font-weight:600; letter-spacing:.02em }
-.item { display:flex; align-items:center; gap:9px; padding:6px 8px;
-  border-radius:6px; color:var(--ink-2); font-size:12.8px; margin-bottom:0 }
-.item:hover { background:var(--line-2) }
-.item.on { background:var(--brand-wash); color:var(--brand-ink); font-weight:560 }
+.item { display:flex; align-items:center; gap:9px; padding:6px 9px;
+  border-radius:8px; color:var(--ink-2); font-size:12.8px; margin-bottom:1px;
+  transition:background .12s ease, color .12s ease }
+.item:hover { background:var(--line-2); color:var(--ink) }
+.item.on { background:var(--brand-wash); color:var(--brand-ink); font-weight:600 }
 .item .ic { width:17px; text-align:center; opacity:.75; font-size:13px }
 .item .tag { margin-left:auto; font-size:10px; padding:1px 6px; border-radius:20px;
   background:var(--line-2); color:var(--muted) }
@@ -89,9 +138,9 @@ SHELL = """/* --- frame --------------------------------------------------------
   display:flex; align-items:center; gap:12px; padding:0 18px; position:sticky;
   top:0; z-index:5 }
 .top .biz { display:flex; align-items:center; gap:8px }
-.top select { border:1px solid var(--line); background:var(--raised);
-  border-radius:6px; padding:4px 9px; font-size:12.8px; color:var(--ink);
-  font-family:inherit; max-width:210px }
+.top select { border:1px solid var(--line); background:var(--surface);
+  border-radius:8px; padding:5px 10px; font-size:12.8px; color:var(--ink);
+  font-family:inherit; max-width:210px; font-weight:500 }
 .sp { flex:1 }
 .mode { display:inline-flex; align-items:center; gap:6px; padding:3px 9px;
   border-radius:20px; font-size:10.5px; font-weight:650; letter-spacing:.05em;
@@ -116,11 +165,12 @@ COMPONENTS = """/* --- content -------------------------------------------------
    cap left-aligns and every pixel of slack piles up on the right, which on a
    wide screen reads as a broken layout rather than a measure. */
 main { padding:20px 24px 60px; max-width:1120px; margin:0 auto }
-h1 { font-size:18px; margin:0 0 2px; letter-spacing:-.02em; font-weight:640 }
-h2 { font-size:13px; margin:0 0 2px; letter-spacing:-.01em; font-weight:620 }
+h1 { font-size:19px; margin:0 0 2px; letter-spacing:-.025em; font-weight:700 }
+h2 { font-size:13.5px; margin:0 0 2px; letter-spacing:-.015em; font-weight:700 }
 .sub { color:var(--muted); font-size:12.3px; margin:0 0 12px }
 .card { background:var(--surface); border:1px solid var(--line);
-  border-radius:9px; padding:15px 16px; margin-bottom:11px; box-shadow:var(--shadow) }
+  border-radius:var(--radius); padding:16px 18px; margin-bottom:12px;
+  box-shadow:var(--shadow) }
 .card.tint { background:var(--brand-wash); border-color:transparent }
 .card.flush { padding:0; overflow:hidden }
 .card-head { padding:11px 16px; border-bottom:1px solid var(--line-2);
@@ -130,11 +180,12 @@ h2 { font-size:13px; margin:0 0 2px; letter-spacing:-.01em; font-weight:620 }
 /* --- forms ------------------------------------------------------------ */
 label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px;
   font-weight:500 }
-input, select, textarea { width:100%; padding:7px 10px; font-size:13px;
-  border:1px solid var(--line); border-radius:8px; background:var(--raised);
-  color:var(--ink); font-family:inherit }
-input:focus, select:focus, textarea:focus { outline:2px solid var(--brand-wash);
-  border-color:var(--brand) }
+input, select, textarea { width:100%; padding:8px 11px; font-size:13px;
+  border:1px solid var(--line); border-radius:9px; background:var(--surface);
+  color:var(--ink); font-family:inherit;
+  transition:border-color .12s ease, box-shadow .12s ease }
+input:focus, select:focus, textarea:focus { outline:none;
+  border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-wash) }
 input[readonly] { color:var(--muted); background:var(--line-2) }
 /* Checkboxes and radios are not text fields - the rule above stretched them
    to fill their container and gave them a text-input's padding and border,
@@ -145,11 +196,13 @@ input[type="checkbox"], input[type="radio"] { width:16px; height:16px;
   flex:0 0 auto; cursor:pointer }
 .row { display:flex; gap:9px; align-items:flex-end; flex-wrap:wrap }
 .row > div { flex:1; min-width:132px }
-button, .btn { padding:7px 13px; font-size:12.8px; font-weight:560; border:0;
-  border-radius:7px; background:var(--brand); color:#fff; cursor:pointer;
+button, .btn { padding:8px 15px; font-size:12.8px; font-weight:600; border:0;
+  border-radius:9px; background:var(--brand); color:#fff; cursor:pointer;
   font-family:inherit; text-decoration:none; display:inline-block;
-  white-space:nowrap }
-button:hover, .btn:hover { background:var(--brand-ink) }
+  white-space:nowrap; box-shadow:0 1px 2px rgba(15,23,42,.08);
+  transition:background .12s ease, box-shadow .12s ease }
+button:hover, .btn:hover { background:var(--brand-ink);
+  box-shadow:0 2px 6px -1px rgba(37,99,235,.35) }
 button.ghost, .btn.ghost { background:var(--surface); color:var(--ink-2);
   border:1px solid var(--line) }
 button.ghost:hover, .btn.ghost:hover { background:var(--line-2) }
@@ -512,7 +565,7 @@ tr.clickable:hover td { background:var(--raised) }
 @media (max-width:720px) { .modes { grid-template-columns:1fr } }
 """
 
-CSS = TOKENS + SHELL + COMPONENTS
+CSS = WEBFONT + TOKENS + SHELL + COMPONENTS
 
 
 
@@ -584,7 +637,7 @@ def _rail(active: str, agents=(), enabled=frozenset(), source=None,
 
     return f"""
   <aside class="rail">
-    <div class="logo"><span class="mark">A</span>ArthAI</div>
+    <div class="logo">{LOGO_SVG}<span class="wordmark">ArthAI</span></div>
     <nav>
       {''.join(blocks)}
     </nav>
@@ -734,8 +787,8 @@ def auth_page(title: str, subtitle: str, body: str, footer: str = "") -> str:
 <title>{esc(title)} &middot; ArthAI</title><style>{CSS}</style></head>
 <body><main style="max-width:400px;margin:0 auto;padding-top:76px">
   <div style="display:flex;align-items:center;gap:9px;margin-bottom:22px">
-    <span class="mark">A</span>
-    <span style="font-weight:680;letter-spacing:-.02em">ArthAI</span>
+    {LOGO_SVG}
+    <span class="wordmark" style="font-size:17px">ArthAI</span>
   </div>
   <div class="card">
     <h1 style="font-size:17px">{esc(title)}</h1>
@@ -1988,7 +2041,7 @@ COMPONENTS += """
 @media (max-width:720px) { .three-src .arrow { display:none } }
 """
 
-CSS = TOKENS + SHELL + COMPONENTS
+CSS = WEBFONT + TOKENS + SHELL + COMPONENTS
 
 
 # --- the three-way agent's real-data tabs ---------------------------------
@@ -3111,8 +3164,14 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
 .auth-or::before, .auth-or::after { content:""; flex:1; height:1px;
   background:var(--line) }
 
-.dash-card { padding:26px 28px 22px; border-radius:18px }
-.dash-card h2 { font-size:17px; font-weight:700; letter-spacing:-.015em }
+.dash-card { padding:26px 28px 22px; border-radius:16px;
+  box-shadow:var(--shadow-lift) }
+/* An eyebrow, not a heading. On a dashboard the figure IS the content and
+   the label only says which figure it is - so the label steps back into
+   small uppercase and the number takes the weight it was competing for. */
+.dash-card h2 { font-family:var(--font-display); font-size:.75rem;
+  font-weight:600; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--muted) }
 .dash-head { display:flex; justify-content:space-between; align-items:flex-start;
   gap:12px }
 .pill-count { flex:none; font-size:11.5px; font-weight:650; color:var(--ink-2);
@@ -3124,8 +3183,14 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
   margin:10px 0 4px }
 /* Targets the number by class, not by element - .trend-pill is a sibling
    span, and a bare `.big-figure > span` sets its size too. */
-.big-figure > .figure-num { font-size:38px; font-weight:780;
-  letter-spacing:-.025em; font-variant-numeric:tabular-nums; line-height:1 }
+/* clamp, not a fixed size: this column is a 1fr track and an Indian-format
+   lakh figure ("Rs 1,65,720.00") is long enough to wrap at 40px, which broke
+   the number across two lines. It scales with the viewport instead and stops
+   at 40px on a wide screen. */
+.big-figure > .figure-num { font-family:var(--font-display);
+  font-size:clamp(26px, 2.6vw, 40px);
+  font-weight:800; letter-spacing:-.03em; color:var(--ink); white-space:nowrap;
+  font-variant-numeric:tabular-nums; line-height:1 }
 .trend-pill { font-size:11.5px; font-weight:700; color:var(--good);
   background:var(--good-wash); border-radius:999px; padding:4px 9px;
   white-space:nowrap }
@@ -3226,11 +3291,15 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
 
 .stat-stack { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
   gap:16px; align-content:start }
-.stat-card { padding:20px 22px; border-radius:18px; display:block }
-.stat-head { font-size:11px; text-transform:uppercase; letter-spacing:.07em;
-  color:var(--faint); font-weight:700 }
-.stat-value { font-size:34px; font-weight:780; letter-spacing:-.025em;
-  margin-top:6px; font-variant-numeric:tabular-nums; line-height:1.05 }
+.stat-card { padding:20px 22px; border-radius:16px; display:block;
+  transition:box-shadow .15s ease, transform .15s ease }
+a.stat-card:hover { box-shadow:var(--shadow-lift); transform:translateY(-1px) }
+.stat-head { font-family:var(--font-display); font-size:.75rem;
+  text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
+  font-weight:600 }
+.stat-value { font-family:var(--font-display); font-size:36px; font-weight:800;
+  letter-spacing:-.03em; color:var(--ink); margin-top:6px;
+  font-variant-numeric:tabular-nums; line-height:1.05 }
 .stat-sub { font-size:11.8px; color:var(--ink-2); margin-top:8px; line-height:1.4 }
 
 /* The reference's dot matrix. Cells are a real count, capped at 24 so a
@@ -3241,25 +3310,32 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
 .dotgrid.tone-good i.on { background:var(--good) }
 .dotgrid.tone-danger i.on { background:var(--danger) }
 
-.insights-panel { position:relative; overflow:hidden; border-radius:18px;
+/* One ground for the panel whatever its tone: deep slate into indigo. The
+   old version took its whole background from the tone, so a warn-tier lead
+   painted the largest surface on the page burnt orange - an alarm colour
+   doing a layout's job. Tone still shows, as a bar down the leading edge,
+   which is enough to read and does not shout. */
+.insights-panel { position:relative; overflow:hidden; border-radius:16px;
   padding:26px 28px; color:#fff; display:flex; flex-direction:column;
-  border:none; box-shadow:0 18px 38px -18px rgba(16,24,40,.42);
-  background:linear-gradient(135deg, var(--brand-ink), var(--brand)) }
-.insights-panel.tone-danger { background:linear-gradient(135deg,
-  color-mix(in srgb, var(--danger) 100%, black 30%), var(--danger)) }
-.insights-panel.tone-warn { background:linear-gradient(135deg,
-  color-mix(in srgb, var(--warn) 100%, black 30%), var(--warn)) }
+  border:none; box-shadow:0 18px 38px -20px rgba(15,23,42,.45);
+  background:linear-gradient(150deg,#0f172a 0%,#1e293b 45%,#312e81 100%) }
+.insights-panel::before { content:""; position:absolute; left:0; top:0;
+  bottom:0; width:3px; background:var(--brand); z-index:2 }
+.insights-panel.tone-danger::before { background:#f87171 }
+.insights-panel.tone-warn::before { background:#fbbf24 }
 /* The reference's glossy sweep - a light source in the top-right corner. */
 .insights-panel::after { content:""; position:absolute; inset:0;
   pointer-events:none;
-  background:radial-gradient(130% 130% at 100% 0%, rgba(255,255,255,.30),
-    rgba(255,255,255,.06) 45%, transparent 70%) }
+  background:radial-gradient(120% 120% at 100% 0%, rgba(129,140,248,.28),
+    rgba(255,255,255,.05) 45%, transparent 72%) }
 .insights-panel > * { position:relative; z-index:1 }
-.insights-panel .insight-agent { font-size:11px; text-transform:uppercase;
-  letter-spacing:.07em; color:rgba(255,255,255,.78); font-weight:700 }
+.insights-panel .insight-agent { font-family:var(--font-display);
+  font-size:.75rem; text-transform:uppercase;
+  letter-spacing:.05em; color:rgba(255,255,255,.72); font-weight:600 }
 .insights-lead { display:block; text-decoration:none; color:inherit }
-.insights-headline { display:block; font-size:36px; font-weight:780;
-  letter-spacing:-.03em; margin-top:10px; line-height:1.08;
+.insights-headline { display:block; font-family:var(--font-display);
+  font-size:38px; font-weight:800;
+  letter-spacing:-.035em; margin-top:10px; line-height:1.08;
   font-variant-numeric:tabular-nums }
 .insights-sub { display:block; font-size:12.8px; line-height:1.5;
   margin:10px 0 0; color:rgba(255,255,255,.9) }
@@ -3274,8 +3350,8 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
   border:1px solid var(--line); box-shadow:var(--shadow) }
 .insights-panel.quiet::after { display:none }
 .insights-panel.quiet .insight-agent { color:var(--faint) }
-.insights-quiet-head { font-size:20px; font-weight:720; margin:10px 0 6px;
-  letter-spacing:-.015em }
+.insights-quiet-head { font-family:var(--font-display); font-size:21px;
+  font-weight:700; margin:10px 0 6px; letter-spacing:-.025em }
 
 .insight-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
   gap:14px; align-items:stretch }
@@ -3284,10 +3360,12 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
   border-top:3px solid var(--line-2) }
 .insight-card.tone-danger { border-top-color:var(--danger) }
 .insight-card.tone-warn { border-top-color:var(--warn) }
-.insight-card .insight-agent { font-size:10.8px; text-transform:uppercase;
-  letter-spacing:.06em; color:var(--faint); font-weight:700 }
-.insight-card .insight-headline { font-size:23px; font-weight:750; margin-top:5px;
-  font-variant-numeric:tabular-nums; letter-spacing:-.01em }
+.insight-card .insight-agent { font-family:var(--font-display);
+  font-size:.75rem; text-transform:uppercase;
+  letter-spacing:.05em; color:var(--muted); font-weight:600 }
+.insight-card .insight-headline { font-family:var(--font-display);
+  font-size:24px; font-weight:800; margin-top:5px; color:var(--ink);
+  font-variant-numeric:tabular-nums; letter-spacing:-.025em }
 .insight-card .insight-subtext { font-size:12px; color:var(--ink-2);
   margin-top:3px; line-height:1.4 }
 
@@ -3300,21 +3378,23 @@ tr.src-demo > td:first-child { box-shadow:inset 3px 0 0 var(--warn) }
   grid-column:span 2 }
 .insight-hero::after { content:""; position:absolute; inset:0;
   background:radial-gradient(120% 140% at 100% 0%, rgba(255,255,255,.22), transparent 60%) }
-.insight-hero.tone-brand { background:linear-gradient(135deg, var(--brand-ink), var(--brand)) }
-.insight-hero.tone-danger { background:linear-gradient(135deg,
-  color-mix(in srgb, var(--danger) 100%, black 25%), var(--danger)) }
-.insight-hero.tone-warn { background:linear-gradient(135deg,
-  color-mix(in srgb, var(--warn) 100%, black 25%), var(--warn)) }
+.insight-hero { background:linear-gradient(150deg,#0f172a 0%,#1e293b 45%,
+  #312e81 100%) }
+.insight-hero::before { content:""; position:absolute; left:0; top:0; bottom:0;
+  width:3px; background:var(--brand); z-index:2 }
+.insight-hero.tone-danger::before { background:#f87171 }
+.insight-hero.tone-warn::before { background:#fbbf24 }
 .insight-hero .insight-agent { position:relative; font-size:11px; text-transform:uppercase;
   letter-spacing:.07em; color:rgba(255,255,255,.75); font-weight:700 }
-.insight-hero .insight-headline { position:relative; font-size:34px; font-weight:780;
-  margin-top:8px; font-variant-numeric:tabular-nums; letter-spacing:-.02em }
+.insight-hero .insight-headline { position:relative;
+  font-family:var(--font-display); font-size:34px; font-weight:800;
+  margin-top:8px; font-variant-numeric:tabular-nums; letter-spacing:-.03em }
 .insight-hero .insight-subtext { position:relative; font-size:13px;
   color:rgba(255,255,255,.88); margin-top:8px; line-height:1.5; max-width:46ch }
 @media (max-width:560px) { .insight-hero { grid-column:span 1 } }
 """
 
-CSS = TOKENS + SHELL + COMPONENTS
+CSS = WEBFONT + TOKENS + SHELL + COMPONENTS
 
 
 CASH_UPLOAD_HELP = {
